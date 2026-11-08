@@ -74,7 +74,7 @@ catalog:
   "@types/morgan": ^1.9.10
   "@types/multer": ^2.3.0
   "@types/mustache": ^4.2.6
-  "@types/node": ^26.6.5
+  "@types/node": ^26.6.6
   "@types/react": ^19.3.0
   "@types/react-dom": ^19.3.0
   "@types/remark-heading-id": ^1.0.0
