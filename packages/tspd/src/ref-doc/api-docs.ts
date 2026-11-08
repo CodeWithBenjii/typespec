@@ -1,0 +1,98 @@
+import { joinPaths } from "@typespec/compiler";
+import { writeFile } from "fs/promises";
+import type { Reflection } from "typedoc";
+import { Application, PageEvent, ReflectionKind } from "typedoc";
+import type { PluginOptions } from "typedoc-plugin-markdown";
+import { load } from "typedoc-plugin-markdown";
+import { stringify } from "yaml";
+/**
+ * Generates Markdown JavaScript API pages using TypeDoc and writes Docusaurus category metadata.
+ * Reads `src/index.ts` and `tsconfig.build.json` under `libraryPath`; the package must provide
+ * both files. Adds page front matter through {@link loadRenderer}.
+ * If TypeDoc cannot convert the project, it logs the error and returns without generating pages.
+ */
+export async function generateJsApiDocs(libraryPath: string, outputDir: string) {
+  const markdownPluginOptions: Partial<PluginOptions> = {
+    entryFileName: "index.md",
+    interfacePropertiesFormat: "table",
+    classPropertiesFormat: "table",
+    parametersFormat: "table",
+    enumMembersFormat: "table",
+    typeDeclarationFormat: "table",
+    hidePageTitle: true,
+    hideBreadcrumbs: true,
+    hidePageHeader: true,
+    useCodeBlocks: true,
+  };
+
+  const app = await Application.bootstrapWithPlugins({
+    entryPoints: [joinPaths(libraryPath, "src/index.ts")],
+    tsconfig: joinPaths(libraryPath, "tsconfig.build.json"),
+    entryPointStrategy: "resolve",
+  });
+
+  loadRenderer(app);
+  load(app);
+
+  setOptions(app, {
+    name: "JS API",
+    githubPages: false,
+    readme: "none",
+    hideGenerator: true,
+    disableSources: true,
+    out: outputDir,
+    ...markdownPluginOptions,
+  });
+
+  const project = await app.convert();
+
+  // if project is undefined typedoc has a problem - error logging will be supplied by typedoc.
+  if (!project) {
+    return;
+  }
+
+  await app.generateOutputs(project);
+
+  await writeFile(
+    joinPaths(outputDir, "_category_.json"),
+    JSON.stringify({
+      label: "JS API",
+      link: {
+        type: "doc",
+        id: "index",
+      },
+    }),
+  );
+}
+
+function setOptions(app: Application, options: any, reportErrors = true) {
+  for (const [key, val] of Object.entries(options)) {
+    app.options.setValue(key as never, val as never);
+  }
+}
+
+/**
+ * Registers a TypeDoc page-end hook that adds `jsApi` and title front matter and unescapes
+ * angle brackets in rendered pages. Call once before output generation to avoid duplicate hooks.
+ */
+export function loadRenderer(app: Application) {
+  app.renderer.on(PageEvent.END, (page: PageEvent<any>) => {
+    if (page.contents && page) {
+      const frontMatter = createFrontMatter(page.model);
+      page.contents = frontMatter + page.contents.replace(/\\</g, "<");
+    }
+  });
+}
+
+function createFrontMatter(model: Reflection) {
+  return ["---", stringify(createFrontMatterData(model)), "---", ""].join("\n");
+}
+
+function createFrontMatterData(model: Reflection) {
+  const kind = ReflectionKind.singularString(model.kind)[0];
+
+  return {
+    jsApi: true,
+    title: `[${kind}] ${model.name}`,
+  };
+}

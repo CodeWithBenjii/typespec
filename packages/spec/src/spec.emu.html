@@ -1,0 +1,673 @@
+<pre class="metadata">
+copyright: false
+</pre>
+
+<emu-intro id="intro">
+<h1>Introduction</h1>
+<p>This document will eventually have a full specification for TypeSpec. For now, it just has the grammar below.</p>
+</emu-intro>
+
+<emu-clause id="lexical-grammar">
+<h1>Lexical Grammar</h1>
+<emu-grammar type="definition">
+<![CDATA[
+// TODO: Incorporate remarks in comments below into the eventual specification text.
+
+SourceCharacter :
+    > any Unicode code point
+
+InputElement :
+    Token
+    Trivia
+
+Token :
+    Keyword
+    Identifier
+    NumericLiteral
+    StringLiteral
+    Punctuator
+
+Trivia :
+    Comment
+    WhiteSpace
+    LineTerminatorSequence
+
+Keyword :
+    BooleanLiteral
+    `import`
+    `model`
+    `namespace`
+    `op`
+    `extends`
+    `using`
+    `interface`
+    `union`
+    `extern`
+    `dec`
+    `fn`
+    `projection`
+    `void`
+    `never`
+    `unknown`
+
+Identifier :
+    IdentifierName but not Keyword
+    ``` BacktickedIdentifierChars ```
+
+IdentifierName :
+    IdentifierStart
+    IdentifierName IdentifierContinue
+
+IdentifierStart :
+    IdentifierContinue but not DecimalDigit
+
+///
+// This is a profile of UAX31.R2 Immutable Identifiers:
+// http://www.unicode.org/reports/tr31/#R2 
+//
+// The profile adds Pattern_Syntax code points outside the ASCII range, and
+// removes unassigned code points and 0xFFD (REPLACEMENT CHARACTER). 
+//
+// Unassigned code points are removed to ensure identifier normalization remains 
+// stable across versions of Unicode.
+//
+// Non-ASCII Pattern_Syntax characters are added as reserving ASCII characters
+// for future punctuation in the language is sufficient and users may wish to
+// use some of the Non-ASCII Pattern_Syntax characters in identifiers.
+//
+// 0xFFFD (REPLACEMENT CHARACTER) is removed to prevent its inadvertent 
+// substitution from becoming part of a valid identifier.
+///
+
+IdentifierContinue :
+    AsciiLetter
+    DecimalDigit
+    `$`
+    `_`
+    > any assigned Unicode code point other than U+FFFD greater than U+007F that does not have any of the following property values: General_Category=Surrogate, Control or Private_Use, Noncharacter_Code_Point=True, or Pattern_White_Space=True
+
+BacktickedIdentifierChars:
+    BacktickedIdentifierChar BacktickedIdentifierChars?
+
+BacktickedIdentifierChar :
+    SourceCharacter but not one of ``` or `\` or LineTerminator
+    `\` EscapeCharacter
+
+AsciiLetter : one of
+    `A` `B` `C` `D` `E` `F` `G` `H` `I` `J` `K` `L` `M` `N` `O` `P` `Q` `R` `S` `T` `U` `V` `W` `X` `Y` `Z`
+    `a` `b` `c` `d` `e` `f` `g` `h` `i` `j` `k` `l` `m` `n` `o` `p` `q` `r` `s` `t` `u` `v` `w` `x` `y` `z`
+
+BooleanLiteral :
+    `true`
+    `false`
+
+NumericLiteral :
+    DecimalLiteral
+    HexIntegerLiteral
+    BinaryIntegerLiteral
+
+DecimalLiteral :
+    DecimalIntegerLiteral `.` DecimalDigits ExponentPart?
+    DecimalIntegerLiteral ExponentPart?
+
+DecimalIntegerLiteral :
+    DecimalDigits
+    `+` DecimalDigits
+    `-` DecimalDigits
+
+DecimalDigits :
+    DecimalDigit
+    DecimalDigits DecimalDigit
+
+DecimalDigit : one of
+    `0` `1` `2` `3` `4` `5` `6` `7` `8` `9`
+
+ExponentPart :
+    `e` DecimalIntegerLiteral
+
+DecimalIntegerInteger :
+    DecimalDigits
+    `+` DecimalDigits
+    `-` DecimalDigits
+
+HexIntegerLiteral :
+    `0x` HexDigits
+
+HexDigits :
+    HexDigit
+    HexDigits HexDigit
+
+HexDigit : one of
+    `0` `1` `2` `3` `4` `5` `6` `7` `8` `9`
+    `A` `B` `C` `D` `E` `F`
+    `a` `b` `c` `d` `e` `f` 
+
+BinaryIntegerLiteral :
+    `0b` BinaryDigits
+
+BinaryDigits :
+    BinaryDigit
+    BinaryDigits BinaryDigit
+
+BinaryDigit : one of
+    `0` `1`
+
+StringLiteral :
+    `"` StringCharacters? `"`
+    `"""` TripleQuotedStringCharacters? `"""`
+    StringTemplate
+
+StringTemplate :
+    StringTemplateHead Expression StringTemplateSpans
+
+StringTemplateSpans :
+    StringTemplateTail
+    StringTemplateMiddleList StringTemplateTail
+
+StringTemplateMiddleList :
+    StringTemplateMiddle Expression
+    StringTemplateMiddle Expression StringTemplateMiddleList
+
+StringTemplateHead :
+    `"` StringCharacters? `${`
+    `"""` TripleQuotedStringCharacters? `${`
+
+StringTemplateMiddle :
+    `}` StringCharacters? `${`
+    `}` TripleQuotedStringCharacters? `${`
+
+StringTemplateTail :
+    `}` StringCharacters? `"`
+    `}` TripleQuotedStringCharacters? `"""`
+
+StringCharacters :
+    StringCharacter StringCharacters?
+
+StringCharacter :
+    `$` [lookahead != `{`]
+    SourceCharacter but not one of `"` or `\` or LineTerminator
+    `\` EscapeCharacter
+
+///
+// BUG: This does not specify the extra rules about `"""`s going
+// on their own lines and having consistent indentation.
+//
+// BUG: This does not allow `"` inside of `"""`s as it should.
+///
+TripleQuotedStringCharacters :
+    TripleQuotedStringCharacter TripleQuotedStringCharacters?
+
+TripleQuotedStringCharacter :
+    SourceCharacter but not one of `"` or `\`
+    `\` EscapeCharacter
+
+EscapeCharacter : one of
+    `"` `r` `n` `t` `\` ```
+
+Punctuator : one of 
+    `|` `?` `=` `&`  `:` `,` `;` `.` `<` `>` `(` `)` `{` `}` `[` `]` `@` `...` `#`
+
+///
+// WhiteSpace covers non-line-terminator whitespace characters. The
+// Pattern_White_Space property from Unicode TR31 defines the full set:
+//
+//    - U+0009  TAB   HORIZONTAL TAB
+//    - U+000B  VT    VERTICAL TAB
+//    - U+000C  FF    FORM FEED
+//    - U+0020  SP    SPACE
+//    - U+0085  NEL   NEXT LINE
+//    - U+200E  LRM   LEFT-TO-RIGHT MARK
+//    - U+200F  RLM   RIGHT-TO-LEFT MARK
+//    - U+2028  LS    LINE SEPARATOR
+//    - U+2029  PS    PARAGRAPH SEPARATOR
+//
+// Note: U+000A (LF), U+000D (CR), and the CR+LF sequence are line terminators
+// and are covered by LineTerminatorSequence instead of WhiteSpace.
+///
+WhiteSpace :
+    <TAB>
+    <VT>
+    <FF>
+    <SP>
+    <NEL>
+    <LRM>
+    <RLM>
+    <LS>
+    <PS>
+
+///
+// LineTerminatorSequence covers the three sequences recognized as line endings:
+// a lone LF (U+000A), a lone CR (U+000D) not followed by LF, or the CRLF pair.
+// Unlike WhiteSpace, line terminators are syntactically significant: they
+// terminate directive expressions (see DirectiveExpression).
+///
+LineTerminatorSequence :
+    <LF>
+    <CR> [lookahead != <LF>]
+    <CR> <LF>
+
+Comment :
+    MultiLineComment
+    SingleLineComment
+
+MultiLineComment :
+    `/*` MultiLineCommentChars? `*/`
+
+MultiLineCommentChars :
+    MultiLineNotAsteriskChar MultiLineCommentChars?
+    `*` PostAsteriskCommentChars?
+
+PostAsteriskCommentChars :
+    MultiLineNotForwardSlashOrAsteriskChar MultiLineCommentChars?
+    `*` PostAsteriskCommentChars?
+
+MultiLineNotAsteriskChar :
+    SourceCharacter but not `*`
+
+MultiLineNotForwardSlashOrAsteriskChar :
+    SourceCharacter but not one of `/` or `*`
+
+SingleLineComment :
+    `//` SingleLineCommentChars?
+
+SingleLineCommentChars :
+    SingleLineCommentChar SingleLineCommentChars?
+
+SingleLineCommentChar :
+    SourceCharacter but not LineTerminator
+]]>
+</emu-grammar>
+</emu-clause>
+
+<emu-clause id="syntactic-grammar">
+<h1>Syntactic Grammar</h1>
+<emu-grammar type="definition">
+<![CDATA[
+TypeSpecScript :
+    TypeSpecScriptItemList?
+
+TypeSpecScriptItemList :
+    TypeSpecScriptItemList? TypeSpecScriptItem
+
+TypeSpecScriptItem :
+    BlocklessNamespaceStatement
+    ImportStatement
+    Statement
+
+BlocklessNamespaceStatement :
+    DirectiveList? DecoratorList? `namespace` IdentifierOrMemberExpression `;`
+
+ImportStatement :
+    `import` StringLiteral `;`
+
+StatementList :
+    StatementList? Statement
+
+Statement :
+    ModelStatement
+    ScalarStatement
+    InterfaceStatement
+    NamespaceStatement
+    OperationStatement
+    UsingStatement
+    EnumStatement
+    AliasStatement
+    AugmentDecoratorStatement
+    DecoratorDeclarationStatement
+    FunctionDeclarationStatement
+    ConstStatement
+    `;`
+
+UsingStatement :
+    `using` IdentifierOrMemberExpression `;`
+
+ModelStatement :
+    DirectiveList? DecoratorList? `model` Identifier TemplateParameters? IsModelHeritage `;`
+    DirectiveList? DecoratorList? `model` Identifier TemplateParameters? ModelHeritage? `{` ModelBody? `}`
+
+IsModelHeritage :
+    `is` Expression
+
+ScalarStatement :
+    DirectiveList? DecoratorList? `scalar` Identifier TemplateParameters? ScalarExtends? `;`
+    DirectiveList? DecoratorList? `scalar` Identifier TemplateParameters? ScalarExtends? `{` ScalarBody? `}`
+
+ScalarExtends :
+    `extends` Expression
+
+ScalarBody : 
+  ScalarMemberList `;`?
+
+ScalarMemberList : 
+  ScalarMember
+  ScalarMemberList `;` ScalarMember
+
+ScalarMember:
+  `init` Identifier `(` FunctionParameterList? `)`
+
+ExtendsModelHeritage :
+    `extends` Expression
+
+ModelHeritage :
+    IsModelHeritage
+    ExtendsModelHeritage
+    
+ModelBody :
+    ModelPropertyList `,`?
+    ModelPropertyList `;`?
+
+ModelPropertyList :
+    ModelProperty
+    ModelPropertyList `,` ModelProperty
+    ModelPropertyList `;` ModelProperty
+
+ModelProperty :
+    ModelSpreadProperty
+    DirectiveList? DecoratorList? Identifier `?`? `:` Expression
+    DirectiveList? DecoratorList? StringLiteral `?`? `:` Expression
+
+ModelSpreadProperty :
+    `...` ReferenceExpression
+
+InterfaceStatement :
+    DirectiveList? DecoratorList? `interface` Identifier TemplateParameters? InterfaceHeritage? `{` InterfaceBody? `}`
+
+InterfaceHeritage :
+    `extends` ReferenceExpressionList;
+
+InterfaceBody
+    InterfaceMemberList `;`?
+
+InterfaceMemberList :
+    InterfaceMember
+    InterfaceMemberList `;` InterfaceMember
+
+InterfaceMember :
+    DirectiveList? DecoratorList? `op`? Identifier OperationSignature
+
+
+UnionStatement :
+    DirectiveList? DecoratorList? `union` Identifier TemplateParameters? UnionExtends? `{` UnionBody? `}`
+
+UnionExtends :
+    `extends` Expression
+
+UnionBody :
+    UnionVariantList `;`? 
+
+UnionVariantList :
+    UnionVariant
+    UnionVariantList `;` UnionVariant
+
+UnionVariant :
+    DirectiveList? DecoratorList? Identifier `:` Expression
+    DirectiveList? DecoratorList? StringLiteral `:` Expression
+    DirectiveList? DecoratorList? Expression
+
+EnumStatement :
+    DirectiveList? DecoratorList? `enum` Identifier `{` EnumBody? `}`
+
+EnumBody :
+    EnumMemberList `,`?
+    EnumMemberList `;`?
+
+EnumMemberList :
+    EnumMember
+    EnumMemberList `,` EnumMember
+    EnumMemberList `;` EnumMember
+
+EnumMember :
+    EnumSpreadMember
+    DirectiveList? DecoratorList? Identifier EnumMemberValue?
+    DirectiveList? DecoratorList? StringLiteral EnumMemberValue?
+
+EnumSpreadMember :
+    `...` ReferenceExpression
+
+EnumMemberValue :
+    `:` StringLiteral
+    `:` NumericLiteral
+
+AliasStatement :
+    `alias` Identifier TemplateParameters? `=` Expression;
+
+TemplateParameters :
+    `<` TemplateParameterList `>`
+
+TemplateParameterList :
+    TemplateParameter
+    TemplateParameterList `,` TemplateParameter
+
+TemplateParameter :
+    Identifier TemplateParameterConstraint? TemplateParameterDefault?
+
+TemplateParameterConstraint :
+    `extends` MixedParameterConstraint
+
+MixedParameterConstraint :
+  UnionExpressionOrHigher[+InParameter]
+  valueof UnionExpressionOrHigher
+
+  
+TemplateParameterDefault :
+    `=` Expression
+
+IdentifierList :
+    Identifier
+    IdentifierList `,` Identifier
+
+NamespaceStatement : 
+    DirectiveList? DecoratorList? `namespace` IdentifierOrMemberExpression `{` StatementList? `}`
+
+OperationSignatureDeclaration :
+  `(` ModelPropertyList? `)` `:` Expression
+
+OperationSignatureReference :
+  `is` ReferenceExpression
+
+OperationSignature :
+  OperationSignatureDeclaration
+  OperationSignatureReference
+
+OperationStatement :
+    DirectiveList? DecoratorList? `op` Identifier TemplateParameters? OperationSignature `;`
+
+Expression :
+    UnionExpressionOrHigher
+
+UnionExpressionOrHigher[InParameter] :
+    IntersectionExpressionOrHigher[?InParameter]
+    `|`? UnionExpressionOrHigher[?InParameter] `|` IntersectionExpressionOrHigher[?InParameter]
+
+IntersectionExpressionOrHigher[InParameter] :
+    ArrayExpressionOrHigher[?InParameter]
+    `&`? IntersectionExpressionOrHigher[?InParameter] `&` ArrayExpressionOrHigher[?InParameter]
+
+ValueOfExpression :
+  `valueof` Expression
+
+TypeOfExpression :
+    `typeof` Literal
+    `typeof` ReferenceExpression
+    `typeof` ParenthesizedExpression
+
+ArrayExpressionOrHigher[InParameter] :
+    PrimaryExpression[?InParameter]
+    ArrayExpressionOrHigher[?InParameter] `[` `]`
+
+PrimaryExpression[InParameter] :
+    TypeOfExpression
+    FunctionTypeExpression
+    Literal
+    CallOrReferenceExpression
+    ParenthesizedExpression[?InParameter]
+    ObjectLiteral
+    ArrayLiteral
+    ModelExpression
+    ModelDeclarationExpression
+    ScalarDeclarationExpression
+    EnumDeclarationExpression
+    UnionDeclarationExpression
+    TupleExpression
+
+FunctionTypeExpression :
+    `fn` `(` FunctionParameterList? `)` FunctionTypeExpressionReturnTypeAnnotation?
+
+FunctionTypeExpressionReturnTypeAnnotation :
+    `=>` MixedParameterConstraint
+
+Literal :
+    StringLiteral
+    BooleanLiteral
+    NumericLiteral
+
+CallOrReferenceExpression :
+    CallExpression
+    ReferenceExpression
+CallExpression
+    IdentifierOrMemberExpression CallArguments
+
+ReferenceExpression
+    IdentifierOrMemberExpression TemplateArguments?
+
+ReferenceExpressionList :
+    ReferenceExpression
+    ReferenceExpressionList `,` ReferenceExpression
+
+IdentifierOrMemberExpression :
+    Identifier
+    IdentifierOrMemberExpression `.` Identifier
+
+TemplateArguments :
+    `<` TemplateArgumentList `>`
+
+TemplateArgumentList :
+    TemplateArgument
+    TemplateArgumentList `,` TemplateArgument
+
+TemplateArgument :
+    Expression
+    Identifier `=` Expression
+
+ParenthesizedExpression[InParameter] :
+    [~InParameter] `(` Expression `)`
+    [+InParameter] `(` MixedParameterConstraint `)`
+
+ObjectLiteral :
+    `#{` ObjectLiteralBody? `}`
+
+ObjectLiteralBody : 
+    ModelPropertyList `,`?
+
+ObjectLiteralPropertyList :
+    ObjectLiteralProperty
+    ObjectLiteralPropertyList `,` ObjectLiteralProperty
+
+ObjectLiteralProperty :
+    ObjectLiteralSpreadProperty
+    Identifier `:` Expression
+
+ObjectLiteralSpreadProperty :
+    `...` ReferenceExpression
+
+ArrayLiteral :
+    `#[` ExpressionList? `]`
+
+ModelExpression :
+    `{` ModelBody? `}`
+
+ModelDeclarationExpression :
+    DecoratorList? `model` Identifier? TemplateParameters? ExtendsModelHeritage? IsModelHeritage
+    DecoratorList? `model` Identifier? TemplateParameters? ModelHeritage? `{` ModelBody? `}`
+
+ScalarDeclarationExpression :
+    DecoratorList? `scalar` Identifier? TemplateParameters? ScalarExtends?
+    DecoratorList? `scalar` Identifier? TemplateParameters? ScalarExtends? `{` ScalarBody? `}`
+
+EnumDeclarationExpression :
+    DecoratorList? `enum` Identifier? `{` EnumBody? `}`
+
+UnionDeclarationExpression :
+    DecoratorList? `union` Identifier? UnionExtends? `{` UnionBody? `}`
+
+TupleExpression :
+    `[` ExpressionList? `]`
+
+ExpressionList :
+    Expression
+    ExpressionList `,` Expression
+
+DecoratorList :
+    DecoratorList? Decorator
+
+Decorator :
+    `@` IdentifierOrMemberExpression DecoratorArguments?
+
+DecoratorArguments :
+    `(` ExpressionList? `)`
+
+///
+// DirectiveExpression covers the #suppress and #deprecated directives.
+// A directive is terminated by a line terminator (CR, LF, or CRLF) or end of
+// input. Because line terminators are classified as Trivia and are normally
+// transparent to the syntactic grammar, the termination rule is enforced
+// contextually by the parser rather than expressed as a formal production: all
+// DirectiveArguments must appear on the same source line as the `#` token.
+//
+// Currently recognized directive names are `suppress` and `deprecated`.
+//   #suppress <rule-code> <message>   -- suppresses a specific diagnostic (2 arguments)
+//   #deprecated <message>             -- marks a declaration as deprecated (1 argument)
+//
+// The number of required arguments is validated during semantic analysis, not
+// by this grammar.
+///
+DirectiveList :
+    DirectiveList? DirectiveExpression
+
+DirectiveExpression :
+    `#` Identifier DirectiveArguments?
+
+DirectiveArguments :
+    DirectiveArgument DirectiveArguments?
+
+DirectiveArgument :
+    StringLiteral
+    Identifier
+
+CallExpression :
+    IdentifierOrMemberExpression `(` ExpressionList? `)`
+
+
+AugmentDecoratorStatement :
+    `@@` IdentifierOrMemberExpression DecoratorArguments?
+
+AugmentDecoratorArguments :
+  `(` ExpressionList `)`
+
+
+DecoratorDeclarationStatement :
+  DecoratorModifiers? `dec` `(` FunctionParameterList? `)`
+
+DecoratorModifiers:
+  `extern`
+
+FunctionDeclarationStatement :
+  FunctionModifiers? `fn` `(` FunctionParameterList? `)` TypeAnnotation?
+
+TypeAnnotation:
+  `:` MixedParameterConstraint
+
+FunctionModifiers:
+  `extern`
+
+FunctionParameterList : 
+  FunctionParameter
+  FunctionParameterList `,` FunctionParameter
+
+FunctionParameter :
+  `...`? Identifier `?`? TypeAnnotation?
+
+ConstStatement :
+  `const` Identifier TypeAnnotation? `=` Expression `;`
+</emu-grammar>
+</emu-clause>

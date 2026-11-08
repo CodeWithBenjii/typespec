@@ -1,0 +1,82 @@
+{
+  "name": "@typespec/html-program-viewer",
+  "version": "0.87.0",
+  "author": "Microsoft Corporation",
+  "description": "TypeSpec library for emitting an html view of the program.",
+  "homepage": "https://typespec.io",
+  "readme": "https://github.com/microsoft/typespec/blob/main/README.md",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/microsoft/typespec.git"
+  },
+  "bugs": {
+    "url": "https://github.com/microsoft/typespec/issues"
+  },
+  "keywords": [
+    "typespec"
+  ],
+  "type": "module",
+  "main": "dist/emitter/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/emitter/index.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "default": "./dist/react/index.js"
+    },
+    "./style.css": "./dist/style.css"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "clean": "rimraf ./dist ./temp",
+    "build": "pnpm build:react && pnpm build:emitter",
+    "build:react": "vite build && pnpm build:types",
+    "build:emitter": "vite build --config vite.emitter.config.ts",
+    "build:types": "tsc -p tsconfig.declaration.json",
+    "watch": "concurrently --kill-others \"vite build --watch --emptyOutDir false\" \"pnpm build:types --watch\"",
+    "test": "vitest run",
+    "test:ui": "vitest --ui",
+    "test:ci": "vitest run --coverage --reporter=junit --reporter=default",
+    "lint": "oxlint . --deny-warnings",
+    "lint:fix": "oxlint . --fix"
+  },
+  "files": [
+    "dist/**",
+    "!dist/test/**"
+  ],
+  "peerDependencies": {
+    "@typespec/compiler": "workspace:^"
+  },
+  "dependencies": {
+    "@fluentui/react-components": "catalog:",
+    "@fluentui/react-icons": "catalog:",
+    "@fluentui/react-list": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-hotkeys-hook": "catalog:"
+  },
+  "devDependencies": {
+    "@babel/core": "catalog:",
+    "@testing-library/dom": "catalog:",
+    "@testing-library/jest-dom": "catalog:",
+    "@testing-library/react": "catalog:",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@typespec/compiler": "workspace:^",
+    "@typespec/react-components": "workspace:^",
+    "@vitejs/plugin-react": "catalog:",
+    "@vitest/coverage-v8": "catalog:",
+    "@vitest/ui": "catalog:",
+    "concurrently": "catalog:",
+    "rimraf": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plugin-checker": "catalog:",
+    "vitest": "catalog:"
+  }
+}

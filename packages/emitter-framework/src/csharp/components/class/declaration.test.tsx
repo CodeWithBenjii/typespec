@@ -1,0 +1,554 @@
+import {
+  Experimental_ComponentOverrides,
+  Experimental_ComponentOverridesConfig,
+} from "#core/index.js";
+import { Tester } from "#test/test-host.js";
+import { List, type Children } from "@alloy-js/core";
+import { d } from "@alloy-js/core/testing";
+import { createCSharpNamePolicy, SourceFile } from "@alloy-js/csharp";
+import { t, type TesterInstance } from "@typespec/compiler/testing";
+import { beforeEach, describe, expect, it } from "vitest";
+import { Output } from "../../../core/index.js";
+import { ClassDeclaration, EnumDeclaration } from "../../index.js";
+
+let runner: TesterInstance;
+
+beforeEach(async () => {
+  runner = await Tester.createInstance();
+});
+
+function Wrapper(props: { children: Children }) {
+  const policy = createCSharpNamePolicy();
+  return (
+    <Output program={runner.program} namePolicy={policy}>
+      <SourceFile path="test.cs">{props.children}</SourceFile>
+    </Output>
+  );
+}
+
+it("renders an empty class declaration", async () => {
+  const { TestModel } = await runner.compile(t.code`
+    model ${t.model("TestModel")} {}
+  `);
+
+  expect(
+    <Wrapper>
+      <ClassDeclaration type={TestModel} />
+    </Wrapper>,
+  ).toRenderTo(`
+    class TestModel {}
+  `);
+});
+
+it("renders a class declaration with properties", async () => {
+  const { TestModel } = await runner.compile(t.code`
+    model ${t.model("TestModel")} {
+      @test Prop1: string;
+      @test Prop2: int32;
+    }
+  `);
+
+  expect(
+    <Wrapper>
+      <ClassDeclaration type={TestModel} />
+    </Wrapper>,
+  ).toRenderTo(`
+    class TestModel
+    {
+        public required string Prop1 { get; set; }
+    
+        public required int Prop2 { get; set; }
+    }
+  `);
+});
+
+it("renders a class declaration with properties using component override", async () => {
+  const { TestModel, Foo, Bar } = await runner.compile(t.code`
+    model ${t.model("Foo")} {}
+    model ${t.model("Bar")} {}
+    model ${t.model("TestModel")} {
+      Prop1: string;
+      Prop2: int32;
+      Prop3?: Foo;
+      Prop4?: "foo" | "bar";
+    }
+  `);
+
+  expect(
+    <Wrapper>
+      <TestClientOverrides>
+        <List hardline>
+          <ClassDeclaration type={Foo} />
+          <ClassDeclaration type={Bar} />
+          <ClassDeclaration type={TestModel} />
+        </List>
+      </TestClientOverrides>
+    </Wrapper>,
+  ).toRenderTo(d`
+    class Foo {}
+    class Bar {}
+    class TestModel
+    {
+        public required string Prop1 { get; set; }
+    
+        public required int Prop2 { get; set; }
+    
+        public Bar? Prop3 { get; set; }
+
+        public string? Prop4 { get; set; }
+    }
+  `);
+});
+
+function TestClientOverrides(props: { children?: Children }) {
+  const overrides = Experimental_ComponentOverridesConfig()
+    .forTypeKind("Model", {
+      reference: (props) => {
+        if (props.type.name === "Foo") {
+          return "Bar";
+        } else {
+          return props.default;
+        }
+      },
+    })
+    .forTypeKind("Union", {
+      reference: (props) => {
+        for (const variant of props.type.variants.values()) {
+          if (
+            variant.type.kind !== "String" ||
+            (variant.type.kind === "String" && !variant.type.value)
+          ) {
+            return props.default;
+          }
+        }
+        return "string";
+      },
+    });
+  return (
+    <Experimental_ComponentOverrides overrides={overrides}>
+      {props.children}
+    </Experimental_ComponentOverrides>
+  );
+}
+
+it("can override class name", async () => {
+  const { TestModel } = await runner.compile(t.code`
+    model ${t.model("TestModel")} {}
+  `);
+
+  expect(
+    <Wrapper>
+      <ClassDeclaration type={TestModel} name="CustomClassName" />
+    </Wrapper>,
+  ).toRenderTo(`
+    class CustomClassName {}
+  `);
+});
+
+it("renders a class with access modifiers", async () => {
+  const { TestModel } = await runner.compile(t.code`
+    model ${t.model("TestModel")} {
+    }
+  `);
+
+  expect(
+    <Wrapper>
+      <ClassDeclaration type={TestModel} protected />
+    </Wrapper>,
+  ).toRenderTo(`
+    protected class TestModel {}
+  `);
+});
+
+describe("from an interface", () => {
+  it("renders an empty class", async () => {
+    const { TestInterface } = await runner.compile(t.code`
+    interface ${t.interface("TestInterface")} {
+    }
+  `);
+
+    expect(
+      <Wrapper>
+        <ClassDeclaration type={TestInterface} />
+      </Wrapper>,
+    ).toRenderTo(`
+      class TestInterface {}
+    `);
+  });
+
+  it("renders a class with operations", async () => {
+    const { TestInterface } = await runner.compile(t.code`
+    interface ${t.interface("TestInterface")} {
+      op getName(id: string): string;
+    }
+  `);
+
+    expect(
+      <Wrapper>
+        <ClassDeclaration type={TestInterface} />
+      </Wrapper>,
+    ).toRenderTo(`
+      class TestInterface
+      {
+          public abstract string GetName(string id);
+      }
+    `);
+  });
+});
+
+it("renders a class with model members", async () => {
+  const { TestModel, TestReference } = await runner.compile(t.code`
+    model ${t.model("TestReference")} { }
+    model ${t.model("TestModel")} {
+      prop1: TestReference;
+    }
+  `);
+
+  expect(
+    <Wrapper>
+      <ClassDeclaration type={TestReference} />
+      <hbr />
+      <ClassDeclaration type={TestModel} />
+    </Wrapper>,
+  ).toRenderTo(`
+    class TestReference {}
+    class TestModel
+    {
+        public required TestReference Prop1 { get; set; }
+    }
+  `);
+});
+
+it("renders a class with enum members", async () => {
+  const { TestModel, TestEnum } = await runner.compile(t.code`
+    @test enum ${t.enum("TestEnum")} {
+      Value1;
+      Value2;
+    }
+    model ${t.model("TestModel")} {
+      @test prop1: TestEnum;
+    }
+  `);
+
+  expect(
+    <Wrapper>
+      <EnumDeclaration type={TestEnum} />
+      <hbr />
+      <ClassDeclaration type={TestModel} />
+    </Wrapper>,
+  ).toRenderTo(`
+    enum TestEnum
+    {
+        Value1,
+        Value2
+    }
+    class TestModel
+    {
+        public required TestEnum Prop1 { get; set; }
+    }
+  `);
+});
+
+it("maps prop: string | null to nullable property", async () => {
+  const { TestModel } = await runner.compile(t.code`
+    model ${t.model("TestModel")} {
+      prop1: string | null;
+    }
+  `);
+
+  expect(
+    <Wrapper>
+      <ClassDeclaration type={TestModel} />
+    </Wrapper>,
+  ).toRenderTo(`
+    class TestModel
+    {
+        public required string? Prop1 { get; set; }
+    }
+  `);
+});
+
+it("renders a class with string enums", async () => {
+  const { TestModel, TestEnum } = await runner.compile(t.code`
+    @test enum ${t.enum("TestEnum")} {
+      Value1;
+      Value2;
+    }
+    model ${t.model("TestModel")} {
+      @test prop1: TestEnum;
+    }
+  `);
+
+  expect(
+    <Wrapper>
+      <EnumDeclaration type={TestEnum} />
+      <hbr />
+      <ClassDeclaration type={TestModel} />
+    </Wrapper>,
+  ).toRenderTo(`
+    enum TestEnum
+    {
+        Value1,
+        Value2
+    }
+    class TestModel
+    {
+        public required TestEnum Prop1 { get; set; }
+    }
+  `);
+});
+
+describe("with doc comments", () => {
+  it("renders a model with docs", async () => {
+    const { TestModel } = await runner.compile(t.code`
+    @doc("This is a test model")
+    model ${t.model("TestModel")} {
+      @doc("This is a test property")
+        prop1: string;
+      }
+    
+  `);
+
+    expect(
+      <Wrapper>
+        <ClassDeclaration type={TestModel} />
+      </Wrapper>,
+    ).toRenderTo(`
+      /// <summary>
+      /// This is a test model
+      /// </summary>
+      class TestModel
+      {
+          /// <summary>
+          /// This is a test property
+          /// </summary>
+          public required string Prop1 { get; set; }
+      }
+    `);
+  });
+
+  it("renders an interface with docs", async () => {
+    const { TestInterface } = await runner.compile(t.code`
+      @doc("This is a test interface")
+      @test interface ${t.interface("TestInterface")} {
+        @doc("This is a test operation")
+        @returnsDoc("The name of the item")
+        op getName(id: string): string;
+      }
+    `);
+
+    expect(
+      <Wrapper>
+        <ClassDeclaration type={TestInterface} />
+      </Wrapper>,
+    ).toRenderTo(`
+      /// <summary>
+      /// This is a test interface
+      /// </summary>
+      class TestInterface
+      {
+          /// <summary>
+          /// This is a test operation
+          /// </summary>
+          ///
+          /// <returns>
+          /// The name of the item
+          /// </returns>
+          public abstract string GetName(string id);
+      }
+    `);
+  });
+});
+
+describe("declaration overrides", () => {
+  it("replaces a class declaration entirely", async () => {
+    const { TestModel } = await runner.compile(t.code`
+      model ${t.model("TestModel")} {
+        Prop1: string;
+      }
+    `);
+
+    const overrides = Experimental_ComponentOverridesConfig().forTypeKind("Model", {
+      declaration: () => "class Replaced {}",
+    });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <ClassDeclaration type={TestModel} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(`class Replaced {}`);
+  });
+
+  it("re-renders the default declaration with modified props", async () => {
+    const { TestModel } = await runner.compile(t.code`
+      model ${t.model("TestModel")} {}
+    `);
+
+    const overrides = Experimental_ComponentOverridesConfig().forTypeKind("Model", {
+      declaration: (props) => (
+        <props.Declaration {...props.declarationProps} name="Renamed" partial />
+      ),
+    });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <ClassDeclaration type={TestModel} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(`partial class Renamed {}`);
+  });
+
+  it("falls back to the default when only a reference override is configured", async () => {
+    const { TestModel } = await runner.compile(t.code`
+      model ${t.model("TestModel")} {}
+    `);
+
+    const overrides = Experimental_ComponentOverridesConfig().forTypeKind("Model", {
+      reference: () => "Nope",
+    });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <ClassDeclaration type={TestModel} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(`class TestModel {}`);
+  });
+
+  it("overrides a property declaration", async () => {
+    const { TestModel } = await runner.compile(t.code`
+      model ${t.model("TestModel")} {
+        Prop1: string;
+        Prop2: int32;
+      }
+    `);
+
+    const overrides = Experimental_ComponentOverridesConfig().forTypeKind("ModelProperty", {
+      declaration: (props) =>
+        props.type.name === "Prop1" ? "public string Custom { get; }" : props.default,
+    });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <ClassDeclaration type={TestModel} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(d`
+      class TestModel
+      {
+          public string Custom { get; }
+
+          public required int Prop2 { get; set; }
+      }
+    `);
+  });
+
+  it("overrides an enum declaration", async () => {
+    const { TestEnum } = await runner.compile(t.code`
+      enum ${t.enum("TestEnum")} {
+        A,
+        B,
+      }
+    `);
+
+    const overrides = Experimental_ComponentOverridesConfig().forTypeKind("Enum", {
+      declaration: (props) => <props.Declaration {...props.declarationProps} name="RenamedEnum" />,
+    });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <EnumDeclaration type={TestEnum} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(d`
+      enum RenamedEnum
+      {
+          A,
+          B
+      }
+    `);
+  });
+});
+
+describe("override precedence", () => {
+  it("does not let a type-level reference override hide a kind-level declaration override", async () => {
+    const { TestModel } = await runner.compile(t.code`
+      model ${t.model("TestModel")} {}
+    `);
+
+    const overrides = Experimental_ComponentOverridesConfig()
+      .forType(TestModel, { reference: () => "Unrelated" })
+      .forTypeKind("Model", {
+        declaration: (props) => <props.Declaration {...props.declarationProps} name="Renamed" />,
+      });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <ClassDeclaration type={TestModel} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(`class Renamed {}`);
+  });
+
+  it("does not let a type-level declaration override hide a kind-level reference override", async () => {
+    const { Container, TestModel } = await runner.compile(t.code`
+      model ${t.model("TestModel")} {}
+      model ${t.model("Container")} {
+        prop: TestModel;
+      }
+    `);
+
+    const overrides = Experimental_ComponentOverridesConfig()
+      .forType(TestModel, { declaration: () => "unreachable" })
+      .forTypeKind("Model", { reference: () => "Referenced" });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <ClassDeclaration type={Container} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(d`
+      class Container
+      {
+          public required Referenced Prop { get; set; }
+      }
+    `);
+  });
+
+  it("resolves each override kind independently up the scalar hierarchy", async () => {
+    const { Container, myBase, myDerived } = await runner.compile(t.code`
+      scalar ${t.scalar("myBase")} extends string;
+      scalar ${t.scalar("myDerived")} extends myBase;
+      model ${t.model("Container")} {
+        prop: myDerived;
+      }
+    `);
+
+    // `myDerived` only overrides `declaration`, so the `reference` override on its base
+    // scalar must still be found.
+    const overrides = Experimental_ComponentOverridesConfig()
+      .forType(myDerived, { declaration: () => "unreachable" })
+      .forType(myBase, { reference: () => "BaseRef" });
+
+    expect(
+      <Wrapper>
+        <Experimental_ComponentOverrides overrides={overrides}>
+          <ClassDeclaration type={Container} />
+        </Experimental_ComponentOverrides>
+      </Wrapper>,
+    ).toRenderTo(d`
+      class Container
+      {
+          public required BaseRef Prop { get; set; }
+      }
+    `);
+  });
+});

@@ -1,0 +1,1703 @@
+import type { Diagnostic, Service } from "@typespec/compiler";
+import type { Contact, ExtensionKey, License } from "@typespec/openapi";
+
+/**
+ * Intersection used by helpers that build schema keywords across supported versions.
+ * This is not a separate schema dialect: emitted keywords must still follow the selected OpenAPI version.
+ */
+export type CommonOpenAPI3Schema = OpenAPI3Schema & OpenAPISchema3_1 & OpenAPISchema3_2;
+
+/** Schema shapes accepted across supported OpenAPI versions; interpret keywords using the enclosing document's version. */
+export type SupportedOpenAPISchema = OpenAPI3Schema | OpenAPISchema3_1 | OpenAPISchema3_2;
+
+/** Documents for the supported OpenAPI versions; narrow on `openapi` before using version-specific fields. */
+export type SupportedOpenAPIDocuments = OpenAPI3Document | OpenAPIDocument3_1 | OpenAPIDocument3_2;
+
+/** Vendor extension fields, whose names must begin with `x-`. */
+export type Extensions = {
+  [key in ExtensionKey]?: any;
+};
+
+/** An OpenAPI 3.0 document, using the 3.0 schema vocabulary rather than JSON Schema 2020-12. */
+export interface OpenAPI3Document extends Extensions {
+  /** OpenAPI specification version, independent of the API version in `info.version`. */
+  openapi: "3.0.0";
+
+  /**
+   * Provides metadata about the API. The metadata can be used by the clients if needed.
+   */
+  info: OpenAPI3Info;
+
+  /** Additional external documentation. */
+  externalDocs?: OpenAPI3ExternalDocs;
+
+  /** The available paths and operations for the API */
+  paths: Record<string, OpenAPI3PathItem>;
+
+  /**
+   * An array of Server Objects, which provide connectivity information to a target server.
+   * If the servers property is not provided, or is an empty array, the default value would be a Server Object with a url value of /.
+   */
+  servers?: OpenAPI3Server[];
+
+  /**
+   * A list of tags used by the specification with additional metadata.
+   * The order of the tags can be used to reflect on their order by the parsing tools.
+   * Not all tags that are used by the Operation Object must be declared.
+   * The tags that are not declared MAY be organized randomly or based on the tools' logic. Each tag name in the list MUST be unique.
+   */
+  tags?: OpenAPI3Tag[];
+
+  /** An element to hold various schemas for the specification. */
+  components?: OpenAPI3Components;
+
+  /** A declaration of which security mechanisms can be used across the API. The list of values includes alternative security requirement objects that can be used. Only one of the security requirement objects need to be satisfied to authorize a request. Individual operations can override this definition. */
+  security?: Record<string, string[]>[];
+}
+
+/**
+ * Documents and diagnostics for a TypeSpec service. Narrow on `versioned` to
+ * access either one document or the service's version snapshots.
+ */
+export type OpenAPI3ServiceRecord =
+  OpenAPI3UnversionedServiceRecord | OpenAPI3VersionedServiceRecord;
+
+/** A service emitted as one document, including services with only transient dependency versioning. */
+export interface OpenAPI3UnversionedServiceRecord {
+  /** The service that generated this OpenAPI document */
+  readonly service: Service;
+
+  /** Whether the service is versioned */
+  readonly versioned: false;
+
+  /** The OpenAPI 3 document */
+  readonly document: SupportedOpenAPIDocuments;
+
+  /** The diagnostics created for this document */
+  readonly diagnostics: readonly Diagnostic[];
+}
+
+/** A versioned service whose documents are grouped by API version, not OpenAPI specification version. */
+export interface OpenAPI3VersionedServiceRecord {
+  /** The service that generated this OpenAPI document */
+  readonly service: Service;
+
+  /** Whether the service is versioned */
+  readonly versioned: true;
+
+  /** The OpenAPI 3 document records for each version of this service */
+  readonly versions: OpenAPI3VersionedDocumentRecord[];
+}
+
+/**
+ * One API-version snapshot of a versioned service, with its document-specific diagnostics.
+ */
+export interface OpenAPI3VersionedDocumentRecord {
+  /** The OpenAPI document*/
+  readonly document: SupportedOpenAPIDocuments;
+
+  /** The service that generated this OpenAPI document. */
+  readonly service: Service;
+
+  /** The service's API version for this snapshot, not the OpenAPI specification version. */
+  readonly version: string;
+
+  /** The diagnostics created for this version. */
+  readonly diagnostics: readonly Diagnostic[];
+}
+
+/** API metadata shared by the document versions supported by this package. */
+export interface OpenAPI3Info extends Extensions {
+  /** Human-readable API title, not an identifier for operations or schemas. */
+  title: string;
+  /** Longer API description; CommonMark may be used for rich text. */
+  description?: string;
+  /** URL of the API's terms of service. */
+  termsOfService?: string;
+  /** API or document version; does not select the OpenAPI specification version. */
+  version: string;
+  /** Contact details for questions about this API. */
+  contact?: Contact;
+  /** License governing use of the API. */
+  license?: License;
+  /** Short API summary, supported by OpenAPI 3.1 and later. */
+  summary?: string;
+}
+
+/** A target endpoint whose URL can contain named variable substitutions. */
+export interface OpenAPI3Server {
+  /** Absolute or relative endpoint URL, with optional `{variable}` placeholders. */
+  url: string;
+  /** Human-readable explanation of when to use this endpoint. */
+  description?: string;
+  /** Substitutions keyed by the placeholder names used in `url`. */
+  variables?: Record<string, OpenAPI3ServerVariable>;
+}
+
+/** A string substitution for a server URL placeholder, with a required fallback value. */
+export interface OpenAPI3ServerVariable {
+  /** Allowed substitutions; when supplied, must include `default`. */
+  enum?: string[];
+  /** Substitution used when the caller does not supply a value. */
+  default: string;
+  /** Explanation of the substitution, which may use CommonMark. */
+  description?: string;
+}
+
+/** A link to documentation outside the OpenAPI document. */
+export interface OpenAPI3ExternalDocs {
+  /** URL at which the additional documentation can be found. */
+  url: string;
+  /** Explanation of the linked material, which may use CommonMark. */
+  description?: string;
+}
+
+/** Metadata for an operation tag; operations refer to it by `name`. */
+export interface OpenAPI3Tag extends Extensions {
+  /** Tag identifier, unique within the document's tag list. */
+  name: string;
+  /** Explanation of the group of operations, which may use CommonMark. */
+  description?: string;
+  /** Additional documentation for the tagged operations. */
+  externalDocs?: OpenAPI3ExternalDocs;
+}
+
+/** HTTP method fields available on OpenAPI 3.0 and 3.1 Path Item Objects. */
+export type OpenAPI3HttpMethod =
+  "get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace";
+
+/** Named method fields in OpenAPI 3.2, adding `query` to the methods supported in earlier versions. */
+export type OpenAPIHttpMethod3_2 = OpenAPI3HttpMethod | "query";
+
+/** Named HTTP method fields supported across versions; does not include arbitrary 3.2 `additionalOperations` keys. */
+export type HttpMethod = OpenAPI3HttpMethod | OpenAPIHttpMethod3_2;
+
+/**
+ * Describes the operations available on a single path. A Path Item may be empty, due to ACL constraints. The path itself is still exposed to the documentation viewer but they will not know which operations and parameters are available.
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#fixed-fields-6
+ */
+export type OpenAPI3PathItem = {
+  [method in OpenAPI3HttpMethod]?: OpenAPI3Operation;
+} & {
+  /** Parameters shared by every operation on this path; operations can override matching name/location pairs. */
+  parameters?: OpenAPI3Parameter[];
+} & Extensions;
+
+/** Reusable OpenAPI 3.0 definitions. A component has no effect until an operation or another definition references it. */
+export interface OpenAPI3Components extends Extensions {
+  /** Named schemas addressed through `#/components/schemas/{name}`. */
+  schemas?: Record<string, OpenAPI3Schema>;
+  /**
+   * Reusable header definitions keyed by component name. The referencing response
+   * or encoding's `headers` map supplies the HTTP header name.
+   */
+  headers?: Record<string, OpenAPI3Header>;
+  /** Reusable response descriptions, payloads and headers. */
+  responses?: Record<string, OpenAPI3Response>;
+  /** Reusable parameters, each retaining its own name and location. */
+  parameters?: Record<string, OpenAPI3Parameter>;
+  /** Named examples that media types or parameters can reference. */
+  examples?: Record<string, OpenAPI3Example>;
+  /** Reusable request payload descriptions and media types. */
+  requestBodies?: Record<string, OpenAPI3RequestBody>;
+  /** Authentication definitions selected by name in security requirements. */
+  securitySchemes?: Record<string, OpenAPI3SecurityScheme>;
+  /** Named relationships from a response to another operation. */
+  links?: Record<string, OpenAPI3Link>;
+}
+
+/** Response map key: an HTTP status code, a status-code range such as `2XX`, or the `default` fallback. */
+export type OpenAPI3StatusCode = string | "default" | "1XX" | "2XX" | "3XX" | "4XX" | "5XX";
+
+/** Responses for an operation, keyed by status; an explicit code takes precedence over a range. */
+export type OpenAPI3Responses = {
+  /** Response definition or reference for a status code, range, or `default`. */
+  [status: OpenAPI3StatusCode]: Refable<OpenAPI3Response>;
+} & Extensions;
+
+/** One possible operation response, independent of the status key under which it is used. */
+export type OpenAPI3Response = Extensions & {
+  /** A short description of the response. CommonMark syntax MAY be used for rich text representation. */
+  description: string;
+
+  /** Maps a header name to its definition. RFC7230 states header names are case insensitive. If a response header is defined with the name "Content-Type", it SHALL be ignored. */
+  headers?: Record<string, Refable<OpenAPI3Header>>;
+
+  /** A map containing descriptions of potential response payloads. The key is a media type or media type range and the value describes it. For responses that match multiple keys, only the most specific key is applicable. e.g. text/plain overrides text/* */
+  content?: Record<string, OpenAPI3MediaType>;
+
+  /** A map of operations links that can be followed from the response. The key of the map is a short name for the link, following the naming constraints of the names for Component Objects. */
+  links?: Record<string, Refable<OpenAPI3Link>>;
+};
+
+/**
+ * Each Media Type Object provides schema and examples for the media type identified by its key.
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#media-type-object
+ */
+export type OpenAPI3MediaType = Extensions & {
+  /** The schema defining the content of the request, response, or parameter. */
+  schema?: Refable<OpenAPI3Schema>;
+
+  /** A map between a property name and its encoding information. The key, being the property name, MUST exist in the schema as a property. The encoding object SHALL only apply to requestBody objects when the media type is multipart or application/x-www-form-urlencoded.  */
+  encoding?: Record<string, OpenAPI3Encoding>;
+
+  /** Example */
+  example?: unknown;
+
+  /** Examples with title  */
+  examples?: Record<string, OpenAPI3Example>;
+};
+
+/**
+ * A single encoding definition applied to a single schema property.
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#encoding-object
+ */
+export type OpenAPI3Encoding = Extensions & {
+  /** the Content-Type for encoding a specific property. Default value depends on the property type: for string with format being binary – application/octet-stream; for other primitive types – text/plain; for object - application/json; for array – the default is defined based on the inner type. The value can be a specific media type (e.g. application/json), a wildcard media type (e.g. image/*), or a comma-separated list of the two types. */
+  contentType?: string;
+
+  /** A map allowing additional information to be provided as headers, for example Content-Disposition. Content-Type is described separately and SHALL be ignored in this section. This property SHALL be ignored if the request body media type is not a multipart. */
+  headers?: Record<string, Refable<OpenAPI3Header>>;
+
+  /** Describes how a specific property value will be serialized depending on its type. See Parameter Object for details on the style property. The behavior follows the same values as query parameters, including default values. This property SHALL be ignored if the request body media type is not application/x-www-form-urlencoded. */
+  style?: "form" | "spaceDelimited" | "pipeDelimited" | "deepObject";
+
+  /** When this is true, property values of type array or object generate separate parameters for each value of the array, or key-value-pair of the map. For other types of properties this property has no effect. When style is form, the default value is true. For all other styles, the default value is false. This property SHALL be ignored if the request body media type is not application/x-www-form-urlencoded. */
+  explode?: boolean;
+
+  /** Determines whether the parameter value SHOULD allow reserved characters, as defined by RFC3986 :/?#[]@!$&'()*+,;= to be included without percent-encoding. The default value is false. This property SHALL be ignored if the request body media type is not application/x-www-form-urlencoded */
+  allowReserved?: boolean;
+};
+
+/**
+ * Describes a single request body.
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#request-body-object
+ */
+export type OpenAPI3RequestBody = Extensions & {
+  /** A brief description of the request body. This could contain examples of use. CommonMark syntax MAY be used for rich text representation. */
+  description?: string;
+
+  /** The content of the request body. The key is a media type or media type range and the value describes it. For requests that match multiple keys, only the most specific key is applicable. e.g. text/plain overrides text/* */
+  content: Record<string, OpenAPI3MediaType>;
+
+  /** Determines if the request body is required in the request. Defaults to false. */
+  required?: boolean;
+};
+
+/** Authentication scheme definitions referenced by name from document or operation security requirements. */
+export type OpenAPI3SecurityScheme =
+  | OpenAPI3ApiKeySecurityScheme
+  | OpenAPI3OAuth2SecurityScheme
+  | OpenAPI3OpenIdConnectSecurityScheme
+  | OpenAPI3HttpSecurityScheme;
+
+/**
+ * defines a security scheme that can be used by the operations. Supported schemes are HTTP authentication, an API key (either as a header, a cookie parameter or as a query parameter), OAuth2's common flows (implicit, password, application and access code) as defined in RFC6749, and OpenID Connect Discovery.
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#security-scheme-object
+ */
+export interface OpenAPI3SecuritySchemeBase extends Extensions {
+  /** A short description for security scheme. CommonMark syntax MAY be used for rich text representation. */
+  description?: string;
+}
+
+/**
+ * defines an ApiKey security scheme that can be used by the operations
+ */
+export interface OpenAPI3ApiKeySecurityScheme extends OpenAPI3SecuritySchemeBase {
+  /** ApiKey */
+  type: "apiKey";
+
+  /** The name of the header, query or cookie parameter to be used. */
+  name: string;
+
+  /** The location of the API key. */
+  in: "cookie" | "header" | "query";
+}
+
+/**
+ * defines an Http security scheme that can be used by the operations
+ */
+export interface OpenAPI3HttpSecurityScheme extends OpenAPI3SecuritySchemeBase {
+  /** HTTP */
+  type: "http";
+
+  /** he name of the HTTP Authorization scheme to be used in the Authorization header as defined in RFC7235. */
+  scheme: string;
+
+  /** A hint to the client to identify how the bearer token is formatted. Bearer tokens are usually generated by an authorization server, so this information is primarily for documentation purposes. */
+  bearerFormat?: string;
+}
+
+/**
+ * defines an OAuth2 security scheme that can be used by the operations
+ */
+export interface OpenAPI3OAuth2SecurityScheme extends OpenAPI3SecuritySchemeBase {
+  /** Selects OAuth 2.0 authentication; the supported grant types are described in `flows`. */
+  type: "oauth2";
+
+  /** An object containing configuration information for the flow types supported. */
+  flows: OpenAPI3OAuthFlows;
+}
+
+/**
+ * Allows configuration of the supported OAuth Flows.
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#oauth-flows-object
+ */
+export interface OpenAPI3OAuthFlows extends Extensions {
+  /** Configuration for the OAuth Implicit flow */
+  implicit?: OpenAPI3ImplicitOAuthFlow;
+
+  /** Configuration for the OAuth Resource Owner Password flow */
+  password?: OpenAPI3PasswordOAuthFlow;
+
+  /** Configuration for the OAuth Client Credentials flow. Previously called application in OpenAPI 2.0. */
+  clientCredentials?: OpenAPI3ClientCredentialsFlow;
+
+  /** Configuration for the OAuth Authorization Code flow. Previously called accessCode in OpenAPI 2.0. */
+  authorizationCode?: OpenAPI3AuthorizationCodeOAuthFlow;
+}
+
+/** Common definition for the OAuth flows */
+export interface OpenAPI3OAuth2Flow extends Extensions {
+  /** The URL to be used for obtaining refresh tokens. This MUST be in the form of a URL. */
+  refreshUrl?: string;
+
+  /** The available scopes for the OAuth2 security scheme. A map between the scope name and a short description for it. */
+  scopes: Record<string, string>;
+}
+
+/** Configuration for the OAuth Client Credentials flow. Previously called application in OpenAPI 2.0. */
+export interface OpenAPI3ClientCredentialsFlow extends OpenAPI3OAuth2Flow {
+  /** The token URL to be used for this flow. This MUST be in the form of a URL. */
+  tokenUrl: string;
+}
+
+/** Configuration for the OAuth Resource Owner Password flow */
+export interface OpenAPI3PasswordOAuthFlow extends OpenAPI3OAuth2Flow {
+  /** The token URL to be used for this flow. This MUST be in the form of a URL. */
+  tokenUrl: string;
+}
+
+/** Configuration for the OAuth Implicit flow */
+export interface OpenAPI3ImplicitOAuthFlow extends OpenAPI3OAuth2Flow {
+  /** The authorization URL to be used for this flow. This MUST be in the form of a URL. */
+  authorizationUrl: string;
+}
+
+/** Configuration for the OAuth Authorization Code flow. Previously called accessCode in OpenAPI 2.0. */
+export interface OpenAPI3AuthorizationCodeOAuthFlow extends OpenAPI3OAuth2Flow {
+  /** The authorization URL to be used for this flow. This MUST be in the form of a URL. */
+  authorizationUrl: string;
+
+  /** The token URL to be used for this flow. This MUST be in the form of a URL. */
+  tokenUrl: string;
+}
+
+/** OpenIdConnect SecurityScheme */
+export interface OpenAPI3OpenIdConnectSecurityScheme extends OpenAPI3SecuritySchemeBase {
+  /** OpenID Connect */
+  type: "openIdConnect";
+
+  /** OpenId Connect URL to discover OAuth2 configuration values. This MUST be in the form of a URL. */
+  openIdConnectUrl: string;
+}
+
+/** Identifies a related operation by either a reference or an operation ID, but not both. */
+export type OpenAPI3Link =
+  | {
+      /** A relative or absolute reference to an OAS operation. This field is mutually exclusive of the operationId field, and MUST point to an Operation Object. Relative operationRef values MAY be used to locate an existing Operation Object in the OpenAPI definition.  */
+      operationRef: Ref<unknown>;
+    }
+  | {
+      /** the name of an existing, resolvable OAS operation, as defined with a unique operationId. This field is mutually exclusive of the operationRef field. */
+      operationId: string;
+    };
+
+/**
+ * A reusable parameter or payload example, supplied inline or by an external URL.
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#example-object
+ */
+export interface OpenAPI3Example {
+  /** Short label that distinguishes this example from others. */
+  summary?: string;
+  /** Explanation of the example, which may use CommonMark. */
+  description?: string;
+  /** Inline example data; mutually exclusive with `externalValue`. */
+  value?: unknown;
+  /** URL of example data that cannot be included inline; mutually exclusive with `value`. */
+  externalValue?: string;
+}
+
+/** Selects among alternative payload schemas using a property value; does not replace schema validation. */
+export interface OpenAPI3Discriminator extends Extensions {
+  /** Payload property whose value identifies the applicable schema. */
+  propertyName: string;
+  /** Explicit mapping from discriminator values to schema names or references. */
+  mapping?: Record<string, string>;
+}
+
+/** OpenAPI 3.2 discriminator metadata, including a fallback for missing or unmapped discriminator values. */
+export interface OpenAPIDiscriminator3_2 extends OpenAPI3Discriminator {
+  /**
+   * The default mapping value to be used when no other mapping matches.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-21
+   */
+  defaultMapping?: string;
+}
+
+/** Single-type values for OpenAPI 3.0 schemas; nullability is expressed separately with `nullable`. */
+export type JsonType = "array" | "boolean" | "integer" | "number" | "object" | "string";
+
+/** XML serialization metadata for a schema, separate from its JSON property names and structure. */
+export type OpenAPI3XmlSchema = Extensions & {
+  /** Overrides the XML element or attribute name. */
+  name?: string;
+  /** Absolute URI identifying the XML namespace. */
+  namespace?: string;
+  /** Namespace prefix used in the XML representation. */
+  prefix?: string;
+  /** Serializes this property as an XML attribute instead of an element; defaults to false. */
+  attribute?: boolean;
+  /** Wraps array item elements in a container element; only applies to arrays and defaults to false. */
+  wrapped?: boolean;
+};
+
+/**
+ * Schema shape used for OpenAPI 3.0, whose vocabulary differs from the JSON
+ * Schema-based 3.1 and 3.2 shapes. For example, exclusive bounds are booleans
+ * modifying `minimum`/`maximum`, and nullability uses `nullable`.
+ */
+export type OpenAPI3Schema = Extensions & {
+  /**
+   * This attribute is a string that provides a short description of the instance property.
+   *
+   * @see https://tools.ietf.org/html/draft-wright-json-schema-validation-01#section-7.2
+   */
+  title?: string;
+
+  /**
+   * Must be strictly greater than 0.
+   * A numeric instance is valid only if division by this keyword's value results in an integer.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.1
+   */
+  multipleOf?: number;
+
+  /**
+   * Representing an inclusive upper limit for a numeric instance.
+   * This keyword validates only if the instance is less than or exactly equal to "maximum".
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.2
+   */
+  maximum?: number;
+
+  /**
+   * When true, `maximum` is an exclusive bound; otherwise it is inclusive.
+   * Unlike OpenAPI 3.1 and later, this field is not itself a numeric bound.
+   * @see https://spec.openapis.org/oas/v3.0.4.html#schema-object
+   */
+  exclusiveMaximum?: boolean;
+
+  /**
+   * Representing an inclusive lower limit for a numeric instance.
+   * This keyword validates only if the instance is greater than or exactly equal to "minimum".
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.4
+   */
+  minimum?: number;
+
+  /**
+   * When true, `minimum` is an exclusive bound; otherwise it is inclusive.
+   * Unlike OpenAPI 3.1 and later, this field is not itself a numeric bound.
+   * @see https://spec.openapis.org/oas/v3.0.4.html#schema-object
+   */
+  exclusiveMinimum?: boolean;
+
+  /**
+   * Must be a non-negative integer.
+   * A string instance is valid against this keyword if its length is less than, or equal to, the value of this keyword.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.6
+   */
+  maxLength?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * A string instance is valid against this keyword if its length is greater than, or equal to, the value of this keyword.
+   * Omitting this keyword has the same behavior as a value of 0.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.7
+   */
+  minLength?: number;
+
+  /**
+   * Should be a valid regular expression, according to the ECMA 262 regular expression dialect.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.8
+   */
+  pattern?: string;
+  /**
+   * Must be a non-negative integer.
+   * An array instance is valid against "maxItems" if its size is less than, or equal to, the value of this keyword.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.11
+   */
+  maxItems?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * An array instance is valid against "maxItems" if its size is greater than, or equal to, the value of this keyword.
+   * Omitting this keyword has the same behavior as a value of 0.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.12
+   */
+  minItems?: number;
+
+  /**
+   * If this keyword has boolean value false, the instance validates successfully.
+   * If it has boolean value true, the instance validates successfully if all of its elements are unique.
+   * Omitting this keyword has the same behavior as a value of false.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.13
+   */
+  uniqueItems?: boolean;
+
+  /**
+   * Must be a non-negative integer.
+   * An object instance is valid against "maxProperties" if its number of properties is less than, or equal to, the value of this keyword.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.15
+   */
+  maxProperties?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * An object instance is valid against "maxProperties" if its number of properties is greater than,
+   * or equal to, the value of this keyword.
+   * Omitting this keyword has the same behavior as a value of 0.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.16
+   */
+  minProperties?: number;
+
+  /**
+   * Elements of this array must be unique.
+   * An object instance is valid against this keyword if every item in the array is the name of a property in the instance.
+   * Omitting this keyword has the same behavior as an empty array.
+   *
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.17
+   */
+  required?: Array<string>;
+
+  /**
+   * This provides an enumeration of all possible values that are valid
+   * for the instance property. This MUST be an array, and each item in
+   * the array represents a possible value for the instance value. If
+   * this attribute is defined, the instance value MUST be one of the
+   * values in the array in order for the schema to be valid.
+   *
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.23
+   */
+  enum?: (string | number | boolean)[];
+
+  /**
+   * Functionally equivalent to "enum" with a single value.
+   * An instance validates successfully if its value is equal to the value of this keyword.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-const
+   */
+  const?: unknown;
+
+  /** the JSON type for the schema */
+  type?: JsonType;
+
+  /** The extending format for the previously mentioned type.  */
+  format?: string;
+
+  /**  This attribute is a string that provides a full description of the schema */
+  description?: string;
+
+  /**
+   * A collection of schemas that this schema also must conform to.
+   *
+   * An instance validates successfully against this keyword if it validates successfully against all schemas defined by this keyword's value.
+   *
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.26
+   */
+  allOf?: Refable<OpenAPI3Schema>[];
+
+  /**
+   * A collection of schemas that this schema may conform to one or more of.
+   *
+   * An instance validates successfully against this keyword if it validates successfully against at least one schema defined by this keyword's value.
+   *
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.27
+   */
+  anyOf?: Refable<OpenAPI3Schema>[];
+
+  /**
+   * A collection of schemas that this schema may conform to only one of.
+   *
+   * An instance validates successfully against this keyword if it validates successfully against exactly one schema defined by this keyword's value.
+   *
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.28
+   */
+  oneOf?: Refable<OpenAPI3Schema>[];
+
+  /**
+   *  An instance is valid against this keyword if it fails to validate successfully against the schema defined by this keyword.
+   * @see https://datatracker.ietf.org/doc/html/draft-wright-json-schema-validation-00#section-5.29
+   */
+  not?: Refable<OpenAPI3Schema>;
+
+  /**  This keyword determines how child instances validate for arrays, and does not directly validate the immediate instance itself. */
+  items?: Refable<OpenAPI3Schema>;
+
+  /**
+   * This attribute is an object with property definitions that define the
+   * valid values of instance object property values. When the instance
+   * value is an object, the property values of the instance object MUST
+   * conform to the property definitions in this object. In this object,
+   * each property definition's value MUST be a schema, and the property's
+   * name MUST be the name of the instance property that it defines.  The
+   * instance property value MUST be valid according to the schema from
+   * the property definition. Properties are considered unordered, the
+   * order of the instance properties MAY be in any order.
+   *
+   */
+  properties?: Record<string, Refable<OpenAPI3Schema>>;
+
+  /** indicates that additional unlisted properties can exist in this schema */
+  additionalProperties?: boolean | Refable<OpenAPI3Schema>;
+
+  /**
+   * Declares the value of the property that the server will use if none is provided,
+   * for example a "count" to control the number of results per page might default to 100 if not supplied by the client in the request.
+   *
+   * @note "default" has no meaning for required parameters.) See https://tools.ietf.org/html/draft-fge-json-schema-validation-00#section-6.2. Unlike JSON Schema this value MUST conform to the defined type for this parameter.
+   */
+  default?: string | boolean | number | Record<string, any>;
+
+  /** Allows null in addition to an explicitly specified `type`; defaults to false. OpenAPI 3.1 and later use the `"null"` type instead. */
+  nullable?: boolean;
+
+  /**
+   * Property is readonly.
+   */
+  readOnly?: boolean;
+
+  /**
+   * Property is writeonly.
+   */
+  writeOnly?: boolean;
+
+  /** Adds support for polymorphism. The discriminator is an object name that is used to differentiate between other schemas which may satisfy the payload description  */
+  discriminator?: OpenAPI3Discriminator;
+
+  /** Additional external documentation for this schema. */
+  externalDocs?: OpenAPI3ExternalDocs;
+
+  /** A free-form property to include an example of an instance for this schema. To represent examples that cannot be naturally represented in JSON or YAML, a string value can be used to contain the example with escaping where necessary. */
+  example?: any;
+
+  /** Specifies that a schema is deprecated and SHOULD be transitioned out of usage.Default value is false. */
+  deprecated?: boolean;
+
+  /** This MAY be used only on properties schemas. It has no effect on root schemas. Adds additional metadata to describe the XML representation of this property. */
+  xml?: OpenAPI3XmlSchema;
+};
+
+/** Shared parameter and header fields. Use either `schema` with serialization fields or single-entry `content`, not both. */
+export type OpenAPI3ParameterBase = Extensions & {
+  /**A brief description of the parameter. This could contain examples of use. CommonMark syntax MAY be used for rich text representation. */
+  description?: string;
+
+  /**Determines whether this parameter is mandatory. If the parameter location is "path", this property is REQUIRED and its value MUST be true. Otherwise, the property MAY be included and its default value is false. */
+  required?: boolean;
+
+  /** Specifies that a parameter is deprecated and SHOULD be transitioned out of usage. Default value is false.  */
+  deprecated?: boolean;
+
+  /** When this is true, parameter values of type array or object generate separate parameters for each value of the array or key-value pair of the map. For other types of parameters this property has no effect. When style is form, the default value is true. For all other styles, the default value is false.  */
+  explode?: boolean;
+
+  /** Value schema for style-based serialization; mutually exclusive with `content`. */
+  schema?: Refable<OpenAPI3Schema>;
+
+  /** A free-form property to include an example of an instance for this schema. To represent examples that cannot be naturally represented in JSON or YAML, a string value can be used to contain the example with escaping where necessary. */
+  example?: any;
+
+  /** Named examples or references; mutually exclusive with `example` and overriding schema-level examples. */
+  examples?: Record<string, Refable<OpenAPI3Example>>;
+  /** A map containing the representations for the parameter. The key is the media type and the value describes it. The map MUST only contain one entry. */
+  content?: Record<string, OpenAPI3MediaType>;
+};
+
+/** One named URL query parameter; `style` and `explode` describe its serialization. */
+export type OpenAPI3QueryParameter = OpenAPI3ParameterBase & {
+  /** Name of the parameter. */
+  name: string;
+  /** Selects an individual query parameter, not the entire query string. */
+  in: "query";
+  /**
+   * Describes how the parameter value will be serialized depending on the type of the parameter value.
+   *
+   * Default value for query parameters is form.
+   * @see https://spec.openapis.org/oas/v3.0.4.html#style-values
+   */
+  style?: "form" | "spaceDelimited" | "pipeDelimited" | "deepObject";
+};
+/** A path-template substitution. Its name must match a placeholder and `required` must be true. */
+export type OpenAPI3PathParameter = OpenAPI3ParameterBase & {
+  /** Name of the parameter. */
+  name: string;
+  /** Selects a URL path-template parameter. */
+  in: "path";
+  /**
+   * Describes how the parameter value will be serialized depending on the type of the parameter value.
+   *
+   * Default value for path parameters is simple.
+   * @see https://spec.openapis.org/oas/v3.0.4.html#style-values
+   */
+  style?: "simple" | "label" | "matrix";
+};
+/** A named HTTP request header; header names are case-insensitive. */
+export type OpenAPI3HeaderParameter = OpenAPI3ParameterBase & {
+  /** Name of the parameter. */
+  name: string;
+  /** Selects a request header, rather than a response Header Object. */
+  in: "header";
+  /**
+   * Describes how the parameter value will be serialized depending on the type of the parameter value.
+   *
+   * Default value for header parameters is simple.
+   * @see https://spec.openapis.org/oas/v3.0.4.html#style-values
+   */
+  style?: "simple";
+};
+/** A named request cookie, using form-style serialization in OpenAPI 3.0. */
+export type OpenAPI3CookieParameter = OpenAPI3ParameterBase & {
+  /** Name of the parameter. */
+  name: string;
+  /** Selects a cookie carried in the request. */
+  in: "cookie";
+  /**
+   * Describes how the parameter value will be serialized depending on the type of the parameter value.
+   *
+   * Default value for cookie parameters is form.
+   * @see https://spec.openapis.org/oas/v3.0.4.html#style-values
+   */
+  style?: "form";
+};
+/** A request parameter discriminated by `in`; a parameter's identity is its name/location pair. */
+export type OpenAPI3Parameter =
+  | OpenAPI3HeaderParameter
+  | OpenAPI3QueryParameter
+  | OpenAPI3PathParameter
+  | OpenAPI3CookieParameter;
+/** Supported named parameter locations, excluding request bodies. */
+export type OpenAPI3ParameterType = OpenAPI3Parameter["in"];
+
+/**
+ * The Header Object follows the structure of the Parameter Object with the following changes:
+ *
+ * name MUST NOT be specified, it is given in the corresponding headers map.
+ * in MUST NOT be specified, it is implicitly in header.
+ * All traits that are affected by the location MUST be applicable to a location of header (for example, style).
+ *
+ * @see https://spec.openapis.org/oas/v3.0.4.html#header-object
+ */
+export type OpenAPI3Header = OpenAPI3ParameterBase & {
+  /** Describes how the parameter value will be serialized depending on the type of the parameter value
+   *
+   * simple - Simple style parameters defined by RFC6570. This option replaces collectionFormat with a csv value from OpenAPI 2.0
+   */
+  style?: "simple";
+};
+
+/** An operation attached to an HTTP method on a path, with its inputs, responses and security overrides. */
+export type OpenAPI3Operation = Extensions & {
+  /** Detailed explanation of the operation, which may use CommonMark. */
+  description?: string;
+  /** Short explanation suitable for operation lists. */
+  summary?: string;
+  /** Possible responses, including status-specific entries and an optional default. */
+  responses?: Refable<OpenAPI3Responses>;
+  /** Tag names used to group this operation; document-level tag metadata is optional. */
+  tags?: string[];
+  /** Identifier that must be unique among operations in the API. */
+  operationId?: string;
+  /** Payload accepted by this operation, separate from path, query, header and cookie parameters. */
+  requestBody?: Refable<OpenAPI3RequestBody>;
+  /** Operation parameters; matching name/location pairs override path-level parameters. */
+  parameters: Refable<OpenAPI3Parameter>[];
+  /** Marks an operation that consumers should stop using; absence means false. */
+  deprecated?: boolean;
+  /**
+   * Overrides document-level security. Entries are alternatives; schemes within
+   * an entry are all required. An empty array removes inherited requirements.
+   */
+  security?: Record<string, string[]>[];
+};
+
+/**
+ * A reference to a definition of `T`, which is not resolved or validated by this type.
+ * `summary` and `description` siblings are supported on Reference Objects in OpenAPI 3.1 and later.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export interface Ref<T> {
+  /** URI reference locating the target, often a document-local `#/components/...` JSON Pointer. */
+  $ref: string;
+  /** Description override where supported by the referring object and OpenAPI version. */
+  description?: string;
+  /** Summary override where supported by the referring object and OpenAPI version. */
+  summary?: string;
+}
+
+/** A definition embedded inline or supplied by a `$ref`; check for `$ref` before accessing definition fields. */
+export type Refable<T> = Ref<T> | T;
+
+/** JSON Schema type names, including `"null"` for the schema vocabulary used in OpenAPI 3.1 and later. */
+export type JsonSchemaType =
+  "array" | "boolean" | "integer" | "null" | "number" | "object" | "string";
+
+/**
+ * JSON Schema 2020-12 keywords modeled by this package for OpenAPI 3.1 and later.
+ * Unlike the 3.0 shape, supports type arrays, numeric exclusive bounds and tuple prefixes.
+ *
+ * @template AdditionalVocabularies Extra keyword fields, also available on recursively nested schemas.
+ */
+export type JsonSchema<AdditionalVocabularies extends {} = {}> = AdditionalVocabularies & {
+  /**
+   * The JSON type for the schema.
+   * If the value is an array, then an instance validates successfully if its type
+   * matches any of the types indicated by the string in the array.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-type
+   */
+  type?: JsonSchemaType | JsonSchemaType[];
+
+  /**
+   * The extending format for the previously mentioned type.
+   */
+  format?: string;
+
+  /**
+   * This provides an enumeration of all possible values that are valid
+   * for the instance property. This MUST be an array, and each item in
+   * the array represents a possible value for the instance value. If
+   * this attribute is defined, the instance value MUST be one of the
+   * values in the array in order for the schema to be valid.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-enum
+   */
+  enum?: (string | number | boolean | null)[];
+
+  /**
+   * Functionally equivalent to "enum" with a single value.
+   * An instance validates successfully if its value is equal to the value of this keyword.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-const
+   */
+  const?: unknown;
+
+  /**
+   * Must be strictly greater than 0.
+   * A numeric instance is valid only if division by this keyword's value results in an integer.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-multipleof
+   */
+  multipleOf?: number;
+
+  /**
+   * Representing an inclusive upper limit for a numeric instance.
+   * This keyword validates only if the instance is less than or exactly equal to "maximum".
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-maximum
+   */
+  maximum?: number;
+
+  /**
+   * Representing an exclusive upper limit for a numeric instance.
+   * This keyword validates only if the instance is strictly less than (not equal to) to "exclusiveMaximum".
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-exclusivemaximum
+   */
+  exclusiveMaximum?: number;
+
+  /**
+   * Representing an inclusive lower limit for a numeric instance.
+   * This keyword validates only if the instance is greater than or exactly equal to "minimum".
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-minimum
+   */
+  minimum?: number;
+
+  /**
+   * Representing an exclusive lower limit for a numeric instance.
+   * This keyword validates only if the instance is strictly greater than (not equal to) to "exclusiveMinimum".
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-exclusiveminimum
+   */
+  exclusiveMinimum?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * A string instance is valid against this keyword if its length is less than, or equal to, the value of this keyword.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-maxlength
+   */
+  maxLength?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * A string instance is valid against this keyword if its length is greater than, or equal to, the value of this keyword.
+   * Omitting this keyword has the same behavior as a value of 0.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-minlength
+   */
+  minLength?: number;
+
+  /**
+   * Should be a valid regular expression, according to the ECMA 262 regular expression dialect.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-pattern
+   */
+  pattern?: string;
+
+  /**
+   * Must be a non-negative integer.
+   * An array instance is valid against "maxItems" if its size is less than, or equal to, the value of this keyword.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-maxitems
+   */
+  maxItems?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * An array instance is valid against "maxItems" if its size is greater than, or equal to, the value of this keyword.
+   * Omitting this keyword has the same behavior as a value of 0.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-minitems
+   */
+  minItems?: number;
+
+  /**
+   * If this keyword has boolean value false, the instance validates successfully.
+   * If it has boolean value true, the instance validates successfully if all of its elements are unique.
+   * Omitting this keyword has the same behavior as a value of false.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-uniqueitems
+   */
+  uniqueItems?: boolean;
+
+  /**
+   * Must be a non-negative integer.
+   * If "contains" is not present within the same schema object, then this has no effect.
+   * An array instance is valid against "maxContains" if the number of elements that are'
+   * valid against the schema defined by "contains" is less than, or equal to, the value of this keyword.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-maxcontains
+   */
+  maxContains?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * If "contains" is not present within the same schema object, then this has no effect.
+   * An array instance is valid against "minContains" if the number of elements that are'
+   * valid against the schema defined by "contains" is greater than, or equal to, the value of this keyword.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-maxcontains
+   */
+  minContains?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * An object instance is valid against "maxProperties" if its number of properties is less than, or equal to, the value of this keyword.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-maxproperties
+   */
+  maxProperties?: number;
+
+  /**
+   * Must be a non-negative integer.
+   * An object instance is valid against "maxProperties" if its number of properties is greater than,
+   * or equal to, the value of this keyword.
+   * Omitting this keyword has the same behavior as a value of 0.
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-minproperties
+   */
+  minProperties?: number;
+
+  /**
+   * Elements of this array must be unique.
+   * An object instance is valid against this keyword if every item in the array is the name of a property in the instance.
+   * Omitting this keyword has the same behavior as an empty array.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-required
+   */
+  required?: Array<string>;
+
+  /**
+   * Must be a string.
+   * If the schema instance is a string, this property defines that the string SHOULD be
+   * interpreted as encoded binary data and decoded using the encoding named by this property.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-contentencoding
+   */
+  contentEncoding?: string;
+
+  /**
+   * If the schema instance is a string and "contentMediaType" is present, this property
+   * contains a schema which describes the structure of the string.
+   * This should be ignored if "contentMediaType" is not present.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-contentschema
+   */
+  contentSchema?: Refable<JsonSchema<AdditionalVocabularies>>;
+
+  /**
+   * Must be a string.
+   * If the schema instance is a string, this property indicates the media type of the contents of the string.
+   * If "contentEncoding" is present, this property describes the decoded string.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-contentmediatype
+   */
+  contentMediaType?: string;
+
+  /**
+   * This attribute is a string that provides a short description of the instance property.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-title-and-description
+   */
+  title?: string;
+
+  /**
+   * This attribute is a string that provides a full description of the schema
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-title-and-description
+   */
+  description?: string;
+
+  /**
+   * Declares the value of the property that the server will use if none is provided,
+   * for example a "count" to control the number of results per page might default to 100 if not supplied by the client in the request.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-default
+   */
+  default?: string | boolean | number | null | Record<string, any>;
+
+  /**
+   * Specifies that a schema is deprecated and SHOULD be transitioned out of usage.
+   * Default value is false.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-deprecated
+   */
+  deprecated?: boolean;
+
+  /**
+   * An array of free-form properties to include examples of an instance for this schema.
+   * To represent examples that cannot be naturally represented in JSON or YAML, a string value can be used to contain the example with escaping where necessary.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-validation#name-examples
+   */
+  examples?: any[];
+
+  /**
+   * A collection of schemas that this schema also must conform to.
+   *
+   * An instance validates successfully against this keyword if it validates successfully against all schemas defined by this keyword's value.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-allof
+   */
+  allOf?: Refable<JsonSchema<AdditionalVocabularies>>[];
+
+  /**
+   * A collection of schemas that this schema may conform to one or more of.
+   *
+   * An instance validates successfully against this keyword if it validates successfully against at least one schema defined by this keyword's value.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-anyof
+   */
+  anyOf?: Refable<JsonSchema<AdditionalVocabularies>>[];
+
+  /**
+   * A collection of schemas that this schema may conform to only one of.
+   *
+   * An instance validates successfully against this keyword if it validates successfully against exactly one schema defined by this keyword's value.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-oneof
+   */
+  oneOf?: Refable<JsonSchema<AdditionalVocabularies>>[];
+
+  /**
+   *  An instance is valid against this keyword if it fails to validate successfully against the schema defined by this keyword.
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-not
+   */
+  not?: Refable<JsonSchema<AdditionalVocabularies>>;
+
+  /**
+   * Validation succeeds if each element of the instance validates against the schema at the same position, if any.
+   * This keyword does not constrain the length of the array.
+   * If the array is longer than this keyword's value, this keyword validates only the prefix of matching length.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-prefixitems
+   */
+  prefixItems?: Refable<JsonSchema<AdditionalVocabularies>>[];
+
+  /**
+   * This keyword applies its subschema to all instance elements at indexes greater than the lenfth of the "prefixItems" array.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-items
+   * */
+  items?: Refable<JsonSchema<AdditionalVocabularies>>;
+
+  /**
+   * An array instance validates successfully against this keyword if at least one of its elements is valid against the given schema,
+   * except when `minContains` is present and has a value of 0.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-contains
+   */
+  contains?: Refable<JsonSchema<AdditionalVocabularies>>;
+
+  /**
+   * This attribute is an object with property definitions that define the
+   * valid values of instance object property values. When the instance
+   * value is an object, the property values of the instance object MUST
+   * conform to the property definitions in this object. In this object,
+   * each property definition's value MUST be a schema, and the property's
+   * name MUST be the name of the instance property that it defines.  The
+   * instance property value MUST be valid according to the schema from
+   * the property definition. Properties are considered unordered, the
+   * order of the instance properties MAY be in any order.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-properties
+   */
+  properties?: Record<
+    string,
+    Refable<JsonSchema<AdditionalVocabularies>> | JsonSchema<AdditionalVocabularies>
+  >;
+
+  /**
+   * indicates that additional unlisted properties can exist in this schema
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-additionalproperties
+   */
+  additionalProperties?: boolean | Refable<JsonSchema<AdditionalVocabularies>>;
+
+  /**
+   * Indicates that additional unlisted properties can exist in this schema.
+   * This differs from additionalProperties in that it is aware of any in-place applicators.
+   * This includes being aware of properties defined in sibling `allOf` sub-schemas.
+   *
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#name-unevaluatedproperties
+   */
+  unevaluatedProperties?: boolean | Refable<JsonSchema<AdditionalVocabularies>>;
+
+  /**
+   * Property is readonly.
+   */
+  readOnly?: boolean;
+
+  /**
+   * Property is writeonly.
+   */
+  writeOnly?: boolean;
+
+  /** Adds support for polymorphism. The discriminator is an object name that is used to differentiate between other schemas which may satisfy the payload description  */
+  discriminator?: OpenAPI3Discriminator;
+
+  /** Additional external documentation for this schema. */
+  externalDocs?: OpenAPI3ExternalDocs;
+};
+
+/** OpenAPI 3.1 schema vocabulary: JSON Schema 2020-12 keywords plus OpenAPI metadata and vendor extensions. */
+export type OpenAPISchema3_1 = JsonSchema<
+  {
+    /**
+     * Adds support for polymorphism.
+     * The discriminator is an object name that is used to differentiate between other schemas which may satisfy the payload description
+     *
+     * @see https://spec.openapis.org/oas/v3.1.1.html#discriminator-object
+     */
+    discriminator?: OpenAPI3Discriminator;
+
+    /**
+     * Additional external documentation for this schema.
+     *
+     * @see https://spec.openapis.org/oas/v3.1.1.html#external-documentation-object
+     */
+    externalDocs?: OpenAPI3ExternalDocs;
+
+    /**
+     * This MAY be used only on properties schemas.
+     * It has no effect on root schemas.
+     * Adds additional metadata to describe the XML representation of this property.
+     */
+    xml?: OpenAPI3XmlSchema;
+  } & Extensions
+>;
+
+/** An OpenAPI 3.1 document, introducing JSON Schema-based schemas, webhooks and reusable path items. */
+export interface OpenAPIDocument3_1 extends Extensions {
+  /** OpenAPI specification version; `info.version` separately identifies the API version. */
+  openapi: "3.1.0";
+
+  /**
+   * Provides metadata about the API. The metadata can be used by the clients if needed.
+   */
+  info: OpenAPI3Info;
+
+  /**
+   * The default value for the $schema keyword within Schema Objects contained within this document.
+   * This MUST be in the form of a URI.
+   */
+  jsonSchemaDialect?: string;
+
+  /** Additional external documentation. */
+  externalDocs?: OpenAPI3ExternalDocs;
+
+  /** The available paths and operations for the API */
+  paths: Record<string, OpenAPI3PathItem>;
+
+  /**
+   * The incoming webhooks that may be received as part of this API.
+   * The key name is a unique string to refer to each webhook.
+   */
+  webhooks?: Record<string, OpenAPI3PathItem>;
+
+  /**
+   * An array of Server Objects, which provide connectivity information to a target server.
+   * If the servers property is not provided, or is an empty array, the default value would be a Server Object with a url value of /.
+   */
+  servers?: OpenAPI3Server[];
+
+  /**
+   * A list of tags used by the specification with additional metadata.
+   * The order of the tags can be used to reflect on their order by the parsing tools.
+   * Not all tags that are used by the Operation Object must be declared.
+   * The tags that are not declared MAY be organized randomly or based on the tools' logic. Each tag name in the list MUST be unique.
+   */
+  tags?: OpenAPI3Tag[];
+
+  /** An element to hold various schemas for the specification. */
+  components?: OpenAPIComponents3_1;
+
+  /**
+   * A declaration of which security mechanisms can be used across the API.
+   * The list of values includes alternative security requirement objects that can be used.
+   * Only one of the security requirement objects need to be satisfied to authorize a request.
+   * Individual operations can override this definition.
+   */
+  security?: Record<string, string[]>[];
+}
+
+/** Reusable OpenAPI 3.1 definitions, including callbacks and path items not modeled in the 3.0 component shape. */
+export interface OpenAPIComponents3_1 extends Extensions {
+  /** Named schemas using the 3.1 JSON Schema vocabulary rather than the 3.0 schema subset. */
+  schemas?: Record<string, OpenAPISchema3_1>;
+  /** Response definitions or aliases, referenced from an operation's response map. */
+  responses?: Record<string, Refable<OpenAPI3Response>>;
+  /** Parameter definitions or aliases; each definition supplies its own name and location. */
+  parameters?: Record<string, Refable<OpenAPI3Parameter>>;
+  /** Named examples for reuse by parameters or media types. */
+  examples?: Record<string, Refable<OpenAPI3Example>>;
+  /** Request body definitions or aliases, separate from named parameters. */
+  requestBodies?: Record<string, Refable<OpenAPI3RequestBody>>;
+  /** Header definitions or aliases; usage sites supply the header name. */
+  headers?: Record<string, Refable<OpenAPI3Header>>;
+  /** Authentication definitions selected by name in security requirements. */
+  securitySchemes?: Record<string, Refable<OpenAPI3SecurityScheme>>;
+  /** Reusable relationships from a response to another operation. */
+  links?: Record<string, Refable<OpenAPI3Link>>;
+  /** Named callbacks mapping runtime URL expressions to the requests the API may initiate. */
+  callbacks?: Record<string, Record<string, OpenAPI3PathItem>>;
+  /** Named path definitions reusable independently of a concrete URL path. */
+  pathItems?: Record<string, OpenAPI3PathItem>;
+}
+
+/** OpenAPI 3.2 document shape, replacing version-sensitive 3.1 fields with their 3.2 counterparts. */
+export interface OpenAPIDocument3_2 extends Omit<
+  OpenAPIDocument3_1,
+  "openapi" | "servers" | "components" | "webhooks" | "paths" | "tags"
+> {
+  /** OpenAPI specification version; `info.version` separately identifies the API version. */
+  openapi: "3.2.0";
+  /**
+   * This string MUST be in the form of a URI reference as defined.
+   * The $self field provides the self-assigned URI of this document, which also serves as its base URI.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields
+   */
+  $self?: string;
+  /** The available paths and operations for the API */
+  paths: Record<string, OpenAPIPathItem3_2>;
+
+  /**
+   * The incoming webhooks that may be received as part of this API.
+   * The key name is a unique string to refer to each webhook.
+   */
+  webhooks?: Record<string, OpenAPIPathItem3_2>;
+  /**
+   * An array of Server Objects, which provide connectivity information to a target server.
+   * If the servers property is not provided, or is an empty array, the default value would be a Server Object with a url value of /.
+   */
+  servers?: OpenAPIServer3_2[];
+  /**
+   * A list of tags used by the specification with additional metadata.
+   * The order of the tags can be used to reflect on their order by the parsing tools.
+   * Not all tags that are used by the Operation Object must be declared.
+   * The tags that are not declared MAY be organized randomly or based on the tools' logic. Each tag name in the list MUST be unique.
+   */
+  tags?: OpenAPITag3_2[];
+  /** An element to hold various schemas for the specification. */
+  components?: OpenAPIComponents3_2;
+}
+
+/** A server endpoint with the optional stable name introduced in OpenAPI 3.2. */
+export interface OpenAPIServer3_2 extends OpenAPI3Server {
+  /**
+   * An optional unique string to refer to the host designated by the URL.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-3
+   */
+  name?: string;
+}
+
+/** OpenAPI 3.2 encoding metadata supporting nested multipart structures and positional array encodings. */
+export interface OpenAPIEncoding3_2 extends OpenAPI3Encoding {
+  /**
+   * Applies nested Encoding Objects in the same manner as the {@link OpenAPIMediaType3_2.encoding} field
+   * @see https://spec.openapis.org/oas/v3.2.0#common-fixed-fields-0
+   */
+  encoding?: Record<string, OpenAPIEncoding3_2>;
+  /**
+   * Applies nested Encoding Objects in the same manner as the {@link OpenAPIMediaType3_2.prefixEncoding} field
+   * @see https://spec.openapis.org/oas/v3.2.0#common-fixed-fields-0
+   */
+  prefixEncoding?: OpenAPIEncoding3_2[];
+  /**
+   * Applies nested Encoding Objects in the same manner as the {@link OpenAPIMediaType3_2.itemEncoding} field
+   * @see https://spec.openapis.org/oas/v3.2.0#common-fixed-fields-0
+   */
+  itemEncoding?: OpenAPIEncoding3_2;
+}
+
+/** OpenAPI 3.2 media representation, with stream item schemas and nested or positional encodings. */
+export interface OpenAPIMediaType3_2 extends Omit<OpenAPI3MediaType, "examples" | "schema"> {
+  /** The schema defining the content of the request, response, or parameter. */
+  schema?: Refable<OpenAPISchema3_2>;
+  /**
+   * The schema defining the structure of each item in a stream.
+   * Used for streaming content types like text/event-stream.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#server-sent-event-streams
+   */
+  itemSchema?: Refable<OpenAPISchema3_2>;
+  /**
+   * A map between a property name and its encoding information
+   * @see https://spec.openapis.org/oas/v3.2.0#fixed-fields-11
+   */
+  encoding?: Record<string, OpenAPIEncoding3_2>;
+  /**
+   * An array of positional encoding information
+   * @see https://spec.openapis.org/oas/v3.2.0#fixed-fields-11
+   */
+  prefixEncoding?: OpenAPIEncoding3_2[];
+  /**
+   * A single Encoding Object that provides encoding information for multiple array items
+   * @see https://spec.openapis.org/oas/v3.2.0#fixed-fields-11
+   */
+  itemEncoding?: OpenAPIEncoding3_2;
+
+  /** Examples with title  */
+  examples?: Record<string, Refable<OpenAPIExample3_2>>;
+}
+
+/** Reusable OpenAPI 3.2 definitions, adding media type components and version-specific referenced objects. */
+export interface OpenAPIComponents3_2 extends Omit<
+  OpenAPIComponents3_1,
+  | "responses"
+  | "securitySchemes"
+  | "examples"
+  | "schemas"
+  | "callbacks"
+  | "pathItems"
+  | "parameters"
+  | "requestBodies"
+> {
+  /**
+   * An object to hold reusable {@link OpenAPIMediaType3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  mediaTypes?: Record<string, Refable<OpenAPIMediaType3_2>>;
+  /**
+   * An object to hold reusable {@link OpenAPIResponse3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  responses?: Record<string, Refable<OpenAPIResponse3_2>>;
+  /**
+   * An object to hold reusable {@link OpenAPISecurityScheme3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  securitySchemes?: Record<string, Refable<OpenAPISecurityScheme3_2>>;
+  /**
+   * An object to hold reusable {@link OpenAPIRequestBody3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  requestBodies?: Record<string, Refable<OpenAPIRequestBody3_2>>;
+  /**
+   * An object to hold reusable {@link OpenAPIExample3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  examples?: Record<string, Refable<OpenAPIExample3_2>>;
+  /**
+   * An object to hold reusable {@link OpenAPISchema3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  schemas?: Record<string, Refable<OpenAPISchema3_2>>;
+  /**
+   * An object to hold reusable {@link OpenAPIPathItem3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  callbacks?: Record<string, Record<string, Refable<OpenAPIPathItem3_2>>>;
+  /**
+   * An object to hold reusable {@link OpenAPIPathItem3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  pathItems?: Record<string, Refable<OpenAPIPathItem3_2>>;
+  /**
+   * An object to hold reusable {@link OpenAPIParameter3_2} objects
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-5
+   */
+  parameters?: Record<string, Refable<OpenAPIParameter3_2>>;
+}
+
+/** OpenAPI 3.2 operation responses keyed by status code, range, or the `default` fallback. */
+export type OpenAPIResponses3_2 = {
+  /** Response or reference for the corresponding status, with 3.2 media type support. */
+  [status: OpenAPI3StatusCode]: Refable<OpenAPIResponse3_2>;
+} & Extensions;
+
+/** OpenAPI 3.2 response, allowing a short summary and references to reusable media types. */
+export interface OpenAPIResponse3_2 extends Omit<OpenAPI3Response, "content"> {
+  /** A map containing descriptions of potential response payloads. The key is a media type or media type range and the value describes it. For responses that match multiple keys, only the most specific key is applicable. e.g. text/plain overrides text/* */
+  content?: Record<string, Refable<OpenAPIMediaType3_2>>;
+  /**
+   * A short summary of the meaning of the response.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-14
+   */
+  summary?: string;
+}
+
+/** Shared security scheme metadata with the deprecation flag introduced in OpenAPI 3.2. */
+export interface OpenAPISecuritySchemeBase3_2 extends OpenAPI3SecuritySchemeBase {
+  /**
+   * Specifies that a security scheme is deprecated and SHOULD be transitioned out of usage.
+   *
+   * @see https://spec.openapis.org/oas/v3.2.0.html#security-scheme-object
+   */
+  deprecated?: boolean;
+}
+
+/** API key authentication in OpenAPI 3.2, retaining the key name/location and adding deprecation metadata. */
+export interface OpenAPIApiKeySecurityScheme3_2
+  extends OpenAPISecuritySchemeBase3_2, OpenAPI3ApiKeySecurityScheme {}
+
+/** OAuth 2.0 authentication in OpenAPI 3.2, including optional device authorization flow configuration. */
+export interface OpenAPIOAuth2SecurityScheme3_2
+  extends OpenAPISecuritySchemeBase3_2, Omit<OpenAPI3OAuth2SecurityScheme, "flows"> {
+  /** An object containing configuration information for the flow types supported. */
+  flows: OpenAPIOAuthFlows3_2;
+}
+
+/** OpenID Connect discovery in OpenAPI 3.2, with optional security scheme deprecation metadata. */
+export interface OpenAPIOpenIdConnectSecurityScheme3_2
+  extends OpenAPISecuritySchemeBase3_2, OpenAPI3OpenIdConnectSecurityScheme {}
+
+/** HTTP authentication in OpenAPI 3.2, with optional security scheme deprecation metadata. */
+export interface OpenAPIHttpSecurityScheme3_2
+  extends OpenAPISecuritySchemeBase3_2, OpenAPI3HttpSecurityScheme {}
+
+/** Authentication scheme shapes modeled for OpenAPI 3.2, selected by their `type` field. */
+export type OpenAPISecurityScheme3_2 =
+  | OpenAPIApiKeySecurityScheme3_2
+  | OpenAPIOAuth2SecurityScheme3_2
+  | OpenAPIOpenIdConnectSecurityScheme3_2
+  | OpenAPIHttpSecurityScheme3_2;
+
+/** OAuth 2.0 Device Authorization Grant endpoints and scopes, supported starting in OpenAPI 3.2. */
+export interface OpenAPIDeviceAuthorizationFlow3_2 extends OpenAPI3OAuth2Flow {
+  /** The token URL to be used for this flow. This MUST be in the form of a URL. */
+  tokenUrl: string;
+  /**
+   * The device authorization URL to be used for this flow. This MUST be in the form of a URL.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#oauth-flow-object
+   */
+  deviceAuthorizationUrl: string;
+}
+/**
+ * Allows configuration of the supported OAuth Flows.
+ *
+ * @see https://spec.openapis.org/oas/v3.2.0.html#oauthFlowsObject
+ */
+export interface OpenAPIOAuthFlows3_2 extends OpenAPI3OAuthFlows {
+  /**
+   * Configuration for the OAuth 2.0 Device Authorization Grant flow.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#oauth-flows-object
+   */
+  deviceAuthorization?: OpenAPIDeviceAuthorizationFlow3_2;
+}
+
+/**
+ *  Allows sharing examples for operation responses.
+ *
+ * @see https://spec.openapis.org/oas/v3.2.0.html#example-object
+ */
+export interface OpenAPIExample3_2 extends OpenAPI3Example {
+  /**
+   * An example of the data structure that MUST be valid according to the relevant schema.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#example-object
+   */
+  dataValue?: unknown;
+  /**
+   * An example of the serialized form of the value, including encoding and escaping
+   * @see https://spec.openapis.org/oas/v3.2.0.html#example-object
+   */
+  serializedValue?: string;
+}
+
+/** OpenAPI 3.2 schema vocabulary, extending the JSON Schema-based shape with 3.2 XML and discriminator metadata. */
+export type OpenAPISchema3_2 = JsonSchema<
+  {
+    /**
+     * Adds additional metadata to describe the XML representation of this property.
+     * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-20
+     */
+    xml?: OpenAPIXmlSchema3_2;
+    /**
+     * Selects a payload schema by discriminator value, with an optional fallback for missing or unmapped values.
+     * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-20
+     */
+    discriminator?: OpenAPIDiscriminator3_2;
+    /**
+     * Additional external documentation for this schema.
+     *
+     * @see https://spec.openapis.org/oas/v3.1.1.html#external-documentation-object
+     */
+    externalDocs?: OpenAPI3ExternalDocs;
+  } & Extensions
+>;
+
+/** OpenAPI 3.2 XML metadata, using `nodeType` in place of the legacy attribute and array-wrapper flags. */
+export interface OpenAPIXmlSchema3_2 extends Omit<OpenAPI3XmlSchema, "attribute" | "wrapped"> {
+  /**
+   * Legacy switch for serializing a property as an attribute; must not accompany `nodeType`.
+   * @deprecated This property is deprecated and SHOULD be replaced by the {@link nodeType} property.
+   */
+  attribute?: boolean;
+  /**
+   * Legacy array-wrapper switch; must not accompany `nodeType`.
+   * @deprecated This property is deprecated and SHOULD be replaced by the {@link nodeType} property.
+   */
+  wrapped?: boolean;
+  /**
+   * The type of the XML DOM node. Defaults to `"none"` for arrays or reference
+   * schemas, and `"element"` otherwise.
+   * @see https://spec.openapis.org/oas/v3.2.0.html#xml-node-types
+   */
+  nodeType?: "element" | "attribute" | "text" | "cdata" | "comment" | "none";
+}
+
+/** OpenAPI 3.2 operation using version-specific parameters, responses and request media types. */
+export type OpenAPIOperation3_2 = Omit<
+  OpenAPI3Operation,
+  "responses" | "parameters" | "requestBody"
+> & {
+  /** Status-keyed responses using the 3.2 response shape. */
+  responses?: Refable<OpenAPIResponses3_2>;
+  /** Operation-specific parameters, overriding path-level parameters with the same name/location pair. */
+  parameters?: Refable<OpenAPIParameter3_2>[];
+  /** Request payload with support for reusable media type definitions. */
+  requestBody?: Refable<OpenAPIRequestBody3_2>;
+};
+
+/**
+ * Describes the operations available on a single path. A Path Item may be empty, due to ACL constraints. The path itself is still exposed to the documentation viewer but they will not know which operations and parameters are available.
+ *
+ * @see https://spec.openapis.org/oas/v3.2.0.html#fixed-fields-6
+ */
+export type OpenAPIPathItem3_2 = Omit<OpenAPI3PathItem, OpenAPI3HttpMethod | "parameters"> & {
+  [method in OpenAPIHttpMethod3_2]?: OpenAPIOperation3_2;
+} & {
+  /** Operations for HTTP methods without a named path-item field, keyed by case-sensitive method name. */
+  additionalOperations?: Record<string, OpenAPIOperation3_2>;
+  /** Parameters shared by all operations on the path, subject to operation-level overrides. */
+  parameters?: Refable<OpenAPIParameter3_2>[];
+};
+/** Shared OpenAPI 3.2 parameter fields, using version-specific schemas, examples and reusable media types. */
+export type OpenAPIParameterBase3_2 = Omit<
+  OpenAPI3ParameterBase,
+  "content" | "examples" | "schema"
+> & {
+  /** A map containing the representations for the parameter. The key is the media type and the value describes it. The map MUST only contain one entry. */
+  content?: Record<string, Refable<OpenAPIMediaType3_2>>;
+  /** Named data or serialized examples; mutually exclusive with `example`. */
+  examples?: Record<string, Refable<OpenAPIExample3_2>>;
+  /** Value schema for style-based serialization; mutually exclusive with `content`. */
+  schema?: Refable<OpenAPISchema3_2>;
+};
+/**
+ * An OpenAPI 3.2 parameter describing the entire query string through `content`.
+ * Must not coexist with individual `query` parameters for the same operation.
+ */
+export type OpenAPIQueryStringParameter3_2 = Omit<
+  OpenAPIParameterBase3_2,
+  "style" | "explode" | "allowReserved" | "schema"
+> & {
+  /** Name of the parameter. */
+  name: string;
+  /** Selects the entire query string rather than a single named query value. */
+  in: "querystring";
+};
+/** OpenAPI 3.2 cookie parameter, adding cookie-specific serialization to the earlier form style. */
+export type OpenAPICookieParameter3_2 = Omit<
+  OpenAPI3CookieParameter,
+  "content" | "examples" | "style"
+> &
+  OpenAPIParameterBase3_2 & {
+    /**
+     * Describes how the parameter value will be serialized depending on the type of the parameter value.
+     *
+     * Defaults to form for compatibility; OpenAPI 3.2 recommends cookie style for cookie parameters.
+     * @see https://spec.openapis.org/oas/latest#fixed-fields-9
+     */
+    style?: "form" | "cookie";
+  };
+/**
+ * Request header parameter with OpenAPI 3.2 examples and media types.
+ * Its exported schema type also retains the {@link OpenAPI3Schema} restriction, excluding type arrays.
+ */
+export type OpenAPIHeaderParameter3_2 = Omit<OpenAPI3HeaderParameter, "content" | "examples"> &
+  OpenAPIParameterBase3_2;
+/**
+ * Required path-template parameter with OpenAPI 3.2 examples and media types.
+ * Schema support is limited to the intersection of {@link OpenAPI3Schema} and {@link OpenAPISchema3_2}.
+ */
+export type OpenAPIPathParameter3_2 = Omit<OpenAPI3PathParameter, "content" | "examples"> &
+  OpenAPIParameterBase3_2;
+/** Individual named query parameter, distinct from the 3.2 whole-query-string parameter. */
+export type OpenAPIQueryParameter3_2 = Omit<OpenAPI3QueryParameter, "content" | "examples"> &
+  OpenAPIParameterBase3_2;
+/** OpenAPI 3.2 request parameter union, including the whole-query-string location added in this version. */
+export type OpenAPIParameter3_2 =
+  | OpenAPIHeaderParameter3_2
+  | OpenAPIQueryParameter3_2
+  | OpenAPIQueryStringParameter3_2
+  | OpenAPIPathParameter3_2
+  | OpenAPICookieParameter3_2;
+/** Parameter locations modeled for OpenAPI 3.2, including `querystring` but excluding request bodies. */
+export type OpenAPIParameterType3_2 = OpenAPIParameter3_2["in"];
+
+/** OpenAPI 3.2 tag metadata, supporting display summaries, parent-child organization and categorization. */
+export interface OpenAPITag3_2 extends OpenAPI3Tag {
+  /**
+   * A short summary of the tag, used for display purposes.
+   * @see https://spec.openapis.org/oas/latest#fixed-fields-18
+   */
+  summary?: string;
+  /**
+   * The name of a tag that this tag is nested under. The named tag MUST exist in the API description, and circular references between parent and child tags MUST NOT be used.
+   * @see https://spec.openapis.org/oas/latest#fixed-fields-18
+   */
+  parent?: string;
+  /**
+   * A machine-readable string to categorize what sort of tag it is
+   * @see https://spec.openapis.org/oas/latest#fixed-fields-18
+   */
+  kind?: string;
+}
+
+/** OpenAPI 3.2 request body, whose media representations can be embedded inline or referenced. */
+export interface OpenAPIRequestBody3_2 extends Omit<OpenAPI3RequestBody, "content"> {
+  /** A map containing descriptions of potential request payloads. The key is a media type or media type range and the value describes it. For requests that match multiple keys, only the most specific key is applicable. e.g. text/plain overrides text/* */
+  content: Record<string, Refable<OpenAPIMediaType3_2>>;
+}

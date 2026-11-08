@@ -1,0 +1,2472 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.IO;
+using System.Linq;
+using Microsoft.TypeSpec.Generator.EmitterRpc;
+using Microsoft.TypeSpec.Generator.Expressions;
+using Microsoft.TypeSpec.Generator.Input;
+using Microsoft.TypeSpec.Generator.Input.Extensions;
+using Microsoft.TypeSpec.Generator.Primitives;
+using Microsoft.TypeSpec.Generator.Snippets;
+using Microsoft.TypeSpec.Generator.Statements;
+using Microsoft.TypeSpec.Generator.Utilities;
+using static Microsoft.TypeSpec.Generator.Snippets.Snippet;
+
+namespace Microsoft.TypeSpec.Generator.Providers
+{
+    public class ModelProvider : TypeProvider
+    {
+        private const string AdditionalBinaryDataPropsFieldDescription = "Keeps track of any properties unknown to the library.";
+        private const string RequestSuffix = "Request";
+        private const string ResponseSuffix = "Response";
+        private readonly InputModelType _inputModel;
+        internal InputModelType InputModel => _inputModel;
+
+        // Note the description cannot be built from the constructor as it would lead to a circular dependency between the base
+        // and derived models resulting in a stack overflow.
+        protected override FormattableString BuildDescription()
+        {
+            var description = DocHelpers.GetFormattableDescription(_inputModel.Summary, _inputModel.Doc) ??
+                              $"The {Name}.";
+            if (_isDiscriminatedBaseType)
+            {
+                _derivedModels = BuildDerivedModels();
+                var publicDerivedModels = _derivedModels.Where(m => m.DeclarationModifiers.HasFlag(TypeSignatureModifiers.Public)).ToList();
+                if (publicDerivedModels.Count == 0)
+                {
+                    return description;
+                }
+                var derivedClassesDescription = DeclarationModifiers.HasFlag(TypeSignatureModifiers.Abstract)
+                    ? "Please note this is the abstract base class. The derived classes available for instantiation are: "
+                    : "Please note this is the base class. The derived classes available for instantiation are: ";
+                bool addComma = publicDerivedModels.Count > 2;
+                for (int i = 0; i < publicDerivedModels.Count; i++)
+                {
+                    if (i == publicDerivedModels.Count - 1)
+                    {
+                        derivedClassesDescription += $"{(i > 0 ? "and " : "")}<see cref=\"{publicDerivedModels[i].Type.FullyQualifiedName}\"/>.";
+                    }
+                    else
+                    {
+                        derivedClassesDescription += $"<see cref=\"{publicDerivedModels[i].Type.FullyQualifiedName}\"/>{(addComma ? ", " : " ")}";
+                    }
+                }
+
+                description = $"{description}\n{derivedClassesDescription}";
+            }
+
+            return description;
+        }
+
+        private bool? _isMultiLevelDiscriminator;
+        private bool IsMultiLevelDiscriminator => _isMultiLevelDiscriminator ??= ComputeIsMultiLevelDiscriminator();
+
+        private readonly CSharpType _additionalBinaryDataPropsFieldType = typeof(IDictionary<string, BinaryData>);
+        private readonly CSharpType _additionalObjectPropsFieldType = typeof(IDictionary<string, object>);
+        private readonly Type _additionalPropsUnknownType = typeof(BinaryData);
+        private Lazy<bool> _useObjectAdditionalProperties;
+        private FieldProvider? _rawDataField;
+        private bool _buildingRawDataField;
+        private List<FieldProvider>? _additionalPropertyFields;
+        private List<PropertyProvider>? _additionalPropertyProperties;
+        private ModelProvider? _baseModelProvider;
+        private ModelProvider? _backCompatBaseModelProvider;
+        private ConstructorProvider? _fullConstructor;
+        private ConstructorProvider? _nonValidatingInheritanceConstructor;
+        private bool? _needsNonValidatingInheritanceConstructor;
+        internal PropertyProvider? DiscriminatorProperty { get; private set; }
+
+        private readonly bool _isDiscriminatedBaseType;
+
+        private ValueExpression DiscriminatorLiteral => Literal(_inputModel.DiscriminatorValue ?? "");
+
+        public ModelProvider(InputModelType inputModel) : base(inputModel)
+        {
+            _inputModel = inputModel;
+            _isDiscriminatedBaseType = inputModel.DiscriminatorProperty is not null && inputModel.DiscriminatorValue is null;
+            _useObjectAdditionalProperties = new Lazy<bool>(ShouldUseObjectAdditionalProperties);
+        }
+
+        public bool IsUnknownDiscriminatorModel => _inputModel.IsUnknownDiscriminatorModel;
+
+        // Whether this model is reused from another shipped package (linked via an `external` block)
+        // rather than emitted by this library. Such a type's constructor surface is owned elsewhere.
+        internal bool IsExternal => _inputModel.External is not null;
+
+        /// <summary>
+        /// Gets explicitly customized members that own properties added to an externally mapped base model.
+        /// </summary>
+        public IEnumerable<PropertyProvider> ExternalPropertyReplacements => CanonicalView.Properties.Where(property =>
+            property.OriginalName is not null &&
+            property.InputProperty?.EnclosingType is InputModelType { External: not null } owner &&
+            owner != _inputModel);
+
+        public string? DiscriminatorValue => _inputModel.DiscriminatorValue;
+
+        private ValueExpression? _discriminatorValueExpression;
+        public ValueExpression? DiscriminatorValueExpression =>
+            _inputModel.BaseModel is not null
+                ? _discriminatorValueExpression ??= EnsureDiscriminatorValueExpression()
+                : null;
+
+        private IReadOnlyList<ModelProvider>? _derivedModels;
+        public IReadOnlyList<ModelProvider> DerivedModels => _derivedModels ??= BuildDerivedModels();
+
+        private IDictionary<string, CSharpType> LastContractPropertiesMap
+            => _lastContractPropertiesMap ??= LastContractView?.Properties
+                .Where(p => MethodSignatureHelper.IsPublicApi(p.Modifiers, p.Attributes))
+                .ToDictionary(p => p.Name, p => p.Type) ?? [];
+
+        private IDictionary<string, CSharpType>? _lastContractPropertiesMap;
+
+        private IReadOnlyList<ModelProvider> BuildDerivedModels()
+        {
+            var derivedModels = new HashSet<ModelProvider>(_inputModel.DiscriminatedSubtypes.Count + _inputModel.DerivedModels.Count);
+            // add discriminated subtypes
+            foreach (var subtype in _inputModel.DiscriminatedSubtypes)
+            {
+                var model = CodeModelGenerator.Instance.TypeFactory.CreateModel(subtype.Value);
+                if (model != null)
+                {
+                    derivedModels.Add(model);
+                }
+            }
+
+            // add derived models
+            foreach (var derivedModel in _inputModel.DerivedModels)
+            {
+                var model = CodeModelGenerator.Instance.TypeFactory.CreateModel(derivedModel);
+                if (model != null)
+                {
+                    derivedModels.Add(model);
+                }
+            }
+
+            return [.. derivedModels.OrderBy(m => m.Name, StringComparer.Ordinal)];
+        }
+        internal override TypeProvider? BaseTypeProvider => _baseTypeProvider ??= BuildBaseTypeProvider();
+        private TypeProvider? _baseTypeProvider;
+
+        private TypeProvider? BuildBaseTypeProvider()
+        {
+            // First check if there's a generated base model
+            if (BaseModelProvider != null)
+            {
+                return BaseModelProvider;
+            }
+
+            // If there's a custom base type that's not a generated model, create a provider for it
+            if (CustomCodeView?.BaseType != null && !string.IsNullOrEmpty(CustomCodeView.BaseType.Namespace))
+            {
+                var baseType = CustomCodeView.BaseType;
+
+                // Try to find it in the CSharpTypeMap first
+                if (CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap.TryGetValue(baseType, out var existingProvider))
+                {
+                    return existingProvider;
+                }
+
+                // Try to find the type in the customization compilation. Referenced assemblies are
+                // included so custom bases from framework or external packages are represented by
+                // normal symbol-backed providers.
+                var baseTypeProvider = CodeModelGenerator.Instance.SourceInputModel.FindForTypeInCurrentCompilation(
+                    baseType.Namespace,
+                    baseType.Name,
+                    baseType.DeclaringType?.Name,
+                    includeReferencedAssemblies: true);
+
+                if (baseTypeProvider != null)
+                {
+                    // Cache it in CSharpTypeMap for future lookups
+                    CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap[baseType] = baseTypeProvider;
+                    return baseTypeProvider;
+                }
+
+                // If we couldn't find the type symbol, create a SystemObjectTypeProvider that
+                // represents the external type without member metadata.
+                var systemObjectTypeProvider = new SystemObjectTypeProvider(baseType);
+                // Cache it in CSharpTypeMap for future lookups
+                CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap[baseType] = systemObjectTypeProvider;
+                return systemObjectTypeProvider;
+            }
+
+            return null;
+        }
+
+        public ModelProvider? BaseModelProvider
+            => _baseModelProvider ??= BuildBaseModelProvider();
+
+        /// <inheritdoc/>
+        public override void Reset()
+        {
+            base.Reset();
+            _rawDataField = null;
+            _additionalPropertyFields = null;
+            _additionalPropertyProperties = null;
+            _isMultiLevelDiscriminator = null;
+        }
+
+        private protected override void ResetConstructors()
+        {
+            base.ResetConstructors();
+            _fullConstructor = null;
+            _nonValidatingInheritanceConstructor = null;
+            _needsNonValidatingInheritanceConstructor = null;
+        }
+
+        protected FieldProvider? RawDataField
+        {
+            get
+            {
+                if (_rawDataField is not null)
+                {
+                    return _rawDataField;
+                }
+
+                if (_buildingRawDataField)
+                {
+                    // BuildRawDataField walks base models and can re-enter this property when custom
+                    // base models form a cycle.
+                    return null;
+                }
+
+                _buildingRawDataField = true;
+                try
+                {
+                    return _rawDataField = BuildRawDataField();
+                }
+                finally
+                {
+                    _buildingRawDataField = false;
+                }
+            }
+        }
+        protected virtual bool ShouldSkipDerivedModelProperties => false;
+        private protected virtual bool ShouldUseFullConstructorInDerivedTypes => true;
+        /// <summary>
+        /// Gets whether derived models should skip overriding serialization methods from this base model.
+        /// </summary>
+        public virtual bool ShouldSkipDerivedSerializationMethodOverrides => false;
+        private List<FieldProvider> AdditionalPropertyFields => _additionalPropertyFields ??= BuildAdditionalPropertyFields();
+        private List<PropertyProvider> AdditionalPropertyProperties => _additionalPropertyProperties ??= BuildAdditionalPropertyProperties();
+        protected internal bool SupportsBinaryDataAdditionalProperties => AdditionalPropertyProperties.Any(p =>
+            p.Type.ElementType.Equals(_additionalPropsUnknownType) ||
+            (p.Type.ElementType.IsFrameworkType && p.Type.ElementType.FrameworkType == typeof(object)));
+        /// <summary>
+        /// The constructor that takes every serializable property.
+        /// </summary>
+        public ConstructorProvider FullConstructor => _fullConstructor ??= BuildFullConstructor();
+
+        protected override string BuildNamespace() => string.IsNullOrEmpty(_inputModel.Namespace) ?
+            // TODO remove null check once https://github.com/Azure/typespec-azure/issues/2209 is fixed.
+            CodeModelGenerator.Instance.TypeFactory.PrimaryNamespace :
+            CodeModelGenerator.Instance.TypeFactory.GetCleanNameSpace(_inputModel.Namespace);
+
+        protected override CSharpType? BuildBaseType()
+        {
+            var currentBase = BuildCurrentBaseType();
+            return BuildBaseTypeForBackCompatibility(currentBase);
+        }
+
+        /// <summary>
+        /// Returns the model base type after applying backward compatibility against <see cref="LastContractView"/>.
+        /// Restoration is limited to compatible generated roots and mapped bases recognized by the type factory.
+        /// </summary>
+        /// <param name="currentBase">The base type selected from custom code or the current input model.</param>
+        private CSharpType? BuildBaseTypeForBackCompatibility(CSharpType? currentBase)
+        {
+            // Property validation can resolve a type that points back to this model before its Type
+            // has been cached. Keep that nested resolution on the current hierarchy rather than
+            // re-entering restoration and recursively materializing the same property graph.
+            if (_isResolvingBackCompatBaseType)
+            {
+                return currentBase;
+            }
+
+            _isResolvingBackCompatBaseType = true;
+            try
+            {
+                return BuildBaseTypeForBackCompatibilityCore(currentBase);
+            }
+            finally
+            {
+                _isResolvingBackCompatBaseType = false;
+            }
+        }
+
+        internal bool CanRestoreLastContractModelBase(ModelProvider candidate)
+            => candidate is not SystemObjectModelProvider mappedBase ||
+                !RequiresParameterlessBaseConstructor || mappedBase.HasCallableParameterlessConstructor;
+
+        /// <summary>
+        /// Whether generated constructors require a base constructor callable without arguments.
+        /// Used to validate a mapped last-contract base before committing the restored hierarchy.
+        /// </summary>
+        protected virtual bool RequiresParameterlessBaseConstructor => false;
+
+        private CSharpType? BuildBaseTypeForBackCompatibilityCore(CSharpType? currentBase)
+        {
+            // A mapped external model's CLR hierarchy is owned by its wrapped system type.
+            if (this is SystemObjectModelProvider)
+            {
+                return currentBase;
+            }
+
+            var previousBase = LastContractView?.BaseType;
+            if (previousBase is null || previousBase.IsGenericType || IsInBaseTypeHierarchy(currentBase, previousBase))
+            {
+                return currentBase;
+            }
+
+            // Keep this policy deliberately conservative. Conflicting custom bases, structs, polymorphic
+            // models, and models with descendants require broader hierarchy reconciliation and are left unchanged.
+            // Unrelated custom members do not prevent restoring a compatible mapped base.
+            if (CustomCodeView?.BaseType is not null ||
+                DeclarationModifiers.HasFlag(TypeSignatureModifiers.Struct) ||
+                _inputModel.DiscriminatorProperty is not null ||
+                _inputModel.DiscriminatorValue is not null ||
+                _inputModel.DerivedModels.Count > 0 ||
+                _inputModel.DiscriminatedSubtypes.Count > 0)
+            {
+                return currentBase;
+            }
+
+            if (CodeModelGenerator.Instance.SourceInputModel.ApiCompatBaseline.ReferencesSuppressedType(previousBase))
+            {
+                CodeModelGenerator.Instance.Emitter.Info(
+                    $"Skipping back-compat base type restoration for model '{BuildNamespace()}.{BuildName()}'; base type '{previousBase.FullyQualifiedName}' is an accepted removal in the ApiCompat baseline.",
+                    BackCompatibilityChangeCategory.BaselineAcceptedRemovalSkipped);
+                return currentBase;
+            }
+
+            var resolver = new BackCompatModelBaseResolver(this);
+            if (!resolver.TryResolve(previousBase, out var previousBaseProvider))
+            {
+                if (!_hasReportedIncompatibleBackcompatBaseType)
+                {
+                    CodeModelGenerator.Instance.Emitter.ReportDiagnostic(
+                        DiagnosticCodes.IncompatibleBackcompatBaseType,
+                        $"Could not preserve base type '{previousBase.FullyQualifiedName}' on model '{BuildNamespace()}.{BuildName()}'; automatic restoration is limited to compatible generated or mapped root-model bases.");
+                    _hasReportedIncompatibleBackcompatBaseType = true;
+                }
+                return currentBase;
+            }
+
+            // Keep the restored provider local to this model. A downstream fallback may synthesize a
+            // mapped contract specifically for this hierarchy, so publishing it in the global type map
+            // could change constructor and serialization behavior for unrelated models with the same base.
+            _backCompatBaseModelProvider = previousBaseProvider;
+            CodeModelGenerator.Instance.Emitter.Info(
+                $"Changed base type of model '{BuildName()}' from '{currentBase?.FullyQualifiedName ?? "object"}' to '{previousBaseProvider.Type.FullyQualifiedName}' to match the last contract.",
+                BackCompatibilityChangeCategory.ModelBaseTypePreserved);
+            return previousBaseProvider.Type;
+        }
+
+        private bool _hasReportedIncompatibleBackcompatBaseType;
+        private bool _isResolvingBackCompatBaseType;
+
+        private CSharpType? BuildCurrentBaseType()
+        {
+            if (CustomCodeView?.BaseType != null)
+            {
+                var customBase = CustomCodeView.BaseType;
+
+                if (string.IsNullOrEmpty(customBase.Namespace))
+                {
+                    if (CodeModelGenerator.Instance.TypeFactory.TypeProvidersByName.TryGetValue(
+                            customBase.Name, out var resolvedProvider) &&
+                        resolvedProvider is ModelProvider resolvedModel)
+                    {
+                        return resolvedModel.Type;
+                    }
+
+                    foreach (var model in CodeModelGenerator.Instance.InputLibrary.InputNamespace.Models)
+                    {
+                        CodeModelGenerator.Instance.TypeFactory.CreateModel(model);
+                    }
+
+                    if (CodeModelGenerator.Instance.TypeFactory.TypeProvidersByName.TryGetValue(
+                            customBase.Name, out resolvedProvider) &&
+                        resolvedProvider is ModelProvider resolvedAfterCreate)
+                    {
+                        return resolvedAfterCreate.Type;
+                    }
+                }
+
+                if (CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap.TryGetValue(
+                        customBase, out var mappedProvider) &&
+                    mappedProvider is ModelProvider mappedModel)
+                {
+                    return mappedModel.Type;
+                }
+
+                return customBase;
+            }
+
+            return _inputModel.BaseModel is null
+                ? null
+                : CodeModelGenerator.Instance.TypeFactory.CreateModel(_inputModel.BaseModel)?.Type;
+        }
+
+        private static bool IsInBaseTypeHierarchy(CSharpType? currentBase, CSharpType previousBase)
+        {
+            var visited = new HashSet<string>(StringComparer.Ordinal);
+            for (var type = currentBase; type is not null && visited.Add(type.FullyQualifiedName); type = type.BaseType)
+            {
+                if (type.AreNamesEqual(previousBase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        protected override TypeProvider[] BuildSerializationProviders()
+        {
+            return [.. CodeModelGenerator.Instance.TypeFactory.CreateSerializations(_inputModel, this)];
+        }
+
+        protected override string BuildRelativeFilePath() => Path.Combine("src", "Generated", "Models", $"{Name}.cs");
+
+        protected override string BuildName()
+        {
+            return CodeModelGenerator.Instance.TypeFactory.ModelNames.TryGetValue(_inputModel, out var name)
+                ? name
+                : BuildNameWithoutCollisionCheck();
+        }
+
+        internal (string Name, string FinalName, string OriginalName, string Namespace, string FinalNamespace, bool CanRename, bool HasTypeMapping) GetNameForCollisionCheck()
+        {
+            var name = BuildNameWithoutCollisionCheck();
+            var originalName = _inputModel.IsExactName ? _inputModel.Name : _inputModel.Name.ToIdentifierName().NormalizeCSharpAcronyms();
+            var typeNamespace = BuildNamespace();
+            var customType = base.BuildCustomCodeView(name, typeNamespace);
+            var canRename = !_inputModel.IsExactName && name != originalName &&
+                name == RenameModelSuffix(originalName);
+            return (name, customType?.Name ?? name, originalName, typeNamespace, customType?.Type.Namespace ?? typeNamespace,
+                canRename, CodeModelGenerator.Instance.SourceInputModel.HasTypeMapping(typeNamespace, name, DeclaringTypeName));
+        }
+
+        private string BuildNameWithoutCollisionCheck()
+        {
+            if (_inputModel.IsExactName)
+            {
+                return _inputModel.Name;
+            }
+
+            return NormalizeTypeNameForNewContract(_inputModel.Name.ToIdentifierName());
+        }
+
+        private protected override string NormalizeTypeName(string name)
+        {
+            var normalizedName = base.NormalizeTypeName(name);
+            var renamedName = RenameModelSuffix(normalizedName);
+            if (renamedName == normalizedName)
+            {
+                return normalizedName;
+            }
+
+            var typeNamespace = BuildNamespace();
+            var sourceInputModel = CodeModelGenerator.Instance.SourceInputModel;
+            if (sourceInputModel.FindForTypeInCurrentCompilation(typeNamespace, normalizedName, DeclaringTypeName) is not null ||
+                sourceInputModel.FindForTypeInLastContract(typeNamespace, normalizedName, DeclaringTypeName) is not null)
+            {
+                return normalizedName;
+            }
+
+            return renamedName;
+        }
+
+        private string RenameModelSuffix(string name)
+        {
+            if (name.EndsWith(RequestSuffix, StringComparison.Ordinal))
+            {
+                return $"{name[..^RequestSuffix.Length]}Content";
+            }
+
+            if (!_inputModel.Usage.HasFlag(InputModelTypeUsage.Error) &&
+                name.EndsWith(ResponseSuffix, StringComparison.Ordinal))
+            {
+                return $"{name[..^ResponseSuffix.Length]}Result";
+            }
+
+            return name;
+        }
+
+        private protected override TypeProvider? BuildCustomCodeView(string? generatedTypeName = null, string? generatedTypeNamespace = null)
+        {
+            var typeNamespace = generatedTypeNamespace ?? BuildNamespace();
+            var typeName = generatedTypeName ?? BuildName();
+            var customCodeView = base.BuildCustomCodeView(typeName, typeNamespace);
+            return customCodeView ?? BuildModelSuffixFallbackView(
+                typeName,
+                typeNamespace,
+                (name, ns) => base.BuildCustomCodeView(name, ns));
+        }
+
+        private protected override TypeProvider? BuildLastContractView(string? generatedTypeName = null, string? generatedTypeNamespace = null)
+        {
+            var typeNamespace = generatedTypeNamespace ?? CustomCodeView?.Type.Namespace ?? BuildNamespace();
+            var typeName = generatedTypeName ?? CustomCodeView?.Name ?? BuildName();
+            var lastContractView = base.BuildLastContractView(typeName, typeNamespace);
+            return lastContractView ?? BuildModelSuffixFallbackView(
+                typeName,
+                typeNamespace,
+                (name, ns) => base.BuildLastContractView(name, ns));
+        }
+
+        private TypeProvider? BuildModelSuffixFallbackView(
+            string typeName,
+            string typeNamespace,
+            Func<string, string, TypeProvider?> buildView)
+        {
+            if (_inputModel.IsExactName)
+            {
+                return null;
+            }
+
+            var originalName = _inputModel.Name.ToIdentifierName();
+            var normalizedOriginalName = originalName.NormalizeCSharpAcronyms();
+            var renamedName = RenameModelSuffix(normalizedOriginalName);
+            if (renamedName == normalizedOriginalName ||
+                originalName == typeName ||
+                typeName != renamedName)
+            {
+                return null;
+            }
+
+            return buildView(originalName, typeNamespace) ??
+                (normalizedOriginalName == originalName ? null : buildView(normalizedOriginalName, typeNamespace));
+        }
+
+        protected override TypeSignatureModifiers BuildDeclarationModifiers()
+        {
+            var customCodeModifiers = CustomCodeView?.DeclarationModifiers ?? TypeSignatureModifiers.None;
+            var isStruct = false;
+            // the information of if this model should be a struct comes from two sources:
+            // 1. the customied code
+            // 2. the spec
+            if (customCodeModifiers.HasFlag(TypeSignatureModifiers.Struct))
+            {
+                isStruct = true;
+            }
+            if (_inputModel.ModelAsStruct)
+            {
+                isStruct = true;
+            }
+            var declarationModifiers = TypeSignatureModifiers.Partial;
+
+            if (isStruct)
+            {
+                declarationModifiers |= TypeSignatureModifiers.ReadOnly | TypeSignatureModifiers.Struct;
+            }
+            else
+            {
+                declarationModifiers |= TypeSignatureModifiers.Class;
+            }
+
+            if (customCodeModifiers != TypeSignatureModifiers.None)
+            {
+                declarationModifiers |= GetAccessibilityModifiers(customCodeModifiers);
+            }
+            else if (_inputModel.Access == "internal")
+            {
+                declarationModifiers |= TypeSignatureModifiers.Internal;
+            }
+
+            if (_isDiscriminatedBaseType)
+            {
+                declarationModifiers |= TypeSignatureModifiers.Abstract;
+            }
+
+            return declarationModifiers;
+
+            static TypeSignatureModifiers GetAccessibilityModifiers(TypeSignatureModifiers modifiers)
+            {
+                return modifiers & (TypeSignatureModifiers.Public | TypeSignatureModifiers.Internal | TypeSignatureModifiers.Protected | TypeSignatureModifiers.Private);
+            }
+        }
+
+        /// <summary>
+        /// Builds the fields for the model by adding the raw data field.
+        /// </summary>
+        /// <returns>The list of <see cref="FieldProvider"/> for the model.</returns>
+        protected internal override FieldProvider[] BuildFields()
+        {
+            List<FieldProvider> fields = [];
+            if (RawDataField != null)
+            {
+                fields.Add(RawDataField);
+            }
+
+            // add fields for additional properties
+            if (AdditionalPropertyFields.Count > 0)
+            {
+                fields.AddRange(AdditionalPropertyFields);
+            }
+
+            fields.AddRange(SharedCollectionFields.Values);
+            foreach (var property in _inputModel.Properties)
+            {
+                if (IsDiscriminator(property) || SharedCollectionFields.ContainsKey(property))
+                {
+                    continue;
+                }
+
+                var derivedProperty = InputDerivedProperties.FirstOrDefault(p => p.Value.ContainsKey(property.OriginalName)).Value?[property.OriginalName];
+                if (derivedProperty is not null)
+                {
+                    if (!DomainEqual(property, derivedProperty))
+                    {
+                        fields.Add(new FieldProvider(
+                            FieldModifiers.Private | FieldModifiers.Protected,
+                            CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(property.Type)!,
+                            $"_{property.Name.ToVariableName()}",
+                            this));
+                    }
+                }
+            }
+            return [.. fields];
+        }
+
+        private Dictionary<InputModelProperty, FieldProvider>? _sharedCollectionFields;
+        private Dictionary<InputModelProperty, FieldProvider> SharedCollectionFields => _sharedCollectionFields ??= BuildSharedCollectionFields();
+
+        private Dictionary<InputModelProperty, FieldProvider> BuildSharedCollectionFields()
+        {
+            Dictionary<InputModelProperty, FieldProvider> fields = [];
+            foreach (var property in _inputModel.Properties)
+            {
+                if (IsDiscriminator(property)
+                    || !InputDerivedProperties.Values.Any(properties => properties.TryGetValue(property.OriginalName, out var candidate)
+                        && DomainEqual(property, candidate) && property.IsReadOnly != candidate.IsReadOnly)
+                    || EnumerateBaseModels().Any(model => model.Properties.Any(candidate =>
+                        candidate.OriginalName == property.OriginalName && DomainEqual(candidate, property))))
+                {
+                    continue;
+                }
+                if (CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(property.Type) is { IsCollection: true } type)
+                {
+                    fields.Add(property, new FieldProvider(
+                        FieldModifiers.Private | FieldModifiers.Protected,
+                        type.PropertyInitializationType.WithNullable(type.IsNullable),
+                        $"_{property.Name.ToVariableName()}",
+                        this));
+                }
+            }
+            return fields;
+        }
+
+        private static bool IsDiscriminator(InputProperty property)
+        {
+            return property is InputModelProperty modelProperty && modelProperty.IsDiscriminator;
+        }
+
+        protected virtual ModelProvider? BuildBaseModelProvider()
+        {
+            var baseType = BaseType;
+            if (baseType is null)
+            {
+                return null;
+            }
+
+            if (_backCompatBaseModelProvider is not null &&
+                _backCompatBaseModelProvider.Type.AreNamesEqual(baseType))
+            {
+                return _backCompatBaseModelProvider;
+            }
+
+            if (CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap.TryGetValue(baseType, out var provider)
+                && provider is ModelProvider modelProvider)
+            {
+                return modelProvider;
+            }
+
+            if (CustomCodeView?.BaseType is null && _inputModel.BaseModel is not null)
+            {
+                var inputBaseModelProvider = CodeModelGenerator.Instance.TypeFactory.CreateModel(_inputModel.BaseModel);
+                if (inputBaseModelProvider is not null && inputBaseModelProvider.Type.AreNamesEqual(baseType))
+                {
+                    CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap[baseType] = inputBaseModelProvider;
+                    return inputBaseModelProvider;
+                }
+            }
+
+            if (CustomCodeView?.BaseType != null && !string.IsNullOrEmpty(baseType.Namespace))
+            {
+                foreach (var (mapKey, mapValue) in CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap)
+                {
+                    if (mapValue is ModelProvider model
+                        && mapKey.Name == baseType.Name
+                        && mapKey.Namespace == baseType.Namespace)
+                    {
+                        CodeModelGenerator.Instance.TypeFactory.CSharpTypeMap[baseType] = model;
+                        return model;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private List<FieldProvider> BuildAdditionalPropertyFields()
+        {
+            var fields = new List<FieldProvider>();
+
+            if (_inputModel.AdditionalProperties != null)
+            {
+                var valueType = CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(_inputModel.AdditionalProperties);
+                if (valueType != null)
+                {
+                    if (valueType.IsUnion)
+                    {
+                        bool needsNullableBucket = _inputModel.AdditionalProperties is InputNullableType;
+                        foreach (var unionType in valueType.UnionItemTypes)
+                        {
+                            var fieldType = needsNullableBucket ? unionType.WithNullable(true) : unionType;
+                            if (AddFieldForAdditionalProperties(fieldType, fields, true))
+                            {
+                                needsNullableBucket = false;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        AddFieldForAdditionalProperties(valueType, fields, false);
+                    }
+                }
+            }
+
+            return fields;
+        }
+
+        private bool AddFieldForAdditionalProperties(CSharpType valueType, List<FieldProvider> fields, bool isUnionType)
+        {
+            var originalType = new CSharpType(typeof(IDictionary<,>), typeof(string), valueType);
+            var additionalPropsType = ReplaceUnverifiableType(originalType);
+
+            if ((isUnionType && additionalPropsType.ContainsBinaryData)
+                || additionalPropsType.Equals(_additionalBinaryDataPropsFieldType))
+            {
+                return false;
+            }
+
+            var field = new FieldProvider(
+                FieldModifiers.Private,
+                additionalPropsType,
+                BuildAdditionalTypePropertiesFieldName(additionalPropsType.ElementType),
+                this);
+            field.Update(suppressions: ExperimentalApiHelpers.GetReferenceSuppressions(_inputModel.AdditionalProperties));
+            fields.Add(field);
+            return true;
+        }
+
+        internal IEnumerable<string> GetAdditionalPropertyNamesForBackCompatibility()
+        {
+            if (_inputModel.AdditionalProperties is null)
+            {
+                yield break;
+            }
+
+            // Use the same field/type naming as emission, without populating Properties or RawDataField:
+            // those caches walk the base hierarchy while restoration is still choosing that hierarchy.
+            var fields = BuildAdditionalPropertyFields();
+            for (var i = 0; i < fields.Count; i++)
+            {
+                yield return i == 0 ? AdditionalPropertiesHelper.DefaultAdditionalPropertiesPropertyName : fields[i].Name.ToIdentifierName();
+            }
+
+            if (CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(_inputModel.AdditionalProperties) is not { } valueType)
+            {
+                yield break;
+            }
+            var dictionaryType = ReplaceUnverifiableType(new CSharpType(typeof(IDictionary<,>), typeof(string), valueType));
+            if (dictionaryType.ElementType.IsUnion && dictionaryType.ElementType.UnionItemTypes.Any(type => !type.IsFrameworkType) ||
+                !valueType.IsUnion && dictionaryType.Equals(_additionalBinaryDataPropsFieldType))
+            {
+                // Conservatively reserve the raw-data property if its type can be exposed. Whether the
+                // final hierarchy supplies a raw-data field is deliberately not evaluated here.
+                yield return fields.Count == 0
+                    ? AdditionalPropertiesHelper.DefaultAdditionalPropertiesPropertyName
+                    : AdditionalPropertiesHelper.AdditionalBinaryDataPropsFieldName.ToIdentifierName();
+            }
+        }
+
+        private List<PropertyProvider> BuildAdditionalPropertyProperties()
+        {
+            var additionalPropertiesFieldCount = AdditionalPropertyFields.Count;
+            var properties = new List<PropertyProvider>(additionalPropertiesFieldCount + 1);
+            bool containsAdditionalTypeProperties = false;
+
+            for (int i = 0; i < additionalPropertiesFieldCount; i++)
+            {
+                var field = AdditionalPropertyFields[i];
+                var propertyType = !_inputModel.Usage.HasFlag(InputModelTypeUsage.Input) ? field.Type.OutputType : field.Type;
+                var assignment = propertyType.IsReadOnlyDictionary
+                   ? new ExpressionPropertyBody(New.ReadOnlyDictionary(propertyType.Arguments[0], propertyType.ElementType, field))
+                   : new ExpressionPropertyBody(field);
+
+                properties.Add(new(
+                    null,
+                    MethodSignatureModifiers.Public,
+                    propertyType,
+                    i == 0 ? AdditionalPropertiesHelper.DefaultAdditionalPropertiesPropertyName : field.Name.ToIdentifierName(),
+                    assignment,
+                    this,
+                    suppressions: field.Suppressions)
+                {
+                    BackingField = field,
+                    IsAdditionalProperties = true
+                });
+                containsAdditionalTypeProperties = true;
+            }
+
+            if (RawDataField == null || _inputModel.AdditionalProperties == null)
+            {
+                return properties;
+            }
+
+            var apValueType = CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(_inputModel.AdditionalProperties);
+            if (apValueType == null)
+            {
+                return properties;
+            }
+
+            // add public property for raw binary data if the model supports additional binary data properties
+            var originalType = new CSharpType(typeof(IDictionary<,>), typeof(string), apValueType);
+            var additionalPropsType = ReplaceUnverifiableType(originalType);
+            var shouldAddPropForUnionType = additionalPropsType.ElementType.IsUnion
+                && additionalPropsType.ElementType.UnionItemTypes.Any(t => !t.IsFrameworkType);
+
+            if (shouldAddPropForUnionType || (!apValueType.IsUnion && additionalPropsType.Equals(_additionalBinaryDataPropsFieldType)))
+            {
+                var name = !containsAdditionalTypeProperties
+                    ? AdditionalPropertiesHelper.DefaultAdditionalPropertiesPropertyName
+                    : RawDataField.Name.ToIdentifierName();
+
+                // Use object type if backward compatibility requires it, otherwise use BinaryData type
+                var propertyType = _useObjectAdditionalProperties.Value ? _additionalObjectPropsFieldType : additionalPropsType;
+                var type = !_inputModel.Usage.HasFlag(InputModelTypeUsage.Input)
+                    ? propertyType.OutputType
+                    : propertyType;
+
+                var assignment = type.IsReadOnlyDictionary
+                    ? new ExpressionPropertyBody(New.ReadOnlyDictionary(type.Arguments[0], type.ElementType, RawDataField))
+                    : new ExpressionPropertyBody(RawDataField);
+                var property = new PropertyProvider(
+                    null,
+                    MethodSignatureModifiers.Public,
+                    type,
+                    name,
+                    assignment,
+                    this)
+                {
+                    BackingField = RawDataField,
+                    IsAdditionalProperties = true
+                };
+                properties.Add(property);
+            }
+
+            return properties;
+        }
+
+        private Dictionary<InputModelType, Dictionary<string, InputModelProperty>>? _inputDerivedProperties;
+        private Dictionary<InputModelType, Dictionary<string, InputModelProperty>> InputDerivedProperties => _inputDerivedProperties ??= BuildDerivedProperties();
+
+        private Dictionary<InputModelType, Dictionary<string, InputModelProperty>> BuildDerivedProperties()
+        {
+            Dictionary<InputModelType, Dictionary<string, InputModelProperty>> derivedProperties = [];
+            var derivedModels = new List<InputModelType>();
+            EnumerateDerivedModels(_inputModel, derivedModels);
+            foreach (var derivedModel in derivedModels)
+            {
+                var derivedModelProperties = derivedModel.Properties;
+                if (derivedModelProperties.Count > 0)
+                {
+                    derivedProperties[derivedModel] = derivedModelProperties.ToDictionary(p => p.OriginalName);
+                }
+            }
+            return derivedProperties;
+        }
+
+        private void EnumerateDerivedModels(InputModelType inputModel, List<InputModelType> derivedModels)
+        {
+            foreach (var derivedModel in inputModel.DerivedModels)
+            {
+                derivedModels.Add(derivedModel);
+                EnumerateDerivedModels(derivedModel, derivedModels);
+            }
+        }
+
+        protected internal override PropertyProvider[] BuildProperties()
+        {
+            var propertiesCount = _inputModel.Properties.Count;
+            var properties = new List<PropertyProvider>(propertiesCount + 1);
+            Dictionary<string, InputModelProperty> baseProperties = [];
+            HashSet<string> skippedBasePropertyNames = [];
+            foreach (var baseModelProvider in EnumerateBaseModelProviders())
+            {
+                var inputProperties = baseModelProvider is SystemObjectModelProvider mappedBase
+                    ? mappedBase.MappedInputProperties
+                    : baseModelProvider._inputModel.Properties;
+                foreach (var baseProperty in inputProperties)
+                {
+                    if (baseProperties.ContainsKey(baseProperty.OriginalName) ||
+                        skippedBasePropertyNames.Contains(baseProperty.OriginalName))
+                    {
+                        continue;
+                    }
+
+                    if (baseModelProvider.ShouldSkipDerivedModelProperties)
+                    {
+                        skippedBasePropertyNames.Add(baseProperty.OriginalName);
+                    }
+                    else
+                    {
+                        baseProperties.Add(baseProperty.OriginalName, baseProperty);
+                    }
+                }
+            }
+            // Build a set of serialized names for base discriminator properties to handle cases where
+            // the derived model has a discriminator with a different C# name but the same wire name
+            HashSet<string> baseDiscriminatorSerializedNames = EnumerateBaseModels()
+                .SelectMany(m => m.Properties)
+                .Where(p => p.IsDiscriminator && p.SerializedName is not null)
+                .Select(p => p.SerializedName)
+                .ToHashSet();
+            HashSet<string>? reservedPropertyNames = null;
+            for (int i = 0; i < propertiesCount; i++)
+            {
+                var property = _inputModel.Properties[i];
+                var isDiscriminator = IsDiscriminator(property);
+
+                // Skip discriminator properties that already exist in the base class
+                // Check both declaration and serialized names to handle cases where
+                // the derived model has a discriminator with a different C# name but the same wire name
+                if (isDiscriminator && (baseProperties.ContainsKey(property.OriginalName) || skippedBasePropertyNames.Contains(property.OriginalName) || (property.SerializedName is not null && baseDiscriminatorSerializedNames.Contains(property.SerializedName))))
+                {
+                    continue;
+                }
+
+                var outputProperty = CodeModelGenerator.Instance.TypeFactory.CreateProperty(property, this);
+
+                if (_inputModel.DiscriminatorProperty == property)
+                {
+                    DiscriminatorProperty = outputProperty;
+                }
+
+                if (outputProperty is null)
+                {
+                    continue;
+                }
+
+                if (EnumerateBaseModelProviders().Any(model =>
+                    (model is SystemObjectModelProvider mappedBase ? mappedBase.MappedInputProperties : model._inputModel.Properties)
+                        .Any(p => p.OriginalName != property.OriginalName
+                            && CodeModelGenerator.Instance.TypeFactory.CreateProperty(p, model)?.Name == outputProperty.Name))
+                    && EnumerateBaseModelProviders().Any(model => model.CanonicalView.Properties.Any(p =>
+                        p.Name == outputProperty.Name && p.InputProperty is InputModelProperty inputProperty
+                        && inputProperty.OriginalName != property.OriginalName)))
+                {
+                    reservedPropertyNames ??= EnumerateBaseModelProviders().SelectMany(model => model.CanonicalView.Properties)
+                        .Concat(_inputModel.Properties.Select(p => CodeModelGenerator.Instance.TypeFactory.CreateProperty(p, this))
+                            .OfType<PropertyProvider>())
+                        .Select(p => p.Name).Append(Name).ToHashSet(StringComparer.Ordinal);
+                    var name = $"{outputProperty.Name}Property";
+                    var uniqueName = name;
+                    for (int suffix = 1; !reservedPropertyNames.Add(uniqueName); suffix++)
+                    {
+                        uniqueName = $"{name}{suffix}";
+                    }
+                    outputProperty.Update(name: uniqueName);
+                    outputProperty.SynchronizePropertyShape();
+                }
+
+                if (SharedCollectionFields.TryGetValue(property, out var ownCollectionField))
+                {
+                    outputProperty.BackingField = ownCollectionField;
+                }
+
+                // Apply back-compat type replacement only for properties on the public API
+                // surface: changing the type of an internal/private generated property is not
+                // a source-breaking change
+                if (MethodSignatureHelper.IsPublicApi(outputProperty.Modifiers) &&
+                    LastContractPropertiesMap.TryGetValue(outputProperty.Name, out var lastContractPropertyType) &&
+                    ShouldReplacePropertyTypeWithLastContractType(lastContractPropertyType, outputProperty.Type))
+                {
+                    // If the previous property type (or a type nested in it) has been intentionally
+                    // removed and that removal is accepted in the ApiCompat baseline, preserving it
+                    // would reference a now-deleted type. Honor the baseline and allow the new type.
+                    if (CodeModelGenerator.Instance.SourceInputModel?.ApiCompatBaseline.ReferencesSuppressedType(lastContractPropertyType) == true)
+                    {
+                        CodeModelGenerator.Instance.Emitter.Info(
+                            $"Allowing property '{Name}.{outputProperty.Name}' type change to '{outputProperty.Type}'; previous type '{lastContractPropertyType}' is an accepted removal in the ApiCompat baseline.",
+                            BackCompatibilityChangeCategory.BaselineAcceptedRemovalSkipped);
+                    }
+                    else
+                    {
+                        outputProperty.Type = GetPropertyTypeForBackCompatibility(
+                            lastContractPropertyType,
+                            outputProperty.Type,
+                            property);
+                        CodeModelGenerator.Instance.Emitter.Info(
+                            $"Changed property '{Name}.{outputProperty.Name}' type to '{lastContractPropertyType}' to match last contract.",
+                            BackCompatibilityChangeCategory.PropertyTypePreserved);
+                    }
+                }
+
+                if (!isDiscriminator)
+                {
+                    var derivedProperty = InputDerivedProperties.FirstOrDefault(p => p.Value.ContainsKey(property.OriginalName)).Value?[property.OriginalName];
+                    if (derivedProperty is not null)
+                    {
+                        if (DomainEqual(property, derivedProperty))
+                        {
+                            outputProperty.Modifiers |= MethodSignatureModifiers.Virtual;
+                        }
+                    }
+                    if (skippedBasePropertyNames.Contains(property.OriginalName))
+                    {
+                        continue;
+                    }
+
+                    if (baseProperties.TryGetValue(property.OriginalName, out var baseProperty))
+                    {
+                        var baseOutputProperty = outputProperty.Type.IsCollection
+                            ? EnumerateBaseModelProviders().SelectMany(model => model.CanonicalView.Properties)
+                                .FirstOrDefault(candidate => candidate.InputProperty == baseProperty)
+                            : CodeModelGenerator.Instance.TypeFactory.CreateProperty(baseProperty, BaseModelProvider!);
+                        if (DomainEqual(baseProperty, property))
+                        {
+                            if (outputProperty.Type.IsCollection && baseOutputProperty?.BackingField is { } collectionField
+                                && collectionField.Type.Equals(outputProperty.Type.PropertyInitializationType, ignoreNullable: true))
+                            {
+                                outputProperty.BackingField = collectionField;
+                            }
+                            var hasDifferentBaseAccessors = EnumerateBaseModels().Any(model => model.Properties.Any(p =>
+                                p.OriginalName == property.OriginalName && DomainEqual(p, property) && p.IsReadOnly != property.IsReadOnly));
+                            var hasDifferentName = baseOutputProperty is not null && baseOutputProperty.Name != outputProperty.Name;
+                            if (outputProperty.BackingField is not null)
+                            {
+                                if (EnumerateBaseModelProviders().Any(model => model.CanonicalView.Properties.Any(p => p.Name == outputProperty.Name)))
+                                {
+                                    outputProperty.Modifiers |= MethodSignatureModifiers.New;
+                                }
+                            }
+                            else if (baseOutputProperty is not null && (hasDifferentName
+                                || hasDifferentBaseAccessors && outputProperty.Body.HasSetter && baseOutputProperty.Body.HasSetter))
+                            {
+                                if (!hasDifferentName)
+                                {
+                                    outputProperty.Modifiers |= baseProperty.IsReadOnly != property.IsReadOnly
+                                        ? MethodSignatureModifiers.New
+                                        : MethodSignatureModifiers.Override;
+                                }
+                                else if (EnumerateBaseModelProviders().Any(model => model.CanonicalView.Properties.Any(p => p.Name == outputProperty.Name)))
+                                {
+                                    outputProperty.Modifiers |= MethodSignatureModifiers.New;
+                                }
+                                var getter = Base.Property(baseOutputProperty.Name);
+                                var setter = outputProperty.Body.HasSetter && baseOutputProperty.Body.HasSetter
+                                    ? getter.Assign(Value)
+                                    : null;
+                                outputProperty.Body = outputProperty.Body is AutoPropertyBody { SetterModifiers: var setterModifiers }
+                                    && setterModifiers != MethodSignatureModifiers.None && setterModifiers != MethodSignatureModifiers.Public
+                                    ? new MethodPropertyBody(Return(getter), setter?.Terminate(), setterModifiers)
+                                    : new ExpressionPropertyBody(getter, setter);
+                            }
+                            else
+                            {
+                                outputProperty.Modifiers |= MethodSignatureModifiers.Override;
+                            }
+                        }
+                        else
+                        {
+                            if (EnumerateBaseModelProviders().Any(model => model.CanonicalView.Properties.Any(p => p.Name == outputProperty.Name)))
+                            {
+                                outputProperty.Modifiers |= MethodSignatureModifiers.New;
+                            }
+                            if (baseOutputProperty?.Name == outputProperty.Name
+                                || outputProperty.Body is not AutoPropertyBody { InitializationExpression: not null })
+                            {
+                                var fieldName = $"_{baseProperty.Name.ToVariableName()}";
+                                outputProperty.Body = new ExpressionPropertyBody(
+                                    This.Property(fieldName).NullCoalesce(Default),
+                                    outputProperty.Body.HasSetter ? This.Property(fieldName).Assign(Value) : null);
+                                outputProperty.BackingField = BaseModelProvider?.Fields.FirstOrDefault(f => f.Name == fieldName);
+                            }
+                        }
+                        outputProperty.BaseProperty = baseOutputProperty;
+                    }
+                }
+                if (outputProperty.BackingField is { } sharedField && outputProperty.Type.IsCollection
+                    && sharedField.Type.Equals(outputProperty.Type.PropertyInitializationType, ignoreNullable: true))
+                {
+                    outputProperty.Body = new ExpressionPropertyBody(
+                        sharedField,
+                        outputProperty.Body.HasSetter ? sharedField.Assign(GetConversion(outputProperty, source: Value)) : null);
+                }
+                properties.Add(outputProperty);
+            }
+
+            if (AdditionalPropertyProperties.Count > 0)
+            {
+                properties.AddRange(AdditionalPropertyProperties);
+            }
+
+            return [.. properties];
+        }
+
+        private IEnumerable<InputModelType> EnumerateBaseModels()
+            => EnumerateBaseModelProviders().Select(model => model._inputModel);
+
+        private IEnumerable<ModelProvider> EnumerateBaseModelProviders()
+        {
+            // Custom code can create base-model cycles; include this model in the visited set so a cycle
+            // back to it is not yielded as one of its own bases.
+            HashSet<ModelProvider> visited = [this];
+            var model = BaseModelProvider;
+            while (model != null && visited.Add(model))
+            {
+                yield return model;
+                model = model.BaseModelProvider;
+            }
+        }
+
+        private static bool DomainEqual(InputProperty baseProperty, InputProperty derivedProperty)
+        {
+            if (baseProperty.Type.Name != derivedProperty.Type.Name)
+            {
+                return false;
+            }
+
+            if (baseProperty.IsRequired != derivedProperty.IsRequired)
+            {
+                return false;
+            }
+
+            var baseNullable = baseProperty.Type is InputNullableType;
+            return baseNullable ? derivedProperty.Type is InputNullableType : derivedProperty.Type is not InputNullableType;
+        }
+
+        private static bool ShouldReplacePropertyTypeWithLastContractType(CSharpType lastContractType, CSharpType currentType)
+        {
+            if (lastContractType.Equals(currentType))
+            {
+                return false;
+            }
+
+            // Roslyn-backed last-contract reference types do not retain top-level nullable-reference metadata.
+            // Keep the current TypeSpec top-level nullability when the reference types otherwise match.
+            return lastContractType.IsValueType
+                || currentType.IsValueType
+                || !lastContractType.Equals(currentType, ignoreNullable: true);
+        }
+
+        private static CSharpType GetPropertyTypeForBackCompatibility(
+            CSharpType lastContractType,
+            CSharpType currentType,
+            InputProperty inputProperty)
+        {
+            var compatibleType = lastContractType.ApplyInputSpecProperty(inputProperty);
+            if (compatibleType.IsEnum && currentType.IsEnum && compatibleType.AreNamesEqual(currentType))
+            {
+                // The contract's nullability still applies, but serialization must use the current enum representation.
+                compatibleType = currentType.WithNullable(compatibleType.IsNullable);
+            }
+            else if (compatibleType.IsList && currentType.IsList)
+            {
+                compatibleType = compatibleType.MakeGenericType([
+                    GetPropertyTypeForBackCompatibility(compatibleType.ElementType, currentType.ElementType, inputProperty)]);
+            }
+            else if (compatibleType.IsDictionary && currentType.IsDictionary)
+            {
+                compatibleType = compatibleType.MakeGenericType([
+                    compatibleType.Arguments[0],
+                    GetPropertyTypeForBackCompatibility(compatibleType.ElementType, currentType.ElementType, inputProperty)]);
+            }
+
+            return !compatibleType.IsValueType && currentType.IsNullable
+                ? compatibleType.WithNullable(true)
+                : compatibleType;
+        }
+
+        protected internal override ConstructorProvider[] BuildConstructors()
+        {
+            if (_inputModel.IsUnknownDiscriminatorModel)
+            {
+                return [FullConstructor];
+            }
+
+            // Build the standard single initialization constructor
+            var accessibility = DeclarationModifiers.HasFlag(TypeSignatureModifiers.Abstract)
+                ? MethodSignatureModifiers.Private | MethodSignatureModifiers.Protected
+                : _inputModel.Usage.HasFlag(InputModelTypeUsage.Input)
+                    ? MethodSignatureModifiers.Public
+                    : MethodSignatureModifiers.Internal;
+            var includeDiscriminatorParameter = _isDiscriminatedBaseType
+                && BaseModelProvider?._inputModel.DiscriminatorProperty is not null;
+            var (constructorParameters, constructorInitializer) = BuildConstructorParameters(
+                true,
+                includeDiscriminatorParameter);
+
+            var constructor = new ConstructorProvider(
+                signature: new ConstructorSignature(
+                    Type,
+                    $"Initializes a new instance of {Type:C}",
+                    accessibility,
+                    constructorParameters,
+                    initializer: constructorInitializer),
+                bodyStatements: new MethodBodyStatement[]
+                {
+                    GetPropertyInitializers(true, parameters: constructorParameters)
+                },
+                this);
+
+            var constructors = new List<ConstructorProvider> { constructor };
+
+            // Add FullConstructor if parameters are different
+            if (!constructorParameters.SequenceEqual(FullConstructor.Signature.Parameters))
+            {
+                constructors.Add(FullConstructor);
+            }
+            if (NeedsNonValidatingInheritanceConstructor)
+            {
+                constructors.Add(NonValidatingInheritanceConstructor);
+            }
+
+            // For multi-level discriminators, add one additional private protected constructor
+            if (IsMultiLevelDiscriminator)
+            {
+                var protectedConstructor = BuildProtectedInheritanceConstructor();
+                constructors.Add(protectedConstructor);
+            }
+
+            return [.. constructors];
+        }
+
+        /// <summary>
+        /// Restores previously-published public constructors that the current generation would otherwise
+        /// drop. The primary scenario is a previously required property becoming optional: the corresponding
+        /// parameter is removed from the initialization constructor, which is a source-breaking change for
+        /// callers that construct the model positionally. When the previous public constructor can be safely
+        /// reconstructed - i.e. every one of its extra parameters still maps to a settable property whose
+        /// name and type are unchanged (or a property renamed via a codegen customization but keeping the
+        /// same type) - a back-compat overload is added that chains to the current public constructor and
+        /// assigns the extra properties.
+        /// </summary>
+        protected internal override IReadOnlyList<ConstructorProvider> BuildConstructorsForBackCompatibility(IEnumerable<ConstructorProvider> originalConstructors)
+        {
+            if (LastContractView?.Constructors is not { Count: > 0 } previousConstructors)
+            {
+                return base.BuildConstructorsForBackCompatibility(originalConstructors);
+            }
+
+            var originalConstructorList = originalConstructors as IReadOnlyList<ConstructorProvider> ?? [.. originalConstructors];
+            IReadOnlyList<ConstructorProvider> candidateConstructors = CustomCodeView?.Constructors is { Count: > 0 } customConstructors
+                ? [.. originalConstructorList, .. customConstructors]
+                : originalConstructorList;
+
+            var restorablePreviousConstructors = previousConstructors
+                .Where(c => !BackCompatHelper.IsConstructorRemovalAcceptedInBaseline(this, c.Signature))
+                .ToList();
+
+            RestorePreviousConstructorParameterNames(originalConstructorList, candidateConstructors, restorablePreviousConstructors);
+
+            var constructors = new List<ConstructorProvider>(base.BuildConstructorsForBackCompatibility(originalConstructorList));
+            var restorablePropertyLookup = BuildRestorablePropertyLookup();
+
+            foreach (var previousConstructor in restorablePreviousConstructors)
+            {
+                if (!MethodSignatureHelper.IsPublicApi(previousConstructor.Signature))
+                {
+                    continue;
+                }
+
+                var previousParameters = previousConstructor.Signature.Parameters;
+
+                // A previously published accessible parameterless constructor is dropped when the current
+                // generation makes a property required. Restore it and drop the generated mocking constructor
+                // so it is not a duplicate. An accessible parameterless constructor on any generated partial
+                // or in custom code counts as already present. A struct always exposes a public parameterless
+                // constructor via its serialization partial, so there is nothing to restore on the model partial.
+                if (previousParameters.Count == 0)
+                {
+                    if (Type.IsStruct)
+                    {
+                        continue;
+                    }
+
+                    var hasAccessibleParameterlessSerializationConstructor = SerializationProviders
+                        .SelectMany(p => p.Constructors)
+                        .Any(c => c.Signature.Parameters.Count == 0 && MethodSignatureHelper.IsPublicApi(c.Signature.Modifiers));
+
+                    if (!constructors.Any(c => c.Signature.Parameters.Count == 0 && MethodSignatureHelper.IsPublicApi(c.Signature.Modifiers))
+                        && !candidateConstructors.Any(c => c.Signature.Parameters.Count == 0 && MethodSignatureHelper.IsPublicApi(c.Signature.Modifiers))
+                        && !hasAccessibleParameterlessSerializationConstructor)
+                    {
+                        var parameterlessConstructor = BuildBackCompatParameterlessConstructor(previousConstructor, candidateConstructors);
+                        RemoveGeneratedMockingConstructor(constructors);
+                        constructors.Add(parameterlessConstructor);
+                        CodeModelGenerator.Instance.Emitter.Info(
+                            $"Restored parameterless constructor '{Name}()' to match last contract.",
+                            BackCompatibilityChangeCategory.ConstructorAddedFromLastContract);
+                    }
+
+                    continue;
+                }
+
+                // If a constructor with the same parameters already exists - either still generated or
+                // supplied by custom code - there is nothing to restore.
+                if (constructors.Any(c => BackCompatHelper.ParametersMatch(c.Signature.Parameters, previousParameters))
+                    || candidateConstructors.Any(c => BackCompatHelper.ParametersMatch(c.Signature.Parameters, previousParameters)))
+                {
+                    continue;
+                }
+
+                if (TryBuildRestoredConstructor(previousConstructor, candidateConstructors, restorablePropertyLookup, out var restoredConstructor))
+                {
+                    constructors.Add(restoredConstructor);
+                    CodeModelGenerator.Instance.Emitter.Info(
+                        $"Restored constructor '{Name}({string.Join(", ", previousParameters.Select(p => p.Type.Name))})' to match last contract.",
+                        BackCompatibilityChangeCategory.ConstructorAddedFromLastContract);
+                }
+                else
+                {
+                    CodeModelGenerator.Instance.Emitter.Info(
+                        $"Could not restore constructor '{Name}({string.Join(", ", previousParameters.Select(p => p.Type.Name))})' from the last contract; a property name or type has changed.",
+                        BackCompatibilityChangeCategory.ConstructorAddedFromLastContractSkipped);
+                }
+            }
+
+            return constructors;
+        }
+
+        private void RestorePreviousConstructorParameterNames(
+            IReadOnlyList<ConstructorProvider> currentConstructors,
+            IReadOnlyList<ConstructorProvider> candidateConstructors,
+            IReadOnlyList<ConstructorProvider> previousConstructors)
+        {
+            const MethodSignatureModifiers privateProtected = MethodSignatureModifiers.Private | MethodSignatureModifiers.Protected;
+            foreach (var previousConstructor in previousConstructors)
+            {
+                if (!MethodSignatureHelper.IsPublicApi(previousConstructor.Signature))
+                {
+                    continue;
+                }
+
+                var previousParameters = previousConstructor.Signature.Parameters;
+
+                // A generated or custom constructor that already matches the previous signature (types and
+                // names) satisfies the contract; renaming another constructor into it would collide.
+                if (candidateConstructors.Any(c => BackCompatHelper.ParametersMatch(c.Signature.Parameters, previousParameters)))
+                {
+                    continue;
+                }
+
+                var currentConstructor = currentConstructors.FirstOrDefault(c =>
+                    (MethodSignatureHelper.IsPublicApi(c.Signature.Modifiers)
+                        || (c.Signature.Modifiers & privateProtected) == privateProtected)
+                    && MethodSignatureBase.SignatureComparer.Equals(c.Signature, previousConstructor.Signature));
+                if (currentConstructor is null)
+                {
+                    continue;
+                }
+
+                var currentParameters = currentConstructor.Signature.Parameters;
+
+                // A swap or rotation keeps every previous name, so realign the existing parameter objects
+                // to the previous order - renaming positionally would mis-bind a caller's named argument to
+                // the wrong property. Otherwise restore names positionally where the types line up.
+                var currentByName = currentParameters.ToDictionary(p => p.Name);
+                IReadOnlyList<ParameterProvider> restoredParameters = previousParameters.All(p => currentByName.ContainsKey(p.Name))
+                    ? [.. previousParameters.Select(p => currentByName[p.Name])]
+                    : currentParameters;
+                if (!restoredParameters.Select((p, i) => p.Type.AreNamesEqual(previousParameters[i].Type)).All(match => match))
+                {
+                    continue;
+                }
+
+                // A permutation replaces every name, so a clash there is transient. Exact names are
+                // retained, so restoring another parameter onto one would produce a real duplicate.
+                var retainedExactNames = restoredParameters
+                    .Where(p => p.IsExactName)
+                    .Select(p => p.Name)
+                    .ToHashSet(StringComparer.Ordinal);
+                for (int i = 0; i < restoredParameters.Count; i++)
+                {
+                    var restoredName = previousParameters[i].Name;
+                    if (string.Equals(restoredParameters[i].Name, restoredName, StringComparison.Ordinal)
+                        || restoredParameters[i].IsExactName)
+                    {
+                        continue;
+                    }
+
+                    if (retainedExactNames.Contains(restoredName))
+                    {
+                        CodeModelGenerator.Instance.Emitter.Info(
+                            $"Could not preserve parameter name '{restoredName}' at position {i} on constructor '{Name}' from the last contract; it collides with the exact name of another parameter.",
+                            BackCompatibilityChangeCategory.ParameterNamePreserved);
+                        continue;
+                    }
+
+                    CodeModelGenerator.Instance.Emitter.Debug(
+                        $"Preserved parameter name '{restoredName}' at position {i} on constructor '{Name}' from last contract (instead of '{restoredParameters[i].Name}').",
+                        BackCompatibilityChangeCategory.ParameterNamePreserved);
+                    restoredParameters[i].Update(name: restoredName);
+                }
+
+                currentConstructor.Signature.Update(parameters: [.. restoredParameters]);
+                currentConstructor.Update(signature: currentConstructor.Signature);
+            }
+        }
+
+        private bool TryBuildRestoredConstructor(
+            ConstructorProvider previousConstructor,
+            IReadOnlyList<ConstructorProvider> currentConstructors,
+            Dictionary<string, PropertyProvider> restorablePropertyLookup,
+            [NotNullWhen(true)] out ConstructorProvider? restoredConstructor)
+        {
+            restoredConstructor = null;
+            var previousParameters = previousConstructor.Signature.Parameters;
+
+            // Find the public constructor to chain to: its parameters must form an in-order subsequence of
+            // the previous constructor's parameters. Prefer the closest one. Without a chaining target the
+            // constructor is not restored - a standalone constructor would bypass the current constructor's
+            // initialization (e.g. the implicit base() call and inherited get-only properties).
+            ConstructorProvider? targetConstructor = null;
+            foreach (var candidate in currentConstructors)
+            {
+                if (!MethodSignatureHelper.IsPublicApi(candidate.Signature.Modifiers)
+                    || candidate.Signature.Parameters.Count >= previousParameters.Count)
+                {
+                    continue;
+                }
+
+                // Check whether this candidate would improve on the current target before performing the
+                // more expensive subsequence lookup.
+                if ((targetConstructor == null
+                        || candidate.Signature.Parameters.Count > targetConstructor.Signature.Parameters.Count)
+                    && IsParameterSubsequence(candidate.Signature.Parameters, previousParameters))
+                {
+                    targetConstructor = candidate;
+                }
+            }
+
+            if (targetConstructor is null)
+            {
+                return false;
+            }
+
+            var targetParameters = targetConstructor.Signature.Parameters;
+            var restoredParameters = new List<ParameterProvider>(previousParameters.Count);
+            var initializerArguments = new List<ParameterProvider>(targetParameters.Count);
+            var extraAssignments = new List<(PropertyProvider Property, ParameterProvider Parameter)>();
+            int targetIndex = 0;
+
+            foreach (var previousParameter in previousParameters)
+            {
+                if (targetIndex < targetParameters.Count
+                    && targetParameters[targetIndex].Equals(previousParameter)
+                    && ModelBaseMemberCompatibility.AreClrTypesEqual(targetParameters[targetIndex].Type, previousParameter.Type))
+                {
+                    var keptParameter = PartialMethodCustomization.CloneParameterWithName(
+                        targetParameters[targetIndex],
+                        previousParameter.Name,
+                        removeDefault: false,
+                        validation: ParameterValidationType.None);
+                    restoredParameters.Add(keptParameter);
+                    initializerArguments.Add(keptParameter);
+                    targetIndex++;
+                    continue;
+                }
+
+                // Each extra parameter (not consumed by the chain target) must map to a settable, wire-backed
+                // property assigned in the restored constructor's body.
+                var property = restorablePropertyLookup.TryGetValue(previousParameter.Name, out var chained)
+                    && ModelBaseMemberCompatibility.AreClrTypesEqual(
+                        chained.Type.WithNullable(false), previousParameter.Type.WithNullable(false))
+                    ? chained
+                    : null;
+
+                if (property is null || extraAssignments.Any(a => a.Property == property))
+                {
+                    return false;
+                }
+
+                var restoredParameter = new ParameterProvider(
+                    previousParameter.Name,
+                    property.AsParameter.Description,
+                    property.AsParameter.Type.WithNullable(previousParameter.Type.IsNullable),
+                    property: property,
+                    validation: previousParameter.DefaultValue is null
+                        && previousParameter.Type is { IsValueType: false, IsNullable: false }
+                        ? ParameterValidationType.AssertNotNull
+                        : ParameterValidationType.None);
+                restoredParameters.Add(restoredParameter);
+                extraAssignments.Add((property, restoredParameter));
+            }
+
+            if (targetIndex != targetParameters.Count || extraAssignments.Count == 0)
+            {
+                return false;
+            }
+
+            var bodyStatements = new List<MethodBodyStatement>(extraAssignments.Count);
+            foreach (var (property, parameter) in extraAssignments)
+            {
+                if (property.EnclosingType is SystemObjectModelProvider mappedModel &&
+                    !mappedModel.CanAssignProperty(property, parameter.Type))
+                {
+                    return false;
+                }
+
+                ValueExpression assignee = property;
+                var assignmentType = property.Type;
+                if (property.BackingField is { } backingField &&
+                    (property.EnclosingType == this || property.EnclosingType == CustomCodeView))
+                {
+                    assignee = backingField;
+                    assignmentType = backingField.Type;
+                }
+                if (parameter.Type is { IsValueType: true, IsNullable: true } && !assignmentType.IsNullable ||
+                    parameter.Type.IsArray && !ModelBaseMemberCompatibility.AreClrTypesEqual(parameter.Type, assignmentType) ||
+                    parameter.Type.Arguments.Count != assignmentType.Arguments.Count ||
+                    !parameter.Type.Arguments.Zip(assignmentType.Arguments).All(pair =>
+                        ModelBaseMemberCompatibility.AreClrTypesEqual(pair.First, pair.Second)))
+                {
+                    return false;
+                }
+
+                ValueExpression value = parameter;
+                if (CSharpType.RequiresToList(parameter.Type, property.Type))
+                {
+                    value = parameter.Type.IsNullable ? value.NullConditional().ToList() : value.ToList();
+                }
+
+                bodyStatements.Add(assignee.Assign(value).Terminate());
+            }
+
+            var signature = new ConstructorSignature(
+                Type,
+                $"Initializes a new instance of {Type:C}",
+                previousConstructor.Signature.Modifiers,
+                restoredParameters,
+                initializer: new ConstructorInitializer(false, initializerArguments));
+
+            restoredConstructor = new ConstructorProvider(signature, bodyStatements, this);
+            return true;
+        }
+
+        private ConstructorProvider BuildBackCompatParameterlessConstructor(
+            ConstructorProvider previousConstructor,
+            IReadOnlyList<ConstructorProvider> currentConstructors)
+        {
+            // Prefer the public or protected constructor with the fewest required parameters, then a
+            // private-protected one; a null target yields a standalone constructor.
+            const MethodSignatureModifiers privateProtected = MethodSignatureModifiers.Private | MethodSignatureModifiers.Protected;
+            var target = currentConstructors
+                .Where(c => c.Signature.Parameters.Count > 0
+                    && (MethodSignatureHelper.IsPublicApi(c.Signature.Modifiers) || (c.Signature.Modifiers & privateProtected) == privateProtected))
+                .MinBy(c => (MethodSignatureHelper.IsPublicApi(c.Signature.Modifiers) ? 0 : 1, c.Signature.Parameters.Count(p => p.DefaultValue is null)));
+
+            ConstructorInitializer? initializer = target is null
+                ? null
+                : new ConstructorInitializer(false, [.. target.Signature.Parameters.Select(_ => Snippet.Default)]);
+
+            var signature = new ConstructorSignature(
+                Type,
+                $"Initializes a new instance of {Type:C}",
+                previousConstructor.Signature.Modifiers,
+                parameters: [],
+                initializer: initializer);
+
+            return new ConstructorProvider(signature, MethodBodyStatement.Empty, this);
+        }
+
+        private void RemoveGeneratedMockingConstructor(List<ConstructorProvider> constructors)
+        {
+            constructors.RemoveAll(c => c.Signature.Parameters.Count == 0);
+
+            foreach (var serializationProvider in SerializationProviders)
+            {
+                var serializationConstructors = serializationProvider.Constructors;
+                if (serializationConstructors.Any(c => c.Signature.Parameters.Count == 0))
+                {
+                    serializationProvider.Update(
+                        constructors: [.. serializationConstructors.Where(c => c.Signature.Parameters.Count != 0)]);
+                }
+            }
+        }
+
+        private static bool IsParameterSubsequence(
+            IReadOnlyList<ParameterProvider> subset,
+            IReadOnlyList<ParameterProvider> full)
+        {
+            if (subset.Count > full.Count)
+            {
+                return false;
+            }
+
+            int matched = 0;
+            foreach (var parameter in full)
+            {
+                if (matched == subset.Count)
+                {
+                    break;
+                }
+
+                if (subset[matched].Equals(parameter) &&
+                    ModelBaseMemberCompatibility.AreClrTypesEqual(subset[matched].Type, parameter.Type))
+                {
+                    matched++;
+                }
+            }
+
+            return matched == subset.Count;
+        }
+
+        private Dictionary<string, PropertyProvider> BuildRestorablePropertyLookup()
+        {
+            var lookup = new Dictionary<string, PropertyProvider>();
+            var memberNames = new HashSet<string>();
+            foreach (var model in new[] { this }.Concat(EnumerateBaseModelProviders()))
+            {
+                foreach (var property in model.CanonicalView.Properties)
+                {
+                    if (!memberNames.Add(property.Name)
+                        || !MethodSignatureHelper.IsPublicApi(property.Modifiers) || !property.Body.HasSetter || property.WireInfo == null)
+                    {
+                        continue;
+                    }
+
+                    var setterModifiers = property.Body switch
+                    {
+                        AutoPropertyBody body => body.SetterModifiers,
+                        MethodPropertyBody body => body.SetterModifiers,
+                        _ => MethodSignatureModifiers.None,
+                    };
+                    if (model != this && setterModifiers == MethodSignatureModifiers.Private)
+                    {
+                        continue;
+                    }
+
+                    lookup.TryAdd(property.AsParameter.Name, property);
+
+                    if (property.OriginalName != null)
+                    {
+                        lookup.TryAdd(property.OriginalName.ToVariableName(), property);
+                    }
+                }
+
+                memberNames.UnionWith(model.CanonicalView.Fields.Select(field => field.Name));
+                if (model.CustomCodeView is NamedTypeSymbolProvider customCode)
+                {
+                    memberNames.UnionWith(customCode.DeclaredMemberNames);
+                }
+            }
+
+            return lookup;
+        }
+
+        /// <summary>
+        /// Determines if this model should have a dual constructor pattern.
+        /// This is needed when the model shares the same discriminator property name as its base model
+        /// AND has derived models, indicating it's an intermediate type in a discriminated union hierarchy.
+        /// </summary>
+        private bool ComputeIsMultiLevelDiscriminator()
+        {
+            // Only applies to non-abstract models with a base model
+            if (DeclarationModifiers.HasFlag(TypeSignatureModifiers.Abstract) || _inputModel.BaseModel == null)
+            {
+                return false;
+            }
+            // Must have derived models to be considered an intermediate type
+            if (_inputModel.DerivedModels.Count == 0)
+            {
+                return false;
+            }
+
+            // Check if this model has a discriminator property in the input
+            if (_inputModel.DiscriminatorProperty == null)
+            {
+                return false;
+            }
+
+            // Check if base model has a discriminator property with the same name
+            if (_inputModel.BaseModel.DiscriminatorProperty == null)
+            {
+                return false;
+            }
+
+            // If both models have discriminator properties with the same name,
+            // and this model has derived models, it needs the dual constructor pattern
+            return _inputModel.DiscriminatorProperty.Name ==
+                _inputModel.BaseModel.DiscriminatorProperty.Name;
+        }
+
+        /// <summary>
+        /// Builds a private protected constructor for multi-level discriminator inheritance.
+        /// This allows derived models to call this constructor with their discriminator value.
+        /// </summary>
+        private ConstructorProvider BuildProtectedInheritanceConstructor()
+        {
+            var (parameters, initializer) = BuildConstructorParameters(true, includeDiscriminatorParameter: true);
+
+            return new ConstructorProvider(
+                signature: new ConstructorSignature(
+                    Type,
+                    $"Initializes a new instance of {Type:C}",
+                    MethodSignatureModifiers.Private | MethodSignatureModifiers.Protected,
+                    parameters,
+                    initializer: initializer),
+                bodyStatements: new MethodBodyStatement[]
+                {
+                    GetPropertyInitializers(true, parameters: parameters)
+                },
+                this);
+        }
+
+        /// <summary>
+        /// Builds the internal constructor for the model which contains all public properties
+        /// as parameters.
+        /// </summary>
+        private protected virtual ConstructorProvider BuildFullConstructor()
+        {
+            var (ctorParameters, ctorInitializer) = BuildConstructorParameters(false);
+            return new ConstructorProvider(
+                signature: new ConstructorSignature(
+                    Type,
+                    $"Initializes a new instance of {Type:C}",
+                    MethodSignatureModifiers.Internal,
+                    ctorParameters,
+                    initializer: ctorInitializer),
+                bodyStatements: new MethodBodyStatement[]
+                {
+                    GetPropertyInitializers(false)
+                },
+                this);
+        }
+
+        private bool NeedsNonValidatingInheritanceConstructor
+        {
+            get
+            {
+                if (_needsNonValidatingInheritanceConstructor is { } needsConstructor)
+                {
+                    return needsConstructor;
+                }
+                if (!ShouldUseFullConstructorInDerivedTypes || IsExternal || HasBaseModelProviderCycle())
+                {
+                    _needsNonValidatingInheritanceConstructor = false;
+                    return false;
+                }
+                var parameters = BuildConstructorParameters(true).Parameters;
+                var hasRelaxedOverride = InputDerivedProperties.Values.Any(properties => properties.Values.Any(property =>
+                    property.IsRequiredInConstructor == false
+                    && parameters.Any(p => p.Property?.InputProperty is InputModelProperty inputProperty
+                        && inputProperty.OriginalName == property.OriginalName)));
+                return (_needsNonValidatingInheritanceConstructor = hasRelaxedOverride
+                    && (parameters.SequenceEqual(FullConstructor.Signature.Parameters)
+                        || BaseModelProvider?.NeedsNonValidatingInheritanceConstructor == true)).Value;
+            }
+        }
+
+        private ConstructorProvider NonValidatingInheritanceConstructor =>
+            _nonValidatingInheritanceConstructor ??= BuildNonValidatingInheritanceConstructor();
+
+        private ConstructorProvider BuildNonValidatingInheritanceConstructor()
+        {
+            var fullConstructor = FullConstructor;
+            var markerName = "skipValidation";
+            while (fullConstructor.Signature.Parameters.Any(p => p.Name == markerName))
+            {
+                markerName += "Core";
+            }
+            var marker = new ParameterProvider(markerName,
+                $"Distinguishes this non-validating constructor from the initialization constructor.", typeof(bool));
+            return new ConstructorProvider(
+                new ConstructorSignature(Type, fullConstructor.Signature.Description,
+                    MethodSignatureModifiers.Private | MethodSignatureModifiers.Protected,
+                    [.. fullConstructor.Signature.Parameters, marker], initializer: fullConstructor.Signature.Initializer),
+                fullConstructor.BodyStatements ?? MethodBodyStatement.Empty,
+                this,
+                suppressions: fullConstructor.Suppressions);
+        }
+
+        private IEnumerable<PropertyProvider> GetAllBasePropertiesForConstructorInitialization(bool includeAllHierarchyDiscriminator = false)
+        {
+            var properties = new Stack<List<PropertyProvider>>();
+            var inheritedNames = new HashSet<string>();
+            bool isDirectBase = true;
+            foreach (var modelProvider in EnumerateBaseModelProviders())
+            {
+                properties.Push([]);
+                foreach (var property in modelProvider.CanonicalView.Properties)
+                {
+                    if (!property.IsDiscriminator && property.InputProperty is InputModelProperty inputProperty
+                        && inputProperty.EnclosingType?.External is null
+                        && !inheritedNames.Add(inputProperty.OriginalName))
+                    {
+                        continue;
+                    }
+                    if (property.IsDiscriminator)
+                    {
+                        // In the case of nested discriminators, include discriminator property based on the parameter
+                        if (isDirectBase || includeAllHierarchyDiscriminator)
+                        {
+                            properties.Peek().Add(property);
+                        }
+                    }
+                    else
+                    {
+                        properties.Peek().Add(property);
+                    }
+                }
+
+                isDirectBase = false;
+            }
+
+            // parameters need to be ordered from the base-most class to the derived class
+            var result = new List<PropertyProvider>();
+            var externalSlots = new Dictionary<InputProperty, int>();
+            foreach (var property in properties.SelectMany(l => l))
+            {
+                if (property.InputProperty is { EnclosingType: InputModelType { External: not null } } inputProperty)
+                {
+                    if (externalSlots.TryGetValue(inputProperty, out var index))
+                    {
+                        // Keep the original slot order and name, but use the nearest replacement's metadata.
+                        property.AsParameter.Update(name: result[index].AsParameter.Name);
+                        result[index] = property;
+                        continue;
+                    }
+                    externalSlots.Add(inputProperty, result.Count);
+                }
+                result.Add(property);
+            }
+            return result;
+        }
+
+        private IEnumerable<FieldProvider> GetAllBaseFieldsForConstructorInitialization()
+        {
+            var fields = new Stack<List<FieldProvider>>();
+            foreach (var modelProvider in EnumerateBaseModelProviders())
+            {
+                fields.Push([]);
+                foreach (var field in modelProvider.CanonicalView.Fields)
+                {
+                    fields.Peek().Add(field);
+                }
+            }
+
+            return fields.SelectMany(l => l);
+        }
+
+        private (IReadOnlyList<ParameterProvider> Parameters, ConstructorInitializer? Initializer) BuildConstructorParameters(
+            bool isInitializationConstructor, bool includeDiscriminatorParameter = false)
+        {
+            var baseParameters = new List<ParameterProvider>();
+            var constructorParameters = new List<ParameterProvider>();
+            IEnumerable<PropertyProvider> baseProperties = [];
+            IEnumerable<FieldProvider> baseFields = [];
+
+            if (isInitializationConstructor)
+            {
+                baseProperties = GetAllBasePropertiesForConstructorInitialization(includeDiscriminatorParameter);
+                baseFields = GetAllBaseFieldsForConstructorInitialization();
+            }
+            else if (BaseModelProvider is not null && BaseModelProvider.ShouldUseFullConstructorInDerivedTypes && !HasBaseModelProviderCycle())
+            {
+                baseParameters.AddRange(BaseModelProvider.FullConstructor.Signature.Parameters);
+            }
+
+            HashSet<PropertyProvider> overriddenProperties = CanonicalView.Properties.Where(p => p.BaseProperty is not null).Select(p => p.BaseProperty!).ToHashSet();
+
+            // add the base parameters, if any
+            foreach (var property in baseProperties)
+            {
+                AddInitializationParameterForCtor(baseParameters, Type.IsStruct, isInitializationConstructor, property);
+            }
+
+            // add the base fields, if any
+            foreach (var field in baseFields)
+            {
+                AddInitializationParameterForCtor(baseParameters, Type.IsStruct, isInitializationConstructor, field: field);
+            }
+
+            // Build constructor parameters first so we can use them for initializer
+            var externalReplacements = ExternalPropertyReplacements.ToArray();
+            foreach (var replacement in externalReplacements)
+            {
+                var index = baseParameters.FindIndex(parameter =>
+                    parameter.Property?.InputProperty == replacement.InputProperty);
+                if (index >= 0)
+                {
+                    // Keep the inherited constructor slot without mutating the shared external provider.
+                    replacement.AsParameter.Update(name: baseParameters[index].Name);
+                    baseParameters[index] = isInitializationConstructor
+                        ? replacement.AsParameter.ToPublicInputParameter()
+                        : replacement.AsParameter;
+                }
+            }
+
+            foreach (var property in CanonicalView.Properties)
+            {
+                if (externalReplacements.Contains(property) && baseParameters.Any(parameter => parameter.Property == property))
+                {
+                    continue;
+                }
+                AddInitializationParameterForCtor(constructorParameters, Type.IsStruct, isInitializationConstructor, property);
+            }
+
+            foreach (var field in CanonicalView.Fields)
+            {
+                AddInitializationParameterForCtor(constructorParameters, Type.IsStruct, isInitializationConstructor, field: field);
+            }
+
+            constructorParameters.InsertRange(0, _inputModel.IsUnknownDiscriminatorModel
+                ? baseParameters
+                : baseParameters.Where(p =>
+                    p.Property is null
+                    || (!overriddenProperties.Contains(p.Property!) && (!p.Property.IsDiscriminator || !isInitializationConstructor || includeDiscriminatorParameter))));
+
+            // construct the initializer using the parameters from base signature
+            ConstructorInitializer? constructorInitializer = null;
+            if (BaseModelProvider != null)
+            {
+                var requiresFullBaseConstructor = isInitializationConstructor
+                    && BaseModelProvider.ShouldUseFullConstructorInDerivedTypes
+                    && (baseParameters.Any(p => p.Property is not null
+                        && overriddenProperties.Contains(p.Property)
+                        && !constructorParameters.Any(available => available.Property?.BaseProperty == p.Property))
+                        || CanonicalView.Properties.Any(p => p.BaseProperty is { WireInfo.IsReadOnly: true } baseProperty
+                            && p.Name != baseProperty.Name && p.WireInfo is { IsRequiredInConstructor: true }));
+                // Check if we should call multi-level discriminator constructor
+                if (requiresFullBaseConstructor)
+                {
+                    // The public base constructor cannot initialize this overridden storage.
+                    var arguments = BaseModelProvider.FullConstructor.Signature.Parameters.Select(p =>
+                        GetExpressionForCtor(p, overriddenProperties, true, constructorParameters, useFullBaseConstructor: true));
+                    constructorInitializer = new ConstructorInitializer(true,
+                        BaseModelProvider.NeedsNonValidatingInheritanceConstructor
+                            ? [.. arguments, True]
+                            : [.. arguments]);
+                }
+                else if (isInitializationConstructor && (IsMultiLevelDiscriminator || BaseModelProvider.IsMultiLevelDiscriminator))
+                {
+                    var baseDiscriminatorParam = baseParameters.FirstOrDefault(p => p.Property?.IsDiscriminator == true);
+
+                    ValueExpression discriminatorExpression = (baseDiscriminatorParam is not null && includeDiscriminatorParameter)
+                        ? constructorParameters.FirstOrDefault(p => p.Property?.IsDiscriminator == true) ?? baseDiscriminatorParam
+                        : DiscriminatorLiteral;
+
+                    var args = baseParameters.Where(p => p.Property?.IsDiscriminator != true)
+                        .Select(p => GetExpressionForCtor(p, overriddenProperties, isInitializationConstructor, constructorParameters));
+
+                    constructorInitializer = new ConstructorInitializer(true, [discriminatorExpression, .. args]);
+                }
+                else if (baseParameters.Count > 0)
+                {
+                    // Standard base constructor call
+                    var arguments = baseParameters.Select(p => GetExpressionForCtor(p, overriddenProperties, isInitializationConstructor, constructorParameters));
+                    constructorInitializer = new ConstructorInitializer(true,
+                        !isInitializationConstructor && BaseModelProvider.NeedsNonValidatingInheritanceConstructor
+                            ? [.. arguments, True]
+                            : [.. arguments]);
+                }
+                else
+                {
+                    // Even when no base parameters, we still need a base constructor call if there's a base model
+                    constructorInitializer = new ConstructorInitializer(true, Array.Empty<ValueExpression>());
+                }
+            }
+
+            if (!isInitializationConstructor)
+            {
+                foreach (var property in AdditionalPropertyProperties)
+                {
+                    constructorParameters.Add(property.AsParameter);
+                }
+
+                // only add the raw data field if it has not already been added as a parameter for BinaryData additional properties
+                if (RawDataField != null && !SupportsBinaryDataAdditionalProperties)
+                {
+                    constructorParameters.Add(RawDataField.AsParameter);
+                }
+            }
+
+            return (constructorParameters, constructorInitializer);
+        }
+
+        private bool HasBaseModelProviderCycle()
+        {
+            // FullConstructor reads the base constructor signature. If the custom base chain loops back
+            // to this model, skip that read rather than recursively building this constructor again.
+            HashSet<ModelProvider> visited = [this];
+            var modelProvider = BaseModelProvider;
+            while (modelProvider != null)
+            {
+                if (!visited.Add(modelProvider))
+                {
+                    return true;
+                }
+
+                modelProvider = modelProvider.BaseModelProvider;
+            }
+
+            return false;
+        }
+
+        private ValueExpression? EnsureDiscriminatorValueExpression()
+        {
+            if (_inputModel.BaseModel is not null && _inputModel.DiscriminatorValue is not null)
+            {
+                var discriminator = BaseModelProvider?.CanonicalView.Properties.Where(p => p.IsDiscriminator).FirstOrDefault();
+                if (discriminator != null)
+                {
+                    var type = discriminator.Type;
+                    if (IsUnknownDiscriminatorModel)
+                    {
+                        return GetUnknownDiscriminatorExpression(discriminator);
+                    }
+
+                    if (type is { IsFrameworkType: false, IsEnum: true })
+                    {
+                        if (_inputModel.BaseModel.DiscriminatorProperty?.Type is InputEnumType inputEnumType)
+                        {
+                            var discriminatorProvider = CodeModelGenerator.Instance.TypeFactory.CreateEnum(enumType: inputEnumType);
+
+                            var enumMember = discriminatorProvider!.EnumValues.FirstOrDefault(e => e.Value.ToString() == _inputModel.DiscriminatorValue)
+                                             ?? throw new InvalidOperationException($"invalid discriminator value {_inputModel.DiscriminatorValue}");
+                            var enumMemberName = enumMember.Name;
+
+                            // Check to see if the enum member for this discriminator value has been customized
+                            var customEnumProperty = discriminatorProvider.CustomCodeView?.Properties
+                                .FirstOrDefault(f => f.OriginalName?.Equals(enumMemberName, StringComparison.OrdinalIgnoreCase) == true);
+                            if (customEnumProperty != null)
+                            {
+                                enumMemberName = customEnumProperty.Name;
+                            }
+                            /* {KindType}.{enumMember} */
+                            return Static(type).Property(enumMemberName);
+                        }
+
+                        // Handle custom fixed enum discriminator
+                        if (discriminator.CustomProvider?.Value?.IsEnum == true)
+                        {
+                            var enumMember = discriminator.CustomProvider.Value.Fields
+                                .FirstOrDefault(f => f.Name.Equals(_inputModel.DiscriminatorValue, StringComparison.OrdinalIgnoreCase));
+                            if (enumMember != null)
+                            {
+                                return Static(type).Property(enumMember.Name);
+                            }
+                        }
+                    }
+
+                    // fallback to the default value
+                    return DiscriminatorLiteral;
+                }
+            }
+            return null;
+        }
+
+        private ValueExpression GetExpressionForCtor(
+            ParameterProvider parameter,
+            HashSet<PropertyProvider> overriddenProperties,
+            bool isPrimaryConstructor,
+            IReadOnlyList<ParameterProvider>? availableParameters = null,
+            bool useFullBaseConstructor = false)
+        {
+            if (parameter.Property is not null && parameter.Property.IsDiscriminator && _inputModel.DiscriminatorValue != null)
+            {
+                if (isPrimaryConstructor)
+                {
+                    return DiscriminatorValueExpression ?? throw new InvalidOperationException($"invalid discriminator {_inputModel.DiscriminatorValue} for property {parameter.Property.Name}");
+                }
+                else if (IsUnknownDiscriminatorModel)
+                {
+                    return GetUnknownDiscriminatorExpression(parameter.Property) ?? throw new InvalidOperationException($"invalid discriminator {_inputModel.DiscriminatorValue} for property {parameter.Property.Name}");
+                }
+                else
+                {
+                    return parameter;
+                }
+            }
+
+            var paramToUse = parameter.Property is not null && overriddenProperties.Contains(parameter.Property)
+                ? Properties.First(p => p.BaseProperty == parameter.Property).AsParameter
+                : parameter;
+            if (useFullBaseConstructor && availableParameters?.Any(p => p.Name == paramToUse.Name) != true)
+            {
+                if (paramToUse.Property is { WireInfo.IsRequired: true, Type: { IsLiteral: true, IsNullable: false } } property)
+                {
+                    return Literal(property.Type.Literal);
+                }
+                return parameter.Property is not null && parameter.Type.IsCollection
+                    ? New.Instance(parameter.Type.PropertyInitializationType)
+                    : Default;
+            }
+            if (availableParameters is not null && paramToUse.Property is not null)
+            {
+                paramToUse = availableParameters.FirstOrDefault(p => p.Property == paramToUse.Property)
+                    ?? availableParameters.FirstOrDefault(p => p.Property?.Name == paramToUse.Property.Name)
+                    ?? paramToUse;
+            }
+
+            ValueExpression expression = paramToUse.Property is not null ? GetConversion(paramToUse.Property, sourceParameter: paramToUse) : paramToUse;
+            if (useFullBaseConstructor && CSharpType.RequiresToList(paramToUse.Type, parameter.Type))
+            {
+                expression = paramToUse.Type.IsNullable ? expression.NullConditional().ToList() : expression.ToList();
+            }
+            return expression;
+        }
+
+        private ValueExpression? GetUnknownDiscriminatorExpression(PropertyProvider property)
+        {
+            if (!property.IsDiscriminator || _inputModel.DiscriminatorValue == null)
+            {
+                return null;
+            }
+
+            var discriminatorExpression = property.AsParameter;
+            var type = property.Type;
+
+            if (!type.IsFrameworkType && type.IsEnum)
+            {
+                if (type.IsStruct)
+                {
+                    /* kind != default ? kind : "unknown" */
+                    return new TernaryConditionalExpression(discriminatorExpression.NotEqual(Default), discriminatorExpression, DiscriminatorLiteral);
+                }
+                else
+                {
+                    return discriminatorExpression;
+                }
+            }
+            else
+            {
+                /* kind ?? "unknown" */
+                return discriminatorExpression.NullCoalesce(DiscriminatorLiteral);
+            }
+        }
+
+        private static void AddInitializationParameterForCtor(
+            List<ParameterProvider> parameters,
+            bool isStruct,
+            bool isPrimaryConstructor,
+            PropertyProvider? property = default,
+            FieldProvider? field = default)
+        {
+            var wireInfo = property?.WireInfo ?? field?.WireInfo;
+            var type = property?.Type ?? field?.Type;
+
+            // We only add those properties with wire info indicating they are coming from specs.
+            if (wireInfo == null)
+            {
+                return;
+            }
+
+            var parameter = property?.AsParameter ?? field!.AsParameter;
+            if (isPrimaryConstructor)
+            {
+                if (isStruct || (wireInfo.IsRequiredInConstructor && !type!.IsLiteral))
+                {
+                    if (!wireInfo.IsReadOnly)
+                    {
+                        parameters.Add(parameter.ToPublicInputParameter());
+                    }
+                }
+            }
+            else
+            {
+                // For the serialization constructor, we always add the property as a parameter
+                parameters.Add(parameter);
+            }
+        }
+
+        private MethodBodyStatement GetPropertyInitializers(
+            bool isPrimaryConstructor,
+            IReadOnlyList<ParameterProvider>? parameters = null)
+        {
+            List<MethodBodyStatement> methodBodyStatements = new(CanonicalView.Properties.Count + CanonicalView.Fields.Count + 1);
+            Dictionary<string, ParameterProvider> parameterMap = parameters?.ToDictionary(p => p.Name) ?? [];
+
+            foreach (var property in CanonicalView.Properties)
+            {
+                CreatePropertyAssignmentStatement(isPrimaryConstructor, methodBodyStatements, parameterMap, property);
+            }
+
+            foreach (var field in CanonicalView.Fields)
+            {
+                CreatePropertyAssignmentStatement(isPrimaryConstructor, methodBodyStatements, parameterMap, field: field);
+            }
+
+            // If discriminator is defined as optional in the base model, but we have an expression for it, assign it in the
+            // primary constructor body.
+            if (isPrimaryConstructor && DiscriminatorValueExpression != null)
+            {
+                var baseDiscriminatorProperty = BaseModelProvider?.DiscriminatorProperty;
+                if (baseDiscriminatorProperty is { WireInfo.IsRequired: false })
+                {
+                    methodBodyStatements.Add(ExperimentalApiHelpers.Suppress(
+                        baseDiscriminatorProperty.Assign(DiscriminatorValueExpression).Terminate(),
+                        ExperimentalApiHelpers.GetMemberSuppressions(baseDiscriminatorProperty)));
+                }
+            }
+
+            // handle additional properties
+            foreach (var property in AdditionalPropertyProperties)
+            {
+                var backingField = property.BackingField;
+                if (backingField != null)
+                {
+                    AssignmentExpression assignment = backingField.Assign(property.AsParameter);
+                    if (isPrimaryConstructor)
+                    {
+                        assignment = backingField.Assign(New.Instance(backingField.Type.PropertyInitializationType));
+                    }
+                    else if (property.Type.IsReadOnlyDictionary)
+                    {
+                        assignment = backingField.Assign(New.Instance(backingField.Type.PropertyInitializationType, property.AsParameter));
+                    }
+
+                    methodBodyStatements.Add(ExperimentalApiHelpers.Suppress(assignment.Terminate(),
+                        ExperimentalApiHelpers.GetMemberSuppressions(property)));
+                }
+            }
+
+            if (RawDataField != null)
+            {
+                // initialize the raw data field in the serialization constructor if the model does not explicitly support AP of binary data.
+                if (!isPrimaryConstructor && !SupportsBinaryDataAdditionalProperties)
+                {
+                    methodBodyStatements.Add(RawDataField.Assign(RawDataField.AsParameter).Terminate());
+                }
+            }
+
+            return methodBodyStatements;
+        }
+
+        private void CreatePropertyAssignmentStatement(
+            bool isPrimaryConstructor,
+            List<MethodBodyStatement> methodBodyStatements,
+            Dictionary<string, ParameterProvider> parameterMap,
+            PropertyProvider? property = default,
+            FieldProvider? field = default)
+        {
+            var wireInfo = property?.WireInfo ?? field?.WireInfo;
+            // skip those non-spec properties
+            if (wireInfo == null)
+            {
+                return;
+            }
+
+            // skip if this is an overload / new of a base property
+            // also skip if the base constructor initializes it or the derived property is not required
+            if (property?.BaseProperty is not null
+                && (!isPrimaryConstructor || wireInfo.IsRequiredInConstructor == false
+                    || property.BaseProperty.WireInfo is { IsRequiredInConstructor: true, IsReadOnly: false }
+                    || property.Name != property.BaseProperty.Name && property.BaseProperty.WireInfo is { IsReadOnly: true }
+                        && property.Body is ExpressionPropertyBody))
+            {
+                return;
+            }
+
+            ValueExpression assignee = property != null
+                ? property.BackingField is null ? property : property.BackingField
+                : field!;
+
+            if (!isPrimaryConstructor)
+            {
+                // always add the property for the serialization constructor
+                methodBodyStatements.Add(ExperimentalApiHelpers.Suppress(assignee.Assign(GetConversion(property, field)).Terminate(),
+                    property is not null ? ExperimentalApiHelpers.GetMemberSuppressions(property) : ExperimentalApiHelpers.GetMemberSuppressions(field!)));
+                return;
+            }
+
+            ValueExpression? initializationValue = null;
+
+            var type = property?.Type ?? field!.Type;
+
+            if (parameterMap.TryGetValue(property?.AsParameter.Name ?? field!.AsParameter.Name, out var parameter) || Type.IsStruct)
+            {
+                if (parameter != null)
+                {
+                    initializationValue = parameter;
+
+                    if (CSharpType.RequiresToList(parameter.Type, type)
+                        && property?.BackingField?.Type.Equals(type.PropertyInitializationType, ignoreNullable: true) != true)
+                    {
+                        initializationValue = parameter.Type.IsNullable ?
+                            initializationValue.NullConditional().ToList() :
+                            initializationValue.ToList();
+                    }
+                }
+            }
+            else if (initializationValue == null && type.IsCollection)
+            {
+                initializationValue = New.Instance(type.PropertyInitializationType);
+            }
+
+            if (initializationValue != null)
+            {
+                if (parameter is not null && property?.BackingField is { } backingField && type!.IsCollection
+                    && backingField.Type.Equals(type.PropertyInitializationType, ignoreNullable: true))
+                {
+                    initializationValue = GetConversion(property, source: initializationValue, sourceParameter: parameter);
+                }
+                methodBodyStatements.Add(ExperimentalApiHelpers.Suppress(assignee.Assign(initializationValue).Terminate(),
+                    property is not null ? ExperimentalApiHelpers.GetMemberSuppressions(property) : ExperimentalApiHelpers.GetMemberSuppressions(field!)));
+            }
+        }
+
+        private static ValueExpression GetConversion(PropertyProvider? property = default, FieldProvider? field = default, ValueExpression? source = default, ParameterProvider? sourceParameter = default)
+        {
+            CSharpType to = property != null
+                ? property.BackingField is null ? property.Type : property.BackingField.Type
+                : field!.Type;
+            CSharpType from = property?.Type ?? field!.Type;
+            sourceParameter ??= property?.AsParameter ?? field!.AsParameter;
+            source ??= sourceParameter;
+
+            if (property?.BackingField is not null && from.IsCollection
+                && to.Equals(from.PropertyInitializationType, ignoreNullable: true))
+            {
+                var requiresMaterialization = CSharpType.RequiresToList(sourceParameter.Type, from);
+                var collection = (requiresMaterialization ? source.ToList() : source).CastTo(from);
+                ValueExpression converted = New.Instance(to.WithNullable(false), collection);
+                if (!requiresMaterialization)
+                {
+                    converted = new AsExpression(collection, to.WithNullable(false)).NullCoalesce(converted);
+                }
+                return new TernaryConditionalExpression(source.Equal(Null), Null, converted);
+            }
+
+            if (from.IsEnum && to.Equals(from.UnderlyingEnumType))
+            {
+                return from.ToSerial(sourceParameter);
+            }
+
+            return source;
+        }
+
+        /// <summary>
+        /// Builds the raw data field for the model to be used for serialization.
+        /// </summary>
+        /// <returns>The constructed <see cref="FieldProvider"/> if the model should generate the field.</returns>
+        protected virtual FieldProvider? BuildRawDataField()
+        {
+            if (!_inputModel.Usage.HasFlag(InputModelTypeUsage.Json)
+                && (_inputModel.Usage.HasFlag(InputModelTypeUsage.Xml)
+                    || _inputModel.Usage.HasFlag(InputModelTypeUsage.MultipartFormData)))
+            {
+                return null;
+            }
+
+            // check if there is a raw data field on any of the base models, if so, we do not have to have one here.
+            foreach (var baseModelProvider in EnumerateBaseModelProviders())
+            {
+                if (baseModelProvider.RawDataField != null)
+                {
+                    return null;
+                }
+            }
+
+            var modifiers = FieldModifiers.Private;
+            if (!DeclarationModifiers.HasFlag(TypeSignatureModifiers.Sealed) && !DeclarationModifiers.HasFlag(TypeSignatureModifiers.Struct))
+            {
+                modifiers |= FieldModifiers.Protected;
+            }
+            modifiers |= FieldModifiers.ReadOnly;
+
+            // Use object type for backward compatibility if needed, otherwise use BinaryData
+            var fieldType = _useObjectAdditionalProperties.Value ? _additionalObjectPropsFieldType : _additionalBinaryDataPropsFieldType;
+
+            var rawDataField = new FieldProvider(
+                modifiers: modifiers,
+                type: fieldType,
+                description: FormattableStringHelpers.FromString(AdditionalBinaryDataPropsFieldDescription),
+                name: AdditionalPropertiesHelper.AdditionalBinaryDataPropsFieldName,
+                enclosingType: this);
+
+            return rawDataField;
+        }
+
+        /// <summary>
+        /// Replaces unverifiable types, types that do not have value kind checks during deserialization of additional properties,
+        /// with the corresponding verifiable types. By default, BinaryData is used as the value type for unknown additional properties.
+        /// </summary>
+        /// <param name="type"></param>
+        /// <returns></returns>
+        private CSharpType ReplaceUnverifiableType(CSharpType type)
+        {
+            return type switch
+            {
+                _ when type.Equals(_additionalPropsUnknownType, ignoreNullable: true) => type,
+                _ when type.IsFrameworkType && AdditionalPropertiesHelper.VerifiableAdditionalPropertyTypes.Contains(type.FrameworkType) => type,
+                _ when type.IsUnion => type,
+                _ when type.IsList => type.MakeGenericType([ReplaceUnverifiableType(type.Arguments[0])]),
+                _ when type.IsDictionary => type.MakeGenericType([ReplaceUnverifiableType(type.Arguments[0]), ReplaceUnverifiableType(type.Arguments[1])]),
+                _ => CSharpType.FromUnion([type], false, UnionItemTypeReferenceKind.MetadataOnly)
+            };
+        }
+
+        /// <summary>
+        /// Determines whether to use object type for AdditionalProperties based on backward compatibility requirements.
+        /// Checks if the last contract (previous version) had an AdditionalProperties property of type IDictionary&lt;string, object&gt;.
+        /// </summary>
+        /// <returns>True if object type should be used for backward compatibility; otherwise false (uses BinaryData).</returns>
+        private bool ShouldUseObjectAdditionalProperties()
+        {
+            if (LastContractView == null || _inputModel.AdditionalProperties == null)
+            {
+                return false;
+            }
+
+            // Check if the property exists in the last contract by name
+            var lastContractProperty = LastContractView.Properties.FirstOrDefault(p =>
+                MethodSignatureHelper.IsPublicApi(p.Modifiers, p.Attributes) &&
+                p.Name == AdditionalPropertiesHelper.DefaultAdditionalPropertiesPropertyName);
+
+            if (lastContractProperty == null)
+            {
+                return false;
+            }
+
+            // Check if it's IDictionary<string, object>
+            var propertyType = lastContractProperty.Type;
+            if (propertyType.IsDictionary && propertyType.Arguments.Count == 2)
+            {
+                var keyType = propertyType.Arguments[0];
+                var valueType = propertyType.Arguments[1];
+
+                // Check if key is string and value is object
+                if (keyType.IsFrameworkType && keyType.FrameworkType == typeof(string) &&
+                    valueType.IsFrameworkType && valueType.FrameworkType == typeof(object))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string BuildAdditionalTypePropertiesFieldName(CSharpType additionalPropertiesValueType)
+        {
+            var name = additionalPropertiesValueType.Name;
+
+            while (additionalPropertiesValueType.IsCollection)
+            {
+                additionalPropertiesValueType = additionalPropertiesValueType.ElementType;
+                name += additionalPropertiesValueType.Name;
+            }
+
+            return $"_additional{name.ToIdentifierName()}Properties";
+        }
+    }
+}

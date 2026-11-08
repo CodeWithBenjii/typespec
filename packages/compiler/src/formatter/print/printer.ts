@@ -1,0 +1,1966 @@
+import type { AstPath, Doc, Printer } from "prettier";
+import { builders } from "prettier/doc";
+import { compilerAssert } from "../../core/diagnostics.js";
+import {
+  printIdentifier as printIdentifierString,
+  splitLines,
+} from "../../core/helpers/syntax-utils.js";
+import type {
+  AliasStatementNode,
+  ArrayExpressionNode,
+  ArrayLiteralNode,
+  AugmentDecoratorStatementNode,
+  BlockComment,
+  BooleanLiteralNode,
+  CallExpressionNode,
+  Comment,
+  ConstStatementNode,
+  DeclarationNode,
+  DecoratorDeclarationStatementNode,
+  DecoratorExpressionNode,
+  DirectiveExpressionNode,
+  DocNode,
+  EnumMemberNode,
+  EnumSpreadMemberNode,
+  EnumStatementNode,
+  FunctionDeclarationStatementNode,
+  FunctionParameterNode,
+  FunctionTypeExpressionNode,
+  IdentifierNode,
+  InterfaceStatementNode,
+  IntersectionExpressionNode,
+  LineComment,
+  MemberExpressionNode,
+  ModelExpressionNode,
+  ModelPropertyNode,
+  ModelSpreadPropertyNode,
+  ModelStatementNode,
+  Node,
+  NumericLiteralNode,
+  ObjectLiteralNode,
+  ObjectLiteralPropertyNode,
+  ObjectLiteralSpreadPropertyNode,
+  OperationSignatureDeclarationNode,
+  OperationSignatureReferenceNode,
+  OperationStatementNode,
+  OptionallyNamedDeclarationNode,
+  ScalarConstructorNode,
+  ScalarStatementNode,
+  Statement,
+  StringLiteralNode,
+  StringTemplateExpressionNode,
+  StringTemplateSpanNode,
+  TemplateArgumentNode,
+  TemplateParameterDeclarationNode,
+  TextRange,
+  TupleExpressionNode,
+  TypeOfExpressionNode,
+  TypeReferenceNode,
+  TypeSpecScriptNode,
+  UnionExpressionNode,
+  UnionStatementNode,
+  UnionVariantNode,
+  UsingStatementNode,
+  ValueOfExpressionNode,
+} from "../../core/types.js";
+import { NodeFlags, SyntaxKind } from "../../core/types.js";
+import type { FlattenedNamespaceStatementNode } from "../types.js";
+import { commentHandler } from "./comment-handler.js";
+import { needsParens } from "./needs-parens.js";
+import type { DecorableNode, PrettierChildPrint, TypeSpecPrettierOptions } from "./types.js";
+import { util } from "./util.js";
+
+const {
+  align,
+  breakParent,
+  conditionalGroup,
+  group,
+  hardline,
+  ifBreak,
+  indent,
+  join,
+  line,
+  softline,
+  literalline,
+  markAsRoot,
+} = builders;
+
+const { isNextLineEmpty } = util as any;
+
+/**
+ * If the decorators for that node should try to be kept inline.
+ */
+const DecoratorsTryInline = {
+  modelProperty: true,
+  enumMember: true,
+  unionVariant: true,
+};
+
+export const typespecPrinter: Printer<Node> = {
+  print: printTypeSpec,
+  isBlockComment: (node: any) => isBlockComment(node),
+  canAttachComment: canAttachComment,
+  printComment: printComment,
+  handleComments: commentHandler,
+};
+
+export function printTypeSpec(
+  // Path to the AST node to print
+  path: AstPath<Node>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  if (isDeclarationExpressionNode(node)) {
+    // Declaration expressions own the layout of their doc comments and decorators so
+    // they can break (and indent) together with the declaration when too wide.
+    return printDeclarationExpression(path, options, print);
+  }
+  const docs = printDocComments(path, options, print);
+  const directives = shouldPrintDirective(node) ? printDirectives(path, options, print) : "";
+  const printedNode = printNode(path, options, print);
+  const value = needsParens(path, options) ? ["(", printedNode, ")"] : printedNode;
+  const parts: Doc[] = [docs, directives, value];
+  if (node.kind === SyntaxKind.TypeSpecScript) {
+    // For TypeSpecScript(root of TypeSpec document) we had a new line at the end.
+    // This must be done here so the hardline entry can be the last item of the doc array returned by the printer
+    // so the markdown(and other embedded formatter) can omit that extra line.
+    parts.push(hardline);
+  }
+  return parts;
+}
+
+/**
+ * Print a declaration expression (`model`/`enum`/`union`/`scalar` used in expression
+ * position) together with its doc comments and decorators.
+ *
+ * When everything fits on the line the doc comments and decorators are kept inline
+ * (e.g. `@a @b enum { ... }`). When it does not fit, each doc comment and decorator is
+ * placed on its own line and the whole block is indented one level relative to the
+ * surrounding expression.
+ *
+ * The declaration body always breaks (it contains hardlines), so a plain `group` would
+ * always break. A `conditionalGroup` is used instead so the break decision is based on
+ * the width of the first line only.
+ */
+function printDeclarationExpression(
+  path: AstPath<Node>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  const bare = printNode(path, options, print);
+
+  const docs = node.docs?.length ? path.map((x) => print(x as any), "docs") : [];
+  const decorators = (node as DecorableNode).decorators?.length
+    ? path.map((x) => print(x as any), "decorators")
+    : [];
+  const prefix = [...docs, ...decorators];
+
+  // No doc comments or decorators: nothing to lay out, print the bare declaration.
+  if (prefix.length === 0) {
+    return bare;
+  }
+
+  const inline = join(" ", [...prefix, bare]);
+
+  // In argument position (e.g. a decorator argument) the enclosing parentheses already
+  // provide the line break and indentation, so the block must not add its own.
+  const broken = isInArgumentPosition(path)
+    ? join(hardline, [...prefix, bare])
+    : indent([hardline, join(hardline, [...prefix, bare])]);
+
+  return conditionalGroup([inline, broken]);
+}
+
+function isInArgumentPosition(path: AstPath<Node>): boolean {
+  const parent = path.getParentNode() as Node | null;
+  switch (parent?.kind) {
+    case SyntaxKind.DecoratorExpression:
+    case SyntaxKind.AugmentDecoratorStatement:
+    case SyntaxKind.CallExpression:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function shouldPrintDirective(node: Node) {
+  // Model property handle printing directive itself.
+  return node.kind !== SyntaxKind.ModelProperty;
+}
+
+export function printNode(
+  // Path to the AST node to print
+  path: AstPath<Node>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node: Node = path.node;
+
+  switch (node.kind) {
+    // Root
+    case SyntaxKind.TypeSpecScript:
+      return printTypeSpecScript(path as AstPath<TypeSpecScriptNode>, options, print);
+    // Statements
+    case SyntaxKind.ImportStatement:
+      return [`import "${node.path.value}";`];
+    case SyntaxKind.UsingStatement:
+      return [`using `, (path as AstPath<UsingStatementNode>).call(print, "name"), `;`];
+    case SyntaxKind.OperationStatement:
+      return printOperationStatement(path as AstPath<OperationStatementNode>, options, print);
+    case SyntaxKind.OperationSignatureDeclaration:
+      return printOperationSignatureDeclaration(
+        path as AstPath<OperationSignatureDeclarationNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.OperationSignatureReference:
+      return printOperationSignatureReference(
+        path as AstPath<OperationSignatureReferenceNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.NamespaceStatement:
+      return printNamespaceStatement(
+        path as AstPath<FlattenedNamespaceStatementNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.ModelStatement:
+      return printModelStatement(path as AstPath<ModelStatementNode>, options, print);
+    case SyntaxKind.ModelDeclarationExpression:
+      return printModelStatement(path as AstPath<ModelStatementNode>, options, print);
+    case SyntaxKind.ScalarStatement:
+      return printScalarStatement(path as AstPath<ScalarStatementNode>, options, print);
+    case SyntaxKind.ScalarDeclarationExpression:
+      return printScalarStatement(path as AstPath<ScalarStatementNode>, options, print);
+    case SyntaxKind.ScalarConstructor:
+      return printScalarConstructor(path as AstPath<ScalarConstructorNode>, options, print);
+    case SyntaxKind.AliasStatement:
+      return printAliasStatement(path as AstPath<AliasStatementNode>, options, print);
+    case SyntaxKind.EnumStatement:
+      return printEnumStatement(path as AstPath<EnumStatementNode>, options, print);
+    case SyntaxKind.EnumDeclarationExpression:
+      return printEnumStatement(path as AstPath<EnumStatementNode>, options, print);
+    case SyntaxKind.UnionStatement:
+      return printUnionStatement(path as AstPath<UnionStatementNode>, options, print);
+    case SyntaxKind.UnionDeclarationExpression:
+      return printUnionStatement(path as AstPath<UnionStatementNode>, options, print);
+    case SyntaxKind.InterfaceStatement:
+      return printInterfaceStatement(path as AstPath<InterfaceStatementNode>, options, print);
+    // Others.
+    case SyntaxKind.Identifier:
+      return printIdentifier(node);
+    case SyntaxKind.StringLiteral:
+      return printStringLiteral(path as AstPath<StringLiteralNode>, options);
+    case SyntaxKind.NumericLiteral:
+      return printNumberLiteral(path as AstPath<NumericLiteralNode>, options);
+    case SyntaxKind.BooleanLiteral:
+      return printBooleanLiteral(path as AstPath<BooleanLiteralNode>, options);
+    case SyntaxKind.ModelExpression:
+      return printModelExpression(path as AstPath<ModelExpressionNode>, options, print);
+    case SyntaxKind.ModelProperty:
+      return printModelProperty(path as AstPath<ModelPropertyNode>, options, print);
+    case SyntaxKind.DecoratorExpression:
+      return printDecorator(path as AstPath<DecoratorExpressionNode>, options, print);
+    case SyntaxKind.AugmentDecoratorStatement:
+      return printAugmentDecorator(path as AstPath<AugmentDecoratorStatementNode>, options, print);
+    case SyntaxKind.DirectiveExpression:
+      return printDirective(path as AstPath<DirectiveExpressionNode>, options, print);
+    case SyntaxKind.UnionExpression:
+      return printUnion(path as AstPath<UnionExpressionNode>, options, print);
+    case SyntaxKind.IntersectionExpression:
+      return printIntersection(path as AstPath<IntersectionExpressionNode>, options, print);
+    case SyntaxKind.ArrayExpression:
+      return printArray(path as AstPath<ArrayExpressionNode>, options, print);
+    case SyntaxKind.TupleExpression:
+      return printTuple(path as AstPath<TupleExpressionNode>, options, print);
+    case SyntaxKind.MemberExpression:
+      return printMemberExpression(path as AstPath<MemberExpressionNode>, options, print);
+    case SyntaxKind.EnumMember:
+      return printEnumMember(path as AstPath<EnumMemberNode>, options, print);
+    case SyntaxKind.EnumSpreadMember:
+      return printEnumSpreadMember(path as AstPath<EnumSpreadMemberNode>, options, print);
+    case SyntaxKind.UnionVariant:
+      return printUnionVariant(path as AstPath<UnionVariantNode>, options, print);
+    case SyntaxKind.TypeReference:
+      return printTypeReference(path as AstPath<TypeReferenceNode>, options, print);
+    case SyntaxKind.TemplateArgument:
+      return printTemplateArgument(path as AstPath<TemplateArgumentNode>, options, print);
+    case SyntaxKind.ValueOfExpression:
+      return printValueOfExpression(path as AstPath<ValueOfExpressionNode>, options, print);
+    case SyntaxKind.TypeOfExpression:
+      return printTypeOfExpression(path as AstPath<TypeOfExpressionNode>, options, print);
+    case SyntaxKind.TemplateParameterDeclaration:
+      return printTemplateParameterDeclaration(
+        path as AstPath<TemplateParameterDeclarationNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.ModelSpreadProperty:
+      return printModelSpread(path as AstPath<ModelSpreadPropertyNode>, options, print);
+    case SyntaxKind.DecoratorDeclarationStatement:
+      return printDecoratorDeclarationStatement(
+        path as AstPath<DecoratorDeclarationStatementNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.FunctionDeclarationStatement:
+      return printFunctionDeclarationStatement(
+        path as AstPath<FunctionDeclarationStatementNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.FunctionTypeExpression:
+      return printFunctionTypeExpression(
+        path as AstPath<FunctionTypeExpressionNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.FunctionParameter:
+      return printFunctionParameterDeclaration(
+        path as AstPath<FunctionParameterNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.ExternKeyword:
+      return "extern";
+    case SyntaxKind.InternalKeyword:
+      return "internal";
+    case SyntaxKind.AutoKeyword:
+      return "auto";
+    case SyntaxKind.VoidKeyword:
+      return "void";
+    case SyntaxKind.NeverKeyword:
+      return "never";
+    case SyntaxKind.UnknownKeyword:
+      return "unknown";
+    case SyntaxKind.Doc:
+      return printDoc(path as AstPath<DocNode>, options, print);
+    case SyntaxKind.DocText:
+    case SyntaxKind.DocParamTag:
+    case SyntaxKind.DocPropTag:
+    case SyntaxKind.DocTemplateTag:
+    case SyntaxKind.DocReturnsTag:
+    case SyntaxKind.DocErrorsTag:
+    case SyntaxKind.DocUnknownTag:
+      // https://github.com/microsoft/typespec/issues/1319 Tracks pretty-printing doc comments.
+      compilerAssert(
+        false,
+        "Currently, doc comments are only handled as regular comments and we do not opt in to parsing them so we shouldn't reach here.",
+      );
+      return "";
+    case SyntaxKind.EmptyStatement:
+      return "";
+    case SyntaxKind.StringTemplateExpression:
+      return printStringTemplateExpression(
+        path as AstPath<StringTemplateExpressionNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.ObjectLiteral:
+      return printObjectLiteral(path as AstPath<ObjectLiteralNode>, options, print);
+    case SyntaxKind.ObjectLiteralProperty:
+      return printObjectLiteralProperty(path as AstPath<ObjectLiteralPropertyNode>, options, print);
+    case SyntaxKind.ObjectLiteralSpreadProperty:
+      return printObjectLiteralSpreadProperty(
+        path as AstPath<ObjectLiteralSpreadPropertyNode>,
+        options,
+        print,
+      );
+    case SyntaxKind.ArrayLiteral:
+      return printArrayLiteral(path as AstPath<ArrayLiteralNode>, options, print);
+    case SyntaxKind.ConstStatement:
+      return printConstStatement(path as AstPath<ConstStatementNode>, options, print);
+    case SyntaxKind.CallExpression:
+      return printCallExpression(path as AstPath<CallExpressionNode>, options, print);
+    case SyntaxKind.StringTemplateSpan:
+    case SyntaxKind.StringTemplateHead:
+    case SyntaxKind.StringTemplateMiddle:
+    case SyntaxKind.StringTemplateTail:
+    case SyntaxKind.JsSourceFile:
+    case SyntaxKind.JsNamespaceDeclaration:
+    case SyntaxKind.InvalidStatement:
+      return getRawText(node, options);
+    default:
+      // Dummy const to ensure we handle all node types.
+      // If you get an error here, add a case for the new node type
+      // you added..
+      const _assertNever: never = node;
+      return getRawText(node, options);
+  }
+}
+
+export function printTypeSpecScript(
+  path: AstPath<TypeSpecScriptNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  const body = [];
+  if (nodeHasComments) {
+    body.push(printDanglingComments(path, options, { sameIndent: true }));
+  }
+  body.push(printStatementSequence(path, options, print, "statements"));
+  return body;
+}
+
+export function printAliasStatement(
+  path: AstPath<AliasStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const id = path.call(print, "id");
+  const template = printTemplateParameterDeclarations(path, options, print, "templateParameters");
+  return [
+    printModifiers(path, options, print),
+    "alias ",
+    id,
+    template,
+    " = ",
+    path.call(print, "value"),
+    ";",
+  ];
+}
+
+export function printConstStatement(
+  path: AstPath<ConstStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const id = path.call(print, "id");
+  const type = node.type ? [": ", path.call(print, "type")] : "";
+  return [
+    printModifiers(path, options, print),
+    "const ",
+    id,
+    type,
+    " = ",
+    path.call(print, "value"),
+    ";",
+  ];
+}
+
+export function printCallExpression(
+  path: AstPath<CallExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const args = printCallLikeArgs(path, options, print);
+  return [path.call(print, "target"), args];
+}
+
+/**
+ * Print a template argument list (e.g. `<string, T = int32>`).
+ *
+ * A single argument is hugged (`Foo<{...}>`) so object-like arguments and long unions stay attached to the reference.
+ */
+function printTemplateArguments<T extends Node>(
+  path: AstPath<T>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+  propertyName: keyof T,
+) {
+  const node = path.node;
+  const args = node[propertyName] as any as TemplateArgumentNode[];
+  if (args.length === 0) {
+    return "";
+  }
+
+  const shouldHug = args.length === 1;
+  if (shouldHug) {
+    return ["<", join(", ", path.map(print, propertyName as any)), ">"];
+  } else {
+    const body = indent([softline, join([", ", softline], path.map(print, propertyName as any))]);
+    return group(["<", body, softline, ">"]);
+  }
+}
+
+/**
+ * Print a template parameter declaration list (e.g. `<T extends string, U = int32>`).
+ *
+ * A single parameter is hugged (`Foo<T extends string>`) as long as it cannot break by itself. When the
+ * parameter has a breakable constraint or default (union, model expression, ...) the list breaks instead,
+ * so the parameter never gets split while the `<` and `>` stay glued to the surrounding code.
+ */
+function printTemplateParameterDeclarations<T extends Node>(
+  path: AstPath<T>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+  propertyName: keyof T,
+) {
+  const node = path.node;
+  const params = node[propertyName] as any as TemplateParameterDeclarationNode[];
+  if (params.length === 0) {
+    return "";
+  }
+
+  if (params.length === 1 && isUnbreakableTemplateParameter(params[0])) {
+    return ["<", join(", ", path.map(print, propertyName as any)), ">"];
+  }
+
+  const body = indent([softline, join([",", line], path.map(print, propertyName as any))]);
+  return group(["<", body, softline, ">"]);
+}
+
+/** Check the template parameter declaration will always be printed on a single line. */
+function isUnbreakableTemplateParameter(node: TemplateParameterDeclarationNode): boolean {
+  return isUnbreakableType(node.constraint) && isUnbreakableType(node.default);
+}
+
+/** Check the type expression has no line break opportunity and so will always be printed on a single line. */
+function isUnbreakableType(node: Node | undefined): boolean {
+  if (node === undefined) {
+    return true;
+  }
+  switch (node.kind) {
+    case SyntaxKind.Identifier:
+    case SyntaxKind.MemberExpression:
+    case SyntaxKind.StringLiteral:
+    case SyntaxKind.NumericLiteral:
+    case SyntaxKind.BooleanLiteral:
+    case SyntaxKind.VoidKeyword:
+    case SyntaxKind.NeverKeyword:
+    case SyntaxKind.UnknownKeyword:
+      return true;
+    case SyntaxKind.TypeReference:
+      // A single argument is hugged (see `printTemplateArguments`) so it only breaks if the argument itself does.
+      return (
+        node.arguments.length === 0 ||
+        (node.arguments.length === 1 && isUnbreakableType(node.arguments[0].argument))
+      );
+    case SyntaxKind.ArrayExpression:
+      return isUnbreakableType(node.elementType);
+    case SyntaxKind.ValueOfExpression:
+    case SyntaxKind.TypeOfExpression:
+      return isUnbreakableType(node.target);
+    default:
+      return false;
+  }
+}
+
+export function canAttachComment(node: Node): boolean {
+  const kind = node.kind as SyntaxKind;
+  return Boolean(
+    kind &&
+    kind !== SyntaxKind.LineComment &&
+    kind !== SyntaxKind.BlockComment &&
+    kind !== SyntaxKind.EmptyStatement &&
+    kind !== SyntaxKind.DocParamTag &&
+    kind !== SyntaxKind.DocReturnsTag &&
+    kind !== SyntaxKind.DocTemplateTag &&
+    kind !== SyntaxKind.DocText &&
+    kind !== SyntaxKind.DocUnknownTag &&
+    !(node.flags & NodeFlags.Synthetic),
+  );
+}
+
+export function printComment(
+  commentPath: AstPath<Node | Comment>,
+  options: TypeSpecPrettierOptions,
+): Doc {
+  const comment = commentPath.node;
+  (comment as any).printed = true;
+
+  switch (comment.kind) {
+    case SyntaxKind.BlockComment:
+      return printBlockComment(commentPath as AstPath<BlockComment>, options);
+    case SyntaxKind.LineComment:
+      return `${getRawText(comment, options).trimEnd()}`;
+    default:
+      throw new Error(`Not a comment: ${JSON.stringify(comment)}`);
+  }
+}
+
+function printBlockComment(commentPath: AstPath<BlockComment>, options: TypeSpecPrettierOptions) {
+  const comment = commentPath.node;
+  const rawComment = options.originalText.slice(comment.pos + 2, comment.end - 2);
+
+  const printed = isIndentableBlockComment(rawComment)
+    ? printIndentableBlockCommentContent(rawComment)
+    : rawComment;
+  return ["/*", printed, "*/"];
+}
+
+function isIndentableBlockComment(rawComment: string): boolean {
+  // If the comment has multiple lines and every line starts with a star
+  // we can fix the indentation of each line. The stars in the `/*` and
+  // `*/` delimiters are not included in the comment value, so add them
+  // back first.
+  const lines = `*${rawComment}*`.split("\n");
+  return lines.length > 1 && lines.every((line) => line.trim()[0] === "*");
+}
+
+function printIndentableBlockCommentContent(rawComment: string): Doc {
+  const lines = rawComment.split("\n");
+
+  return [
+    join(
+      hardline,
+      lines.map((line, index) =>
+        index === 0
+          ? line.trimEnd()
+          : " " + (index < lines.length - 1 ? line.trim() : line.trimStart()),
+      ),
+    ),
+  ];
+}
+
+/** Print a doc comment. */
+function printDoc(
+  path: AstPath<DocNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const rawComment = getRawText(node, options).slice(3, -2);
+
+  const printed = isIndentableBlockComment(rawComment)
+    ? printIndentableBlockCommentContent(rawComment)
+    : rawComment.includes("\n")
+      ? rawComment
+      : ` ${rawComment.trim()} `;
+  return ["/**", printed, "*/"];
+}
+
+export function printDecorators(
+  path: AstPath<DecorableNode>,
+  options: object,
+  print: PrettierChildPrint,
+  { tryInline }: { tryInline: boolean },
+): { decorators: Doc; multiline: boolean } {
+  const node = path.node;
+  if (node.decorators.length === 0) {
+    return { decorators: "", multiline: false };
+  }
+
+  const shouldBreak = shouldDecoratorBreakLine(path, options, { tryInline });
+  const decorators = path.map((x) => [print(x as any), ifBreak(line, " ")], "decorators");
+
+  return {
+    decorators: group([shouldBreak ? breakParent : "", decorators]),
+    multiline: shouldBreak,
+  };
+}
+
+/** Check if the decorators of the given node should be broken in sparate line */
+function shouldDecoratorBreakLine(
+  path: AstPath<DecorableNode>,
+  options: object,
+  { tryInline }: { tryInline: boolean },
+) {
+  const node = path.node;
+
+  return (
+    !tryInline || node.decorators.length >= 3 || hasNewlineBetweenOrAfterDecorators(node, options)
+  );
+}
+
+/**
+ * Check if there is already new lines in between the decorators of the node.
+ */
+function hasNewlineBetweenOrAfterDecorators(node: DecorableNode, options: any) {
+  return node.decorators.some((decorator) => util.hasNewline(options.originalText, decorator.end));
+}
+
+export function printDecorator(
+  path: AstPath<DecoratorExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const args = printDecoratorArgs(path, options, print);
+  const node = path.node;
+  const name =
+    node.target.kind === SyntaxKind.Identifier
+      ? printIdentifier(node.target, "allow-reserved")
+      : path.call(print, "target");
+  return ["@", name, args];
+}
+
+export function printAugmentDecorator(
+  path: AstPath<AugmentDecoratorStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const target =
+    node.target.kind === SyntaxKind.Identifier
+      ? printIdentifier(node.target, "allow-reserved")
+      : path.call(print, "target");
+  const args = printAugmentDecoratorArgs(path, options, print);
+  return ["@@", target, args, ";"];
+}
+
+function printAugmentDecoratorArgs(
+  path: AstPath<AugmentDecoratorStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  return [
+    "(",
+    group([
+      indent(
+        join(", ", [
+          [softline, path.call(print, "targetType")],
+          ...path.map((arg) => [softline, print(arg)], "arguments"),
+        ]),
+      ),
+      softline,
+    ]),
+    ")",
+  ];
+}
+
+export function printDocComments(path: AstPath<Node>, options: object, print: PrettierChildPrint) {
+  const node = path.node;
+  if (node.docs === undefined || node.docs.length === 0) {
+    return "";
+  }
+
+  const docs = path.map((x) => [print(x as any), line], "docs");
+  return group([...docs, breakParent]);
+}
+
+function isDeclarationExpressionNode(node: Node): boolean {
+  switch (node.kind) {
+    case SyntaxKind.ModelDeclarationExpression:
+    case SyntaxKind.EnumDeclarationExpression:
+    case SyntaxKind.UnionDeclarationExpression:
+    case SyntaxKind.ScalarDeclarationExpression:
+      return true;
+    default:
+      return false;
+  }
+}
+
+export function printDirectives(path: AstPath<Node>, options: object, print: PrettierChildPrint) {
+  const node = path.node;
+  if (node.directives === undefined || node.directives.length === 0) {
+    return "";
+  }
+
+  const directives = path.map((x) => [print(x as any), line], "directives");
+
+  return group([...directives, breakParent]);
+}
+
+export function printDirective(
+  path: AstPath<DirectiveExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const args = printDirectiveArgs(path, options, print);
+  return ["#", path.call(print, "target"), " ", args];
+}
+
+function printDecoratorArgs(
+  path: AstPath<DecoratorExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  if (node.arguments.length === 0) {
+    return "";
+  }
+
+  return printCallLikeArgs(path, options, print);
+}
+
+function printCallLikeArgs(
+  path: AstPath<DecoratorExpressionNode | CallExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+
+  // So that decorator with single object arguments have ( and { hugging.
+  // @deco(#{
+  //   value: "foo"
+  // })
+  const shouldHug =
+    node.arguments.length === 1 &&
+    (node.arguments[0].kind === SyntaxKind.ModelExpression ||
+      node.arguments[0].kind === SyntaxKind.ObjectLiteral ||
+      node.arguments[0].kind === SyntaxKind.ArrayLiteral ||
+      node.arguments[0].kind === SyntaxKind.StringLiteral ||
+      node.arguments[0].kind === SyntaxKind.StringTemplateExpression);
+
+  if (shouldHug) {
+    return [
+      "(",
+      join(
+        ", ",
+        path.map((arg) => [print(arg)], "arguments"),
+      ),
+      ")",
+    ];
+  }
+
+  return [
+    "(",
+    group([
+      indent(
+        join(
+          ", ",
+          path.map((arg) => [softline, print(arg)], "arguments"),
+        ),
+      ),
+      softline,
+    ]),
+    ")",
+  ];
+}
+
+export function printDirectiveArgs(
+  path: AstPath<DirectiveExpressionNode>,
+  options: object,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+
+  if (node.arguments.length === 0) {
+    return "";
+  }
+
+  return join(
+    " ",
+    path.map((arg) => [print(arg)], "arguments"),
+  );
+}
+
+export function printEnumStatement(
+  path: AstPath<EnumStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const inExpressionPosition = isDeclarationExpressionNode(path.node);
+  const decorators = inExpressionPosition
+    ? ""
+    : printDecorators(path, options, print, { tryInline: false }).decorators;
+  const id = path.node.id ? [" ", path.call(print, "id")] : "";
+  return [
+    decorators,
+    printModifiers(path, options, print),
+    "enum",
+    id,
+    " ",
+    printEnumBlock(path, options, print),
+  ];
+}
+
+function printEnumBlock(
+  path: AstPath<EnumStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  if (node.members.length === 0) {
+    return "{}";
+  }
+
+  const body = joinMembersInBlock(path, "members", options, print, ",", hardline);
+  return group(["{", indent(body), hardline, "}"]);
+}
+
+export function printEnumMember(
+  path: AstPath<EnumMemberNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const id = printIdentifier(node.id, "allow-reserved");
+  const value = node.value ? [": ", path.call(print, "value")] : "";
+  const { decorators } = printDecorators(path, options, print, {
+    tryInline: DecoratorsTryInline.enumMember,
+  });
+  return [decorators, id, value];
+}
+
+function printEnumSpreadMember(
+  path: AstPath<EnumSpreadMemberNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  return ["...", path.call(print, "target")];
+}
+
+export function printUnionStatement(
+  path: AstPath<UnionStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const inExpressionPosition = isDeclarationExpressionNode(path.node);
+  const id = path.node.id ? [" ", path.call(print, "id")] : "";
+  const decorators = inExpressionPosition
+    ? ""
+    : printDecorators(path, options, print, { tryInline: false }).decorators;
+  const generic = printTemplateParameterDeclarations(path, options, print, "templateParameters");
+  const heritage = printHeritageClause(path, print, "extends", "extends");
+  return [
+    decorators,
+    printModifiers(path, options, print),
+    "union",
+    id,
+    generic,
+    heritage,
+    " ",
+    printUnionVariantsBlock(path, options, print),
+  ];
+}
+
+export function printUnionVariantsBlock(
+  path: AstPath<UnionStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  if (node.options.length === 0 && !nodeHasComments) {
+    return "{}";
+  }
+
+  const body = [joinMembersInBlock(path, "options", options, print, ",", hardline)];
+  if (nodeHasComments) {
+    body.push(printDanglingComments(path, options, { sameIndent: true }));
+  }
+  return group(["{", indent(body), hardline, "}"]);
+}
+
+export function printUnionVariant(
+  path: AstPath<UnionVariantNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const id =
+    path.node.id === undefined ? "" : [printIdentifier(path.node.id, "allow-reserved"), ": "];
+  const { decorators } = printDecorators(path, options, print, {
+    tryInline: DecoratorsTryInline.unionVariant,
+  });
+  return [decorators, id, path.call(print, "value")];
+}
+
+export function printInterfaceStatement(
+  path: AstPath<InterfaceStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const id = path.call(print, "id");
+  const { decorators } = printDecorators(path, options, print, { tryInline: false });
+  const generic = printTemplateParameterDeclarations(path, options, print, "templateParameters");
+  const extendList = printInterfaceExtends(path, options, print);
+
+  return [
+    decorators,
+    printModifiers(path, options, print),
+    "interface ",
+    id,
+    generic,
+    extendList,
+    " ",
+    printInterfaceMembers(path, options, print),
+  ];
+}
+
+function printInterfaceExtends(
+  path: AstPath<InterfaceStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  if (node.extends.length === 0) {
+    return "";
+  }
+
+  const keyword = "extends ";
+  return [group(indent([line, keyword, indent(join([",", line], path.map(print, "extends")))]))];
+}
+
+export function printInterfaceMembers(
+  path: AstPath<InterfaceStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const hasOperations = node.operations.length > 0;
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  if (!hasOperations && !nodeHasComments) {
+    return "{}";
+  }
+
+  const lastOperation = node.operations[node.operations.length - 1];
+
+  const parts: Doc[] = [];
+  path.each((operationPath) => {
+    const node = operationPath.node as any as OperationStatementNode;
+
+    const printed = print(operationPath);
+    parts.push(printed);
+
+    if (node !== lastOperation) {
+      parts.push(hardline);
+
+      if (isNextLineEmpty(options.originalText, node, options.locEnd)) {
+        parts.push(hardline);
+      }
+    }
+  }, "operations");
+
+  const body: Doc[] = [hardline, parts];
+
+  if (nodeHasComments) {
+    body.push(printDanglingComments(path, options, { sameIndent: true }));
+  }
+  return group(["{", indent(body), hardline, "}"]);
+}
+
+function printDanglingComments(
+  path: AstPath<any>,
+  options: TypeSpecPrettierOptions,
+  { sameIndent }: { sameIndent: boolean },
+) {
+  const node = path.node;
+  const parts: Doc[] = [];
+  if (!node || !node.comments) {
+    return "";
+  }
+  path.each((commentPath) => {
+    const comment: any = commentPath.node;
+    if (!comment.leading && !comment.trailing) {
+      parts.push(printComment(path, options));
+    }
+  }, "comments");
+
+  if (parts.length === 0) {
+    return "";
+  }
+
+  if (sameIndent) {
+    return join(hardline, parts);
+  }
+  return indent([hardline, join(hardline, parts)]);
+}
+
+/**
+ * Handle printing an intersection node.
+ * @example `Foo & Bar` or `{foo: string} & {bar: string}`
+ *
+ * @param path Prettier AST Path.
+ * @param options Prettier options
+ * @param print Prettier child print callback.
+ * @returns Prettier document.
+ */
+export function printIntersection(
+  path: AstPath<IntersectionExpressionNode>,
+  options: object,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const types = path.map(print, "options");
+  const result: (Doc | string)[] = [];
+  let wasIndented = false;
+  for (let i = 0; i < types.length; ++i) {
+    if (i === 0) {
+      result.push(types[i]);
+    } else if (isModelNode(node.options[i - 1]) && isModelNode(node.options[i])) {
+      // If both are objects, don't indent
+      result.push([" & ", wasIndented ? indent(types[i]) : types[i]]);
+    } else if (!isModelNode(node.options[i - 1]) && !isModelNode(node.options[i])) {
+      // If no object is involved, go to the next line if it breaks
+      result.push(indent([" &", line, types[i]]));
+    } else {
+      // If you go from object to non-object or vis-versa, then inline it
+      if (i > 1) {
+        wasIndented = true;
+      }
+      result.push(" & ", i > 1 ? indent(types[i]) : types[i]);
+    }
+  }
+  return group(result);
+}
+
+function isModelNode(node: Node) {
+  return node.kind === SyntaxKind.ModelExpression;
+}
+
+export function printArray(
+  path: AstPath<ArrayExpressionNode>,
+  options: object,
+  print: PrettierChildPrint,
+): Doc {
+  return [path.call(print, "elementType"), "[]"];
+}
+
+export function printTuple(
+  path: AstPath<TupleExpressionNode>,
+  options: object,
+  print: PrettierChildPrint,
+): Doc {
+  return group([
+    "[",
+    indent(
+      join(
+        ", ",
+        path.map((arg) => [softline, print(arg)], "values"),
+      ),
+    ),
+    softline,
+    "]",
+  ]);
+}
+
+export function printMemberExpression(
+  path: AstPath<MemberExpressionNode>,
+  options: object,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+
+  const id = printIdentifier(node.id, "allow-reserved");
+  return [node.base ? [path.call(print, "base"), node.selector] : "", id];
+}
+
+export function printModelExpression(
+  path: AstPath<ModelExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const inBlock = isModelExpressionInBlock(path);
+  const node = path.node;
+  if (inBlock) {
+    return group(printModelPropertiesBlock(path, options, print));
+  } else {
+    const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+    if (node.properties.length === 0) {
+      if (nodeHasComments) {
+        return group([
+          indent(printDanglingComments(path, options, { sameIndent: true })),
+          softline,
+        ]);
+      }
+      return group(["", softline]);
+    }
+    const properties = indent(
+      joinMembersInBlock(path, "properties", options, print, ifBreak(",", ", "), softline),
+    );
+    return group([properties, softline]);
+  }
+}
+
+export function printObjectLiteral(
+  path: AstPath<ObjectLiteralNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const hasProperties = node.properties && node.properties.length > 0;
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  if (!hasProperties && !nodeHasComments) {
+    return "#{}";
+  }
+  const lineDoc = softline;
+  const body: Doc[] = [
+    joinMembersInBlock(path, "properties", options, print, ifBreak(",", ", "), softline),
+  ];
+  if (nodeHasComments) {
+    body.push(printDanglingComments(path, options, { sameIndent: true }));
+  }
+  return group(["#{", ifBreak("", " "), indent(body), lineDoc, ifBreak("", " "), "}"]);
+}
+
+export function printObjectLiteralProperty(
+  path: AstPath<ObjectLiteralPropertyNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const id = printIdentifier(node.id, "allow-reserved");
+  return [printDirectives(path, options, print), id, ": ", path.call(print, "value")];
+}
+
+export function printObjectLiteralSpreadProperty(
+  path: AstPath<ObjectLiteralSpreadPropertyNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  return [printDirectives(path, options, print), "...", path.call(print, "target")];
+}
+
+export function printArrayLiteral(
+  path: AstPath<ArrayLiteralNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  return group([
+    "#[",
+    indent(
+      join(
+        ", ",
+        path.map((arg) => [softline, print(arg)], "values"),
+      ),
+    ),
+    softline,
+    "]",
+  ]);
+}
+
+// When the base is a multi-argument template, its argument list breaks on its
+// own, so keep `is`/`extends` inline instead of breaking the keyword too (#11009).
+function printHeritageClause<T extends Node>(
+  path: AstPath<T>,
+  print: PrettierChildPrint,
+  keyword: string,
+  propertyName: keyof T,
+): Doc {
+  const ref = path.node[propertyName] as Node | undefined;
+  if (!ref) {
+    return "";
+  }
+  const printed = [`${keyword} `, path.call(print, propertyName as any)];
+  if (isMultiArgTemplateReference(ref)) {
+    return [" ", printed];
+  }
+  return group(indent([ifBreak(line, " "), printed]));
+}
+
+function isMultiArgTemplateReference(node: Node): boolean {
+  return (
+    node.kind === SyntaxKind.TypeReference && (node as TypeReferenceNode).arguments.length >= 2
+  );
+}
+
+export function printModelStatement(
+  path: AstPath<ModelStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const id = node.id ? [" ", path.call(print, "id")] : "";
+  const heritage = printHeritageClause(path, print, "extends", "extends");
+  const isBase = printHeritageClause(path, print, "is", "is");
+  const generic = printTemplateParameterDeclarations(path, options, print, "templateParameters");
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  const shouldPrintBody = nodeHasComments || !(node.properties.length === 0 && node.is);
+  const inExpressionPosition = isDeclarationExpressionNode(node);
+  const body = shouldPrintBody
+    ? [" ", printModelPropertiesBlock(path, options, print)]
+    : inExpressionPosition
+      ? ""
+      : ";";
+  const decorators = inExpressionPosition
+    ? ""
+    : printDecorators(path, options, print, { tryInline: false }).decorators;
+  return [
+    decorators,
+    printModifiers(path, options, print),
+    "model",
+    id,
+    generic,
+    heritage,
+    isBase,
+    body,
+  ];
+}
+
+function printModelPropertiesBlock(
+  path: AstPath<
+    Node & {
+      properties?: readonly (ModelPropertyNode | ModelSpreadPropertyNode)[];
+    }
+  >,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const hasProperties = node.properties && node.properties.length > 0;
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  if (!hasProperties && !nodeHasComments) {
+    return "{}";
+  }
+  const tryInline = path.getParentNode()?.kind === SyntaxKind.TemplateParameterDeclaration;
+  const lineDoc = tryInline ? softline : hardline;
+  const rawSeparator: string = isModelAValue(path) ? "," : ";";
+  // When inlined the line between the properties collapses so the separator needs to provide the space itself.
+  const separator: Doc = tryInline ? ifBreak(rawSeparator, `${rawSeparator} `) : rawSeparator;
+
+  const body = [joinMembersInBlock(path, "properties", options, print, separator, lineDoc)];
+  if (nodeHasComments) {
+    body.push(printDanglingComments(path, options, { sameIndent: true }));
+  }
+  return group(["{", indent(body), lineDoc, "}"]);
+}
+
+/**
+ * Join members nodes that are in a block by adding extra new lines when needed.(e.g. when there are decorators or doc comments )
+ * @param path Prettier AST Path.
+ * @param options Prettier options
+ * @param print Prettier print callback
+ * @param separator Separator
+ * @param regularLine What line to use when we should split lines
+ * @returns
+ */
+function joinMembersInBlock<T extends Node>(
+  path: AstPath<T>,
+  member: keyof T,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+  separator: Doc,
+  regularLine: Doc = hardline,
+): Doc {
+  const doc: Doc[] = [regularLine];
+  const propertyContainerNode = path.node;
+
+  let newLineBeforeNextProp = false;
+  path.each((item, propertyIndex) => {
+    const isFirst = propertyIndex === 0;
+    const isLast = propertyIndex === (propertyContainerNode[member] as any).length - 1;
+    const shouldWrapInNewLines = shouldWrapMemberInNewLines(item as any, options);
+
+    if ((newLineBeforeNextProp || shouldWrapInNewLines) && !isFirst) {
+      doc.push(hardline);
+      newLineBeforeNextProp = false;
+    }
+    doc.push(print(item));
+    if (isLast) {
+      doc.push(ifBreak(separator));
+    } else {
+      doc.push(separator);
+      doc.push(regularLine);
+      if (shouldWrapInNewLines) {
+        newLineBeforeNextProp = true;
+      }
+    }
+  }, member as any);
+  return doc;
+}
+
+/**
+ * Check if property item (PropertyNode, SpreadProperty) should be wrapped in new lines.
+ * It can be wrapped for the following reasons:
+ * - has decorators on lines above
+ * - has leading comments
+ */
+function shouldWrapMemberInNewLines(
+  path: AstPath<
+    | ModelPropertyNode
+    | ModelSpreadPropertyNode
+    | EnumMemberNode
+    | EnumSpreadMemberNode
+    | ScalarConstructorNode
+    | UnionVariantNode
+    | ObjectLiteralPropertyNode
+    | ObjectLiteralSpreadPropertyNode
+  >,
+  options: any,
+): boolean {
+  const node = path.node;
+  return (
+    (node.kind !== SyntaxKind.ModelSpreadProperty &&
+      node.kind !== SyntaxKind.EnumSpreadMember &&
+      node.kind !== SyntaxKind.ScalarConstructor &&
+      node.kind !== SyntaxKind.ObjectLiteralProperty &&
+      node.kind !== SyntaxKind.ObjectLiteralSpreadProperty &&
+      shouldDecoratorBreakLine(path as any, options, {
+        tryInline: DecoratorsTryInline.modelProperty,
+      })) ||
+    hasComments(node, CommentCheckFlags.Leading) ||
+    (node.docs && node.docs?.length > 0)
+  );
+}
+
+/**
+ * Figure out if this model is being used as a definition or value.
+ * @returns true if the model is used as a value(e.g. decorator value), false if it is used as a model definition.
+ */
+function isModelAValue(path: AstPath<Node>): boolean {
+  let count = 0;
+  let node: Node | null = path.node;
+  do {
+    switch (node.kind) {
+      case SyntaxKind.ModelStatement:
+      case SyntaxKind.ModelDeclarationExpression:
+      case SyntaxKind.AliasStatement:
+      case SyntaxKind.OperationStatement:
+        return false;
+      case SyntaxKind.DecoratorExpression:
+        return true;
+    }
+  } while ((node = path.getParentNode(count++)));
+  return true;
+}
+
+export function printModelProperty(
+  path: AstPath<ModelPropertyNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const { decorators } = printDecorators(path as AstPath<DecorableNode>, options, print, {
+    tryInline: DecoratorsTryInline.modelProperty,
+  });
+  const id = printIdentifier(node.id, "allow-reserved");
+  return [
+    printDirectives(path, options, print),
+    decorators,
+    id,
+    node.optional ? "?: " : ": ",
+    path.call(print, "value"),
+    node.default ? [" = ", path.call(print, "default")] : "",
+  ];
+}
+
+function printIdentifier(
+  id: IdentifierNode,
+  context: "allow-reserved" | "disallow-reserved" = "disallow-reserved",
+) {
+  return printIdentifierString(id.sv, context);
+}
+
+function isModelExpressionInBlock(path: AstPath<ModelExpressionNode>) {
+  const parent: Node | null = path.getParentNode() as any;
+
+  switch (parent?.kind) {
+    case SyntaxKind.OperationSignatureDeclaration:
+      return parent.parameters !== path.getNode();
+    default:
+      return true;
+  }
+}
+
+function printScalarStatement(
+  path: AstPath<ScalarStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const id = node.id ? [" ", path.call(print, "id")] : "";
+  const template = printTemplateParameterDeclarations(path, options, print, "templateParameters");
+
+  const heritage = printHeritageClause(path, print, "extends", "extends");
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  const shouldPrintBody = nodeHasComments || !(node.members.length === 0);
+
+  const inExpressionPosition = isDeclarationExpressionNode(node);
+  const members = shouldPrintBody
+    ? [" ", printScalarBody(path, options, print)]
+    : inExpressionPosition
+      ? ""
+      : ";";
+  const decorators = inExpressionPosition
+    ? ""
+    : printDecorators(path, options, print, { tryInline: false }).decorators;
+  return [
+    decorators,
+    printModifiers(path, options, print),
+    "scalar",
+    id,
+    template,
+    heritage,
+    members,
+  ];
+}
+
+function printScalarBody(
+  path: AstPath<ScalarStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const hasProperties = node.members && node.members.length > 0;
+  const nodeHasComments = hasComments(node, CommentCheckFlags.Dangling);
+  if (!hasProperties && !nodeHasComments) {
+    return "{}";
+  }
+  const body = [joinMembersInBlock(path, "members", options, print, ";", hardline)];
+  if (nodeHasComments) {
+    body.push(printDanglingComments(path, options, { sameIndent: true }));
+  }
+  return group(["{", indent(body), hardline, "}"]);
+}
+
+function printScalarConstructor(
+  path: AstPath<ScalarConstructorNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const id = path.call(print, "id");
+  const parameters = [
+    group([
+      indent(
+        join(
+          ", ",
+          path.map((arg) => [softline, print(arg)], "parameters"),
+        ),
+      ),
+      softline,
+    ]),
+  ];
+  return ["init ", id, "(", parameters, ")"];
+}
+
+export function printNamespaceStatement(
+  path: AstPath<FlattenedNamespaceStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const names = path.map(print, "ids");
+  const currentNode = path.getNode();
+
+  const suffix =
+    currentNode?.statements === undefined
+      ? ";"
+      : [
+          " {",
+          indent([hardline, printStatementSequence(path, options, print, "statements")]),
+          hardline,
+          "}",
+        ];
+
+  const { decorators } = printDecorators(path, options, print, { tryInline: false });
+  return [decorators, `namespace `, join(".", names), suffix];
+}
+
+export function printOperationSignatureDeclaration(
+  path: AstPath<OperationSignatureDeclarationNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  return ["(", path.call(print, "parameters"), "): ", path.call(print, "returnType")];
+}
+
+export function printOperationSignatureReference(
+  path: AstPath<OperationSignatureReferenceNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  return [" is ", path.call(print, "baseOperation")];
+}
+
+export function printOperationStatement(
+  path: AstPath<OperationStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const inInterface = (path.getParentNode()?.kind as any) === SyntaxKind.InterfaceStatement;
+  const templateParams = printTemplateParameterDeclarations(
+    path,
+    options,
+    print,
+    "templateParameters",
+  );
+  const { decorators } = printDecorators(path as AstPath<DecorableNode>, options, print, {
+    tryInline: true,
+  });
+
+  return [
+    decorators,
+    printModifiers(path, options, print),
+    inInterface ? "" : "op ",
+    path.call(print, "id"),
+    templateParams,
+    path.call(print, "signature"),
+    `;`,
+  ];
+}
+
+export function printStatementSequence<T extends Node>(
+  path: AstPath<T>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+  property: keyof T,
+) {
+  const node = path.node;
+  const parts: Doc[] = [];
+  const lastStatement = getLastStatement(node[property] as any as Statement[]);
+
+  path.each((statementPath) => {
+    const node = path.node;
+
+    if (node.kind === SyntaxKind.EmptyStatement) {
+      return;
+    }
+
+    const printed = print(statementPath);
+    parts.push(printed);
+
+    if (node !== lastStatement) {
+      parts.push(hardline);
+
+      if (isNextLineEmpty(options.originalText, node, options.locEnd)) {
+        parts.push(hardline);
+      }
+    }
+  }, property as any);
+
+  return parts;
+}
+
+function getLastStatement(statements: Statement[]): Statement | undefined {
+  for (let i = statements.length - 1; i >= 0; i--) {
+    const statement = statements[i];
+    if (statement.kind !== SyntaxKind.EmptyStatement) {
+      return statement;
+    }
+  }
+  return undefined;
+}
+
+export function printUnion(
+  path: AstPath<UnionExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  // A union that is one of several template arguments must not add its own
+  // leading line + indent: the argument list already provides them, so stacking
+  // both yields a blank line and an extra indent level for the variants.
+  // The per-variant align(2) is always kept though (matching prettier's union
+  // printer): it accounts for the "| " prefix so a variant that breaks (e.g. a
+  // nested template) stays aligned under its content.
+  // https://github.com/microsoft/typespec/issues/11009
+  const inMultiTemplateArgumentList = isInMultiTemplateArgumentList(path);
+  const types = path.map((typePath) => align(2, print(typePath)), "options");
+
+  const shouldAddStartLine = !inMultiTemplateArgumentList;
+  const code = [ifBreak([shouldAddStartLine ? line : "", "| "], ""), join([line, "| "], types)];
+  return inMultiTemplateArgumentList ? group(code) : group(indent(code));
+}
+
+/** Whether the node is a direct argument of a template reference with more than one argument. */
+function isInMultiTemplateArgumentList(path: AstPath<Node>): boolean {
+  // A `TemplateArgument` only ever lives in `TypeReference.arguments`, so the
+  // owning `TypeReference` is always the next node ancestor.
+  const argument = path.getParentNode();
+  if (argument?.kind !== SyntaxKind.TemplateArgument) {
+    return false;
+  }
+  // Named arguments (`Name = <union>`) print the union after `Name = `, so the
+  // argument list's line break + indent does not apply to the union variants.
+  // The union must therefore provide its own line break + indent like a
+  // standalone union. https://github.com/microsoft/typespec/issues/11092
+  if (argument.name !== undefined) {
+    return false;
+  }
+  const reference = path.getParentNode(1);
+  return reference?.kind === SyntaxKind.TypeReference && reference.arguments.length > 1;
+}
+
+export function printTypeReference(
+  path: AstPath<TypeReferenceNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const type = path.call(print, "target");
+  const template = printTemplateArguments(path, options, print, "arguments");
+  return [type, template];
+}
+
+export function printTemplateArgument(
+  path: AstPath<TemplateArgumentNode>,
+  _options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  if (path.node.name !== undefined) {
+    const name = path.call(print, "name");
+    const argument = path.call(print, "argument");
+
+    return group([name, " = ", argument]);
+  } else {
+    return path.call(print, "argument");
+  }
+}
+
+export function printValueOfExpression(
+  path: AstPath<ValueOfExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const type = path.call(print, "target");
+  return ["valueof ", type];
+}
+export function printTypeOfExpression(
+  path: AstPath<TypeOfExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const type = path.call(print, "target");
+  return ["typeof ", type];
+}
+
+function printTemplateParameterDeclaration(
+  path: AstPath<TemplateParameterDeclarationNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  return [
+    path.call(print, "id"),
+    node.constraint ? [" extends ", path.call(print, "constraint")] : "",
+    node.default ? [" = ", path.call(print, "default")] : "",
+  ];
+}
+
+function printModelSpread(
+  path: AstPath<ModelSpreadPropertyNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  return ["...", path.call(print, "target")];
+}
+
+function printDecoratorDeclarationStatement(
+  path: AstPath<DecoratorDeclarationStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const id = path.call(print, "id");
+  const parameters = [
+    group([
+      indent(
+        join(", ", [
+          [softline, path.call(print, "target")],
+          ...path.map((arg) => [softline, print(arg)], "parameters"),
+        ]),
+      ),
+      softline,
+    ]),
+  ];
+  return [printModifiers(path, options, print), "dec ", id, "(", parameters, ")", ";"];
+}
+
+function printFunctionDeclarationStatement(
+  path: AstPath<FunctionDeclarationStatementNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  const id = path.call(print, "id");
+  const parameters = [
+    group([
+      indent(
+        join(
+          ", ",
+          path.map((arg) => [softline, print(arg)], "parameters"),
+        ),
+      ),
+      softline,
+    ]),
+  ];
+  const returnType = node.returnType ? [": ", path.call(print, "returnType")] : "";
+  return [printModifiers(path, options, print), "fn ", id, "(", parameters, ")", returnType, ";"];
+}
+
+function printFunctionTypeExpression(
+  path: AstPath<FunctionTypeExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  const parameters = [
+    group([
+      indent(
+        join(
+          ", ",
+          path.map((arg) => [softline, print(arg)], "parameters"),
+        ),
+      ),
+      softline,
+    ]),
+  ];
+  const returnType = node.returnType ? [" => ", path.call(print, "returnType")] : "";
+  return ["fn", "(", parameters, ")", returnType];
+}
+
+function printFunctionParameterDeclaration(
+  path: AstPath<FunctionParameterNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  const id = printIdentifier(node.id, "allow-reserved");
+
+  const type = node.type ? [": ", path.call(print, "type")] : "";
+
+  return [
+    node.rest ? "..." : "",
+    printDirectives(path, options, print),
+    id,
+    node.optional ? "?" : "",
+    type,
+  ];
+}
+
+export function printModifiers(
+  path: AstPath<(DeclarationNode | OptionallyNamedDeclarationNode) & Node>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+): Doc {
+  const node = path.node;
+  if (node.modifiers === undefined || node.modifiers.length === 0) {
+    return "";
+  }
+
+  return path.map((x) => [print(x as any), " "], "modifiers");
+}
+
+function printStringLiteral(
+  path: AstPath<StringLiteralNode>,
+  options: TypeSpecPrettierOptions,
+): Doc {
+  const node = path.node;
+  const multiline = isMultiline(node, options);
+
+  const raw = getRawText(node, options);
+  if (multiline) {
+    const lines = splitLines(raw.slice(3));
+    const whitespaceIndent = lines[lines.length - 1].length - 3;
+    const newLines = trimMultilineString(lines, whitespaceIndent);
+    return [`"""`, indent(markAsRoot(newLines))];
+  } else {
+    return raw;
+  }
+}
+
+function isMultiline(
+  node: StringLiteralNode | StringTemplateExpressionNode,
+  options: TypeSpecPrettierOptions,
+) {
+  return (
+    options.originalText[node.pos] &&
+    options.originalText[node.pos + 1] === `"` &&
+    options.originalText[node.pos + 2] === `"`
+  );
+}
+
+function printNumberLiteral(
+  path: AstPath<NumericLiteralNode>,
+  options: TypeSpecPrettierOptions,
+): Doc {
+  const node = path.node;
+  return node.valueAsString;
+}
+
+function printBooleanLiteral(
+  path: AstPath<BooleanLiteralNode>,
+  options: TypeSpecPrettierOptions,
+): Doc {
+  const node = path.node;
+  return node.value ? "true" : "false";
+}
+
+export function printStringTemplateExpression(
+  path: AstPath<StringTemplateExpressionNode>,
+  options: TypeSpecPrettierOptions,
+  print: PrettierChildPrint,
+) {
+  const node = path.node;
+  const multiline = isMultiline(node, options);
+  const rawHead = getRawText(node.head, options);
+  if (multiline) {
+    const lastSpan = node.spans[node.spans.length - 1];
+    const lastLines = splitLines(getRawText(lastSpan.literal, options));
+    const whitespaceIndent = lastLines[lastLines.length - 1].length - 3;
+    const content = [
+      trimMultilineString(splitLines(rawHead.slice(3)), whitespaceIndent),
+      path.map((span: AstPath<StringTemplateSpanNode>) => {
+        const expression = span.call(print, "expression");
+        const spanRawText = getRawText(span.node.literal, options);
+        const spanLines = splitLines(spanRawText);
+        return [
+          expression,
+          spanLines[0],
+          literalline,
+          trimMultilineString(spanLines.slice(1), whitespaceIndent),
+        ];
+      }, "spans"),
+    ];
+
+    return [`"""`, indent(markAsRoot([content]))];
+  } else {
+    const content = [
+      rawHead,
+      path.map((span: AstPath<StringTemplateSpanNode>) => {
+        const expression = span.call(print, "expression");
+        return [expression, getRawText(span.node.literal, options)];
+      }, "spans"),
+    ];
+    return content;
+  }
+}
+
+function trimMultilineString(lines: string[], whitespaceIndent: number): Doc[] {
+  const newLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    newLines.push(lines[i].slice(whitespaceIndent));
+    if (i < lines.length - 1) {
+      newLines.push(literalline);
+    }
+  }
+  return newLines;
+}
+
+/**
+ * @param node Node that has postition information.
+ * @param options Prettier options
+ * @returns Raw text in the file for the given node.
+ */
+function getRawText(node: TextRange, options: TypeSpecPrettierOptions): string {
+  if ("rawText" in node) {
+    return node.rawText as string;
+  }
+  return options.originalText.slice(node.pos, node.end);
+}
+
+function hasComments(node: any, flags?: CommentCheckFlags) {
+  if (!node.comments || node.comments.length === 0) {
+    return false;
+  }
+  const test = getCommentTestFunction(flags);
+  return test ? node.comments.some(test) : true;
+}
+
+enum CommentCheckFlags {
+  /** Check comment is a leading comment */
+  Leading = 1 << 1,
+  /** Check comment is a trailing comment */
+  Trailing = 1 << 2,
+  /** Check comment is a dangling comment */
+  Dangling = 1 << 3,
+  /** Check comment is a block comment */
+  Block = 1 << 4,
+  /** Check comment is a line comment */
+  Line = 1 << 5,
+  /** Check comment is a `prettier-ignore` comment */
+  PrettierIgnore = 1 << 6,
+  /** Check comment is the first attached comment */
+  First = 1 << 7,
+  /** Check comment is the last attached comment */
+  Last = 1 << 8,
+}
+
+type CommentTestFn = (comment: any, index: number, comments: any[]) => boolean;
+
+function getCommentTestFunction(flags: CommentCheckFlags | undefined): CommentTestFn | undefined {
+  if (flags) {
+    return (comment: any, index: number, comments: any[]) =>
+      !(
+        (flags & CommentCheckFlags.Leading && !comment.leading) ||
+        (flags & CommentCheckFlags.Trailing && !comment.trailing) ||
+        (flags & CommentCheckFlags.Dangling && (comment.leading || comment.trailing)) ||
+        (flags & CommentCheckFlags.Block && !isBlockComment(comment)) ||
+        (flags & CommentCheckFlags.Line && !isLineComment(comment)) ||
+        (flags & CommentCheckFlags.First && index !== 0) ||
+        (flags & CommentCheckFlags.Last && index !== comments.length - 1)
+      );
+  }
+  return undefined;
+}
+
+function isBlockComment(comment: Comment): comment is BlockComment {
+  return comment.kind === SyntaxKind.BlockComment;
+}
+
+function isLineComment(comment: Comment): comment is LineComment {
+  return comment.kind === SyntaxKind.BlockComment;
+}

@@ -1,0 +1,33 @@
+import type { Decorator, FunctionValue } from "@typespec/compiler";
+
+export type EntitySignature = DecoratorSignature | FunctionSignature;
+
+export interface DecoratorSignature {
+  kind: Decorator["kind"];
+
+  /** Decorator name ()`@example `@foo`) */
+  name: string;
+
+  /** Name of the js function. (@example `$foo`) */
+  jsName: string;
+
+  /** TypeScript type name (@example `FooDecorator`) */
+  typeName: string;
+
+  decorator: Decorator;
+
+  /** Whether this is an auto decorator (declared with `auto dec`). */
+  isAuto: boolean;
+}
+
+export interface FunctionSignature {
+  kind: FunctionValue["valueKind"];
+
+  /** Function name */
+  name: string;
+
+  /** TypeScript type name (@example `FooFunction`) */
+  typeName: string;
+
+  tspFunction: FunctionValue;
+}

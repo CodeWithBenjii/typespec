@@ -1,0 +1,135 @@
+import type { AssetEmitter } from "@typespec/asset-emitter";
+import type { EmitContext, ModelProperty, Namespace, Program, Scalar } from "@typespec/compiler";
+import type { MetadataInfo } from "@typespec/http";
+import { getExternalDocs, resolveInfo } from "@typespec/openapi";
+import type { JsonSchemaModule } from "./json-schema.js";
+import type { OpenAPI3EmitterOptions, OpenAPIVersion } from "./lib.js";
+import {
+  applyEncoding as applyEncoding3_0,
+  getRawBinarySchema as getRawBinarySchema3_0,
+  isRawBinarySchema as isRawBinarySchema3_0,
+} from "./openapi-helpers-3-0.js";
+import {
+  applyEncoding as applyEncoding3_1,
+  getRawBinarySchema as getRawBinarySchema3_1,
+  isRawBinarySchema as isRawBinarySchema3_1,
+} from "./openapi-helpers-3-1.js";
+import type { ResolvedOpenAPI3EmitterOptions } from "./openapi.js";
+import { createSchemaEmitter3_0 } from "./schema-emitter-3-0.js";
+import { createSchemaEmitter3_1 } from "./schema-emitter-3-1.js";
+import { createSchemaEmitter3_2 } from "./schema-emitter-3-2.js";
+import type { SSEModule } from "./sse-module.js";
+import type { OpenAPI3Schema, OpenAPISchema3_1, SupportedOpenAPIDocuments } from "./types.js";
+import type { VisibilityUsageTracker } from "./visibility-usage.js";
+import type { XmlModule } from "./xml-module.js";
+
+export type CreateSchemaEmitter = (props: {
+  program: Program;
+  context: EmitContext<OpenAPI3EmitterOptions>;
+  metadataInfo: MetadataInfo;
+  visibilityUsage: VisibilityUsageTracker;
+  options: ResolvedOpenAPI3EmitterOptions;
+  optionalDependencies: {
+    jsonSchemaModule?: JsonSchemaModule;
+    xmlModule?: XmlModule;
+    sseModule?: SSEModule;
+  };
+}) => AssetEmitter<OpenAPI3Schema | OpenAPISchema3_1, OpenAPI3EmitterOptions>;
+
+export interface OpenApiSpecSpecificProps {
+  applyEncoding(
+    program: Program,
+    typespecType: Scalar | ModelProperty,
+    target: OpenAPI3Schema,
+    options: ResolvedOpenAPI3EmitterOptions,
+  ): OpenAPI3Schema & OpenAPISchema3_1;
+  createRootDoc: (
+    program: Program,
+    serviceType: Namespace,
+    serviceVersion?: string,
+  ) => SupportedOpenAPIDocuments;
+
+  createSchemaEmitter: CreateSchemaEmitter;
+  /**
+   * Returns the binary description for an unencoded binary type
+   * @see https://spec.openapis.org/oas/v3.1.1.html#migrating-binary-descriptions-from-oas-3-0
+   */
+  getRawBinarySchema(contentType?: string): OpenAPI3Schema | OpenAPISchema3_1;
+
+  isRawBinarySchema(schema: OpenAPI3Schema | OpenAPISchema3_1): boolean;
+}
+
+export function getOpenApiSpecProps(specVersion: OpenAPIVersion): OpenApiSpecSpecificProps {
+  switch (specVersion) {
+    case "3.0.0":
+      return {
+        applyEncoding: applyEncoding3_0,
+        createRootDoc(program, serviceType, serviceVersion) {
+          return createRoot(program, serviceType, specVersion, serviceVersion);
+        },
+        createSchemaEmitter: createSchemaEmitter3_0,
+        getRawBinarySchema: getRawBinarySchema3_0,
+        isRawBinarySchema: isRawBinarySchema3_0,
+      };
+    case "3.1.0":
+      return {
+        applyEncoding: applyEncoding3_1,
+        createRootDoc(program, serviceType, serviceVersion) {
+          return createRoot(program, serviceType, specVersion, serviceVersion);
+        },
+        createSchemaEmitter: createSchemaEmitter3_1,
+        getRawBinarySchema: getRawBinarySchema3_1,
+        isRawBinarySchema: isRawBinarySchema3_1,
+      };
+    case "3.2.0":
+      return {
+        applyEncoding: applyEncoding3_1,
+        createRootDoc(program, serviceType, serviceVersion) {
+          return createRoot(program, serviceType, specVersion, serviceVersion);
+        },
+        createSchemaEmitter: createSchemaEmitter3_2,
+        getRawBinarySchema: getRawBinarySchema3_1,
+        isRawBinarySchema: isRawBinarySchema3_1,
+      };
+  }
+}
+
+function createRoot(
+  program: Program,
+  serviceType: Namespace,
+  specVersion: OpenAPIVersion,
+  serviceVersion?: string,
+): SupportedOpenAPIDocuments {
+  const info = resolveInfo(program, serviceType);
+
+  // Handle license identifier: for OpenAPI 3.0, use x-oai-license-identifier extension
+  let processedInfo = info;
+  if (info?.license?.identifier !== undefined && specVersion === "3.0.0") {
+    const { identifier, ...restLicense } = info.license;
+    processedInfo = {
+      ...info,
+      license: { ...restLicense, "x-oai-license-identifier": identifier },
+    };
+  }
+
+  return {
+    openapi: specVersion,
+    info: {
+      title: "(title)",
+      ...processedInfo,
+      version: serviceVersion ?? info?.version ?? "0.0.0",
+    },
+    externalDocs: getExternalDocs(program, serviceType),
+    tags: [],
+    paths: {},
+    security: undefined,
+    components: {
+      parameters: {},
+      requestBodies: {},
+      responses: {},
+      schemas: {},
+      examples: {},
+      securitySchemes: {},
+    },
+  };
+}

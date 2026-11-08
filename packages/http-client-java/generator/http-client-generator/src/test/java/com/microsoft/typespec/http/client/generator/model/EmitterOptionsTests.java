@@ -1,0 +1,75 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package com.microsoft.typespec.http.client.generator.model;
+
+import io.clientcore.core.serialization.json.JsonReader;
+import java.io.IOException;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+public final class EmitterOptionsTests {
+
+    @Test
+    public void testExperimentalAnnotation() throws IOException {
+        EmitterOptions options
+            = EmitterOptions.fromJson(JsonReader.fromString("{\"experimental-annotation\":\"com.example.Preview\"}"));
+        Assertions.assertEquals("com.example.Preview", options.getExperimentalAnnotation());
+    }
+
+    @Test
+    public void testExperimentalAnnotationIsOptIn() throws IOException {
+        EmitterOptions options = EmitterOptions.fromJson(JsonReader.fromString("{}"));
+        Assertions.assertNull(options.getExperimentalAnnotation());
+    }
+
+    @Test
+    public void testMaxOverload() throws IOException {
+        EmitterOptions options = EmitterOptions.fromJson(JsonReader.fromString("{\"max-overload\":\"model\"}"));
+        Assertions.assertEquals("model", options.getMaxOverload());
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+        strings = {
+            // JSON form
+            "{\"rename-model\":{\"TopLevelArmResourceListResult\":\"ResourceListResult\",\"CustomTemplateResourcePropertiesAnonymousEmptyModel\":\"AnonymousEmptyModel\"}}",
+            // Compact form
+            "{\"rename-model\":\"TopLevelArmResourceListResult:ResourceListResult,CustomTemplateResourcePropertiesAnonymousEmptyModel:AnonymousEmptyModel\"}" })
+    public void testRenameModel(String json) throws IOException {
+        EmitterOptions options = EmitterOptions.fromJson(JsonReader.fromString(json));
+        Assertions.assertEquals(2, options.getRenameModel().split(",").length);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "{\"rename-model\":[]}", "{\"rename-model\":1}" })
+    public void invalidRenameModel(String json) {
+        Assertions.assertThrows(IllegalStateException.class,
+            () -> EmitterOptions.fromJson(JsonReader.fromString(json)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+        strings = {
+            "{\"remove-inner\":[\"NginxConfigurationResponse\"]}", // array form
+            "{\"remove-inner\":\"NginxConfigurationResponse\"}" // string form
+        })
+    public void testRemoveInner(String json) throws IOException {
+        EmitterOptions options = EmitterOptions.fromJson(JsonReader.fromString(json));
+        Assertions.assertEquals(1, options.getRemoveInner().split(",").length);
+        Assertions.assertEquals("NginxConfigurationResponse", options.getRemoveInner());
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+        strings = {
+            "{\"remove-model\":[\"VirtualMachineExtensionImage\",\"VirtualMachineImage\"]}",
+            "{\"remove-model\":\"VirtualMachineExtensionImage,VirtualMachineImage\"}" })
+    public void testRemoveModel(String json) throws IOException {
+        EmitterOptions options = EmitterOptions.fromJson(JsonReader.fromString(json));
+        Assertions.assertEquals(2, options.getRemoveModel().split(",").length);
+        Assertions.assertEquals("VirtualMachineExtensionImage,VirtualMachineImage", options.getRemoveModel());
+    }
+}

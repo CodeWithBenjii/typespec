@@ -1,0 +1,147 @@
+import { isArray } from "../../utils/misc.js";
+import type { Enum, Interface, Model, Namespace, Operation, Tuple, Type, Union } from "../types.js";
+
+/** Bit flags describing whether a tracked type occurs in operation inputs, outputs, or both. */
+// prettier-ignore
+export enum UsageFlags {
+  /** Neither input nor output usage. */
+  None   = 0,
+  /** Reachable from an operation's parameter model. */
+  Input  = 1 << 1,
+  /** Reachable from an operation's return type. */
+  Output = 1 << 2,
+}
+
+/** Type kinds for which {@link resolveUsages} records input and output usage. */
+export type TrackableType = Model | Enum | Union | Tuple;
+
+/** Usage information collected from the operations supplied to {@link resolveUsages}. */
+export interface UsageTracker {
+  /** Encountered types in first-discovery order, with each type appearing once. */
+  readonly types: readonly TrackableType[];
+  /** Whether a tracked type has any of the requested usage flags; untracked types return false. */
+  isUsedAs(type: TrackableType, usage: UsageFlags): boolean;
+}
+
+/** An operation, or a container whose operations can serve as usage-analysis entry points. */
+export type OperationContainer = Namespace | Interface | Operation;
+/**
+ * Resolve usage(input, output or both) of various types in the given namespace.
+ * Will recursively scan all namespace, interfaces and operations contained inside the namespace.
+ * @param types Entrypoint(s) namespace, interface or operations to get usage from.
+ * @returns Map of types to usage.
+ */
+export function resolveUsages(types: OperationContainer | OperationContainer[]): UsageTracker {
+  const usages = new Map<TrackableType, UsageFlags>();
+  if (isArray(types)) {
+    for (const item of types) {
+      addUsagesInContainer(item, usages);
+    }
+  } else {
+    addUsagesInContainer(types, usages);
+  }
+
+  return {
+    types: [...usages.keys()],
+    isUsedAs: (type: TrackableType, usage) => {
+      const used = usages.get(type);
+      if (used === undefined) {
+        return false;
+      }
+      return Boolean(used & usage);
+    },
+  };
+}
+
+function addUsagesInContainer(type: OperationContainer, usages: Map<TrackableType, UsageFlags>) {
+  switch (type.kind) {
+    case "Namespace":
+      addUsagesInNamespace(type, usages);
+      break;
+    case "Interface":
+      addUsagesInInterface(type, usages);
+      break;
+    case "Operation":
+      addUsagesInOperation(type, usages);
+      break;
+  }
+}
+
+function trackUsage(
+  usages: Map<TrackableType, UsageFlags>,
+  type: TrackableType,
+  usage: UsageFlags,
+) {
+  const existingFlag = usages.get(type) ?? UsageFlags.None;
+  usages.set(type, existingFlag | usage);
+}
+
+function addUsagesInNamespace(namespace: Namespace, usages: Map<TrackableType, UsageFlags>): void {
+  for (const subNamespace of namespace.namespaces.values()) {
+    addUsagesInNamespace(subNamespace, usages);
+  }
+  for (const Interface of namespace.interfaces.values()) {
+    addUsagesInInterface(Interface, usages);
+  }
+  for (const operation of namespace.operations.values()) {
+    addUsagesInOperation(operation, usages);
+  }
+}
+
+function addUsagesInInterface(Interface: Interface, usages: Map<TrackableType, UsageFlags>): void {
+  for (const operation of Interface.operations.values()) {
+    addUsagesInOperation(operation, usages);
+  }
+}
+
+function addUsagesInOperation(operation: Operation, usages: Map<TrackableType, UsageFlags>): void {
+  navigateReferencedTypes(operation.parameters, (type) =>
+    trackUsage(usages, type, UsageFlags.Input),
+  );
+  navigateReferencedTypes(operation.returnType, (type) =>
+    trackUsage(usages, type, UsageFlags.Output),
+  );
+}
+
+function navigateReferencedTypes(
+  type: Type,
+  callback: (type: TrackableType) => void,
+  visited: Set<Type> = new Set(),
+) {
+  if (visited.has(type)) {
+    return;
+  }
+  visited.add(type);
+  switch (type.kind) {
+    case "Model":
+      callback(type);
+      navigateIterable(type.properties, callback, visited);
+      navigateIterable(type.derivedModels, callback, visited);
+      type.indexer?.value && navigateReferencedTypes(type.indexer.value, callback, visited);
+      break;
+    case "ModelProperty":
+      navigateReferencedTypes(type.type, callback, visited);
+      break;
+    case "Union":
+      callback(type);
+      navigateIterable(type.variants, callback, visited);
+      break;
+    case "UnionVariant":
+      navigateReferencedTypes(type.type, callback, visited);
+      break;
+    case "Enum":
+    case "Tuple":
+      callback(type);
+      break;
+  }
+}
+
+function navigateIterable<T extends Type>(
+  map: Map<string | symbol, T> | T[],
+  callback: (type: TrackableType) => void,
+  visited: Set<Type> = new Set(),
+) {
+  for (const type of map.values()) {
+    navigateReferencedTypes(type, callback, visited);
+  }
+}

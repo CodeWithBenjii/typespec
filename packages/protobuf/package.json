@@ -1,0 +1,68 @@
+{
+  "name": "@typespec/protobuf",
+  "version": "0.87.0",
+  "author": "Microsoft Corporation",
+  "description": "TypeSpec library and emitter for Protobuf (gRPC)",
+  "homepage": "https://github.com/microsoft/typespec",
+  "readme": "https://github.com/microsoft/typespec/blob/main/packages/protobuf/README.md",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/microsoft/typespec.git"
+  },
+  "bugs": {
+    "url": "https://github.com/microsoft/typespec/issues"
+  },
+  "keywords": [
+    "typespec",
+    "protobuf",
+    "grpc"
+  ],
+  "main": "dist/src/index.js",
+  "exports": {
+    ".": {
+      "typespec": "./lib/proto.tsp",
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./testing": "./dist/src/testing/index.js"
+  },
+  "type": "module",
+  "tspMain": "lib/proto.tsp",
+  "files": [
+    "lib/*.tsp",
+    "dist/**",
+    "!dist/test/**"
+  ],
+  "scripts": {
+    "clean": "rimraf ./dist ./temp",
+    "build": "pnpm gen-extern-signature && tsc -p tsconfig.build.json && pnpm lint-typespec-library",
+    "lint-typespec-library": "tsp compile . --warn-as-error --import @typespec/library-linter --no-emit",
+    "watch": "tsc -p tsconfig.build.json --watch",
+    "gen-extern-signature": "tspd --enable-experimental gen-extern-signature .",
+    "test": "vitest run",
+    "test:ci": "vitest run --coverage --reporter=junit --reporter=default",
+    "lint": "oxlint . --deny-warnings",
+    "lint:fix": "oxlint . --fix",
+    "regen-docs": "tspd doc .  --enable-experimental --llmstxt --output-dir ../../website/src/content/docs/docs/emitters/protobuf/reference"
+  },
+  "dependencies": {
+    "change-case": "catalog:"
+  },
+  "peerDependencies": {
+    "@typespec/compiler": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/micromatch": "catalog:",
+    "@types/node": "catalog:",
+    "@typespec/compiler": "workspace:^",
+    "@typespec/library-linter": "workspace:^",
+    "@typespec/tspd": "workspace:^",
+    "@vitest/coverage-v8": "catalog:",
+    "@vitest/ui": "catalog:",
+    "micromatch": "catalog:",
+    "rimraf": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

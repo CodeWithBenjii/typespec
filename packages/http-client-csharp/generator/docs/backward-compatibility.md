@@ -1,0 +1,1283 @@
+# Backward Compatibility Support
+
+## Table of Contents
+
+- [Overview](#overview)
+- [How It Works](#how-it-works)
+- [Experimental Types](#experimental-types)
+- [Supported Scenarios](#supported-scenarios)
+  - [Model Factory Methods](#model-factory-methods)
+    - [New Model Property Added](#scenario-new-model-property-added)
+    - [Parameter Ordering Changed](#scenario-parameter-ordering-changed)
+    - [Property Renamed](#scenario-property-renamed)
+    - [New Property Added Together with a Rename](#scenario-new-property-added-together-with-a-rename)
+  - [Model Properties](#model-properties)
+  - [AdditionalProperties Type Preservation](#additionalproperties-type-preservation)
+  - [Fixed Enum Members](#fixed-enum-members)
+    - [Explicit (Non-contiguous) Values Preserved](#scenario-explicit-non-contiguous-values-preserved)
+    - [Removed Integer Enum Member Re-added](#scenario-removed-integer-enum-member-re-added)
+    - [Baseline-Accepted Removal Honored](#scenario-baseline-accepted-removal-honored)
+  - [Extensible Enum Members](#extensible-enum-members)
+    - [Removed Extensible Enum Member Re-added](#scenario-removed-extensible-enum-member-re-added)
+  - [API Version Enum](#api-version-enum)
+  - [Non-abstract Base Models](#non-abstract-base-models)
+  - [Model Base Types](#model-base-types)
+  - [Model Constructors](#model-constructors)
+    - [Required Property Becomes Optional](#scenario-required-property-becomes-optional)
+    - [Parameterless Constructor Becomes Parameterized](#scenario-parameterless-constructor-becomes-parameterized)
+    - [Constructor Parameter Name Restored by Signature Match](#scenario-constructor-parameter-name-restored-by-signature-match)
+  - [Parameter Naming](#parameter-naming)
+    - [Page Size Parameter Casing Correction](#scenario-page-size-parameter-casing-correction)
+    - [Top Parameter Conversion to MaxCount](#scenario-top-parameter-conversion-to-maxcount)
+    - [Method Parameter Name Preserved from Last Contract](#scenario-method-parameter-name-preserved-from-last-contract)
+  - [Content-Type Parameter Ordering](#content-type-parameter-ordering)
+    - [Content-Type Before Body Preserved from Last Contract](#scenario-content-type-before-body-preserved-from-last-contract)
+  - [Client Methods](#client-methods)
+    - [Client Method Parameter Ordering Changed](#scenario-client-method-parameter-ordering-changed)
+    - [New Optional Non-Body Parameter Added to a Service Method](#scenario-new-optional-non-body-parameter-added-to-a-service-method)
+    - [Value-Type Parameter Nullability Removed](#scenario-value-type-parameter-nullability-removed)
+    - [Nullable Optional Parameter Became Required](#scenario-nullable-optional-parameter-became-required)
+
+## Overview
+
+The TypeSpec C# generator supports backward compatibility (back-compat) to ensure that existing client code continues to work when the service API evolves. This is achieved by comparing the current generated code against a previous contract (assembly) and automatically generating compatibility shims where needed.
+
+The backward compatibility system uses the `LastContractView` mechanism to access information about previously generated types, methods, and properties from the last released version of the library.
+
+## How It Works
+
+When generating code, the generator can optionally receive a compiled assembly from the previous version of the library (the "last contract"). The generator:
+
+1. Analyzes the current TypeSpec specification and generates types based on the current API
+2. Compares the generated types against the types in the last contract
+3. Automatically generates compatibility methods, properties, or enum members where differences are detected
+
+### Experimental Types
+
+Types in the last released contract marked with `System.Diagnostics.CodeAnalysis.ExperimentalAttribute` are excluded from backward-compatibility lookup. The generator does not preserve their previous type shape or restore their previous members as compatibility shims, allowing those types to change when they graduate to stable or are removed.
+
+This decision uses the attribute on the last released type, including polyfilled definitions of the attribute. Marking a previously stable type experimental in the current generation does not remove its compatibility guarantees. Experimental attributes on individual members in the last released contract also exclude those members from compatibility handling; attributes added only in the current generation do not remove guarantees for previously stable members.
+
+### ApiCompat Baseline Awareness
+
+Sometimes a breaking change (such as removing a model or a model factory method) is intentional and has already been reviewed and accepted. In the Azure SDK, such accepted breaking changes are recorded in an [ApiCompat](https://github.com/dotnet/sdk/tree/main/src/Compatibility) baseline (suppression) file, conventionally located at `eng/apicompatbaselines/<AssemblyName>.txt`.
+
+Without awareness of these files, the back-compat system would resurrect every member present in the last contract — re-introducing the very API that was intentionally removed (and potentially referencing types that no longer exist). To prevent this, the generator discovers the baseline file by walking up from the project directory and parses its `TypesMustExist`, `MembersMustExist`, and `EnumValuesMustMatch` suppressions. The back-compat code then consults the baseline in the following ways:
+
+- **Skipping resurrected members:** before regenerating a compatibility shim for a removed member, it checks whether the removal has been accepted in the baseline (matched by declaring-type full name, member name, and parameter count) and, if so, skips it.
+- **Allowing property type changes:** the back-compat system normally preserves a property's previous (last-contract) type to avoid a breaking change. When that previous type — or a type nested within it (e.g. the element type of a collection) — has itself been intentionally removed and accepted in the baseline, preserving it would reference a now-deleted type. In that case the generator allows the property to take its current (spec) type instead.
+- **Skipping re-added enum members:** before re-adding a fixed enum member that exists in the last contract but was dropped from the current spec, it checks whether that removal — or an accepted value difference recorded as `EnumValuesMustMatch` — has been accepted in the baseline (matched by the declaring enum's fully-qualified name and the member name) and, if so, omits the member.
+
+> [!NOTE]
+> Baseline awareness is currently wired into the base method back-compat path in `TypeProvider` (the parameter reorder/removal loop, inherited by `ClientProvider` and also used directly by `ModelFactoryProvider`), the model property type-preservation path (`ModelProvider`), and the fixed enum member path (`FixedEnumProvider`). The remaining back-compat consumers (`ModelProvider` constructors and `RestClientProvider`) can be made baseline-aware in the same way as a follow-up.
+
+## Supported Scenarios
+
+### Model Factory Methods
+
+Model factory methods are public static methods that enable creating model instances for mocking and testing purposes. The generator attempts to maintain backward compatibility for these methods across API changes.
+
+#### Scenario: New Model Property Added
+
+**Description:** When a new property is added to a model, the generator creates a backward-compatible factory method overload that excludes the new parameter.
+
+**Example:**
+
+Previous version had a model with three properties:
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string stringProp = default,
+    Thing modelProp = default,
+    IEnumerable<string> listProp = default)
+```
+
+Current version adds a new property (`dictProp`):
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string stringProp = default,
+    Thing modelProp = default,
+    IEnumerable<string> listProp = default,
+    IDictionary<string, string> dictProp = default)
+```
+
+**Generated Compatibility Method:**
+
+```csharp
+[EditorBrowsable(EditorBrowsableState.Never)]
+public static PublicModel1 PublicModel1(
+    string stringProp,
+    Thing modelProp,
+    IEnumerable<string> listProp)
+{
+    return PublicModel1(stringProp, modelProp, listProp, dictProp: default);
+}
+```
+
+**Key Points:**
+
+- The old method signature is preserved
+- It delegates to the new method with default value for the new parameter
+- Parameters in the compatibility method have no default values to avoid ambiguous call sites
+- The method is marked with `[EditorBrowsable(EditorBrowsableState.Never)]` to hide it from IntelliSense
+
+#### Scenario: Parameter Ordering Changed
+
+**Description:** When only the parameter ordering changes in a factory method (same parameters, different order), the generator replaces the current method with the previous method signature.
+
+**Example:**
+
+Previous version:
+
+```csharp
+public static PublicModel1 PublicModel1(
+    Thing modelProp = default,
+    string stringProp = default,
+    IEnumerable<string> listProp = default,
+    IDictionary<string, string> dictProp = default)
+```
+
+Current version would generate different ordering:
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string stringProp = default,
+    Thing modelProp = default,
+    IEnumerable<string> listProp = default,
+    IDictionary<string, string> dictProp = default)
+```
+
+**Result:** The generator keeps the previous parameter ordering to maintain compatibility.
+
+#### Scenario: Property Renamed
+
+**Description:** When a model property is renamed (via `@@clientName`, a spec rename, a generator naming-rule change, etc.), the generated factory parameter would normally change its name to follow the new property name. Renaming a parameter is source-breaking for callers using named arguments and is not flagged by ApiCompat / binary-compat tooling. To avoid this, the generator preserves the previous parameter name on the current factory method whenever the only difference between the previous and current method is one or more parameter names (same method name, same parameter types in the same order, same parameter count).
+
+**Example:**
+
+Previous version exposed `stringProp` and `modelProp`:
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string stringProp = default,
+    Thing modelProp = default,
+    IEnumerable<string> listProp = default,
+    IDictionary<string, string> dictProp = default)
+```
+
+Current TypeSpec renames the underlying properties to `CertificateStringProp` and `CertificateModelProp`, which would normally produce:
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string certificateStringProp = default,
+    Thing certificateModelProp = default,
+    IEnumerable<string> listProp = default,
+    IDictionary<string, string> dictProp = default)
+```
+
+**Generated Compatibility Result:**
+
+The generator detects that previous and current methods differ only in parameter names and preserves the previous names on the current method:
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string stringProp = default,
+    Thing modelProp = default,
+    IEnumerable<string> listProp = default,
+    IDictionary<string, string> dictProp = default)
+{
+    // body uses the preserved names when constructing the model
+    return new PublicModel1(stringProp, modelProp, listProp.ToList(), dictProp, additionalBinaryDataProperties: null);
+}
+```
+
+**Key Points:**
+
+- Only one method is generated — no additional `[EditorBrowsable(EditorBrowsableState.Never)]` overload is needed
+- Existing source code using named arguments (e.g. `PublicModel1(stringProp: "x")`) continues to compile
+- The matching is by method name plus parameter types in the same order; the parameter count must also match. If a parameter is added or removed in addition to a rename, the standard "new property added" overload is generated instead (see scenario below)
+- The XML doc `<param>` entries on the method are updated to reference the preserved names
+
+#### Scenario: New Property Added Together with a Rename
+
+**Description:** When a new property is added to a model AND a previously-published property has been renamed at the same time, the parameter counts of the previous and current factory methods differ, so the rename-only fast path above does not apply. The generator falls back to the standard "new property added" flow and emits an `[EditorBrowsable(EditorBrowsableState.Never)]` backcompat overload using the previously-published parameter names.
+
+> [!NOTE]
+> The body of the backcompat overload constructs the model directly. Renamed parameters whose names no longer match a current property are passed as `default` to the constructor, since the body can no longer thread them through the renamed properties. This keeps existing source compiling, but callers who depended on the old parameter being forwarded should migrate to the current method.
+
+**Example:**
+
+Previous version exposed three properties, with the first two under different names:
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string oldStringProp = default,
+    Thing oldModelProp = default,
+    IEnumerable<string> listProp = default)
+```
+
+Current TypeSpec renames the first two properties (now `stringProp` / `modelProp`) and adds a new property (`dictProp`):
+
+```csharp
+public static PublicModel1 PublicModel1(
+    string stringProp = default,
+    Thing modelProp = default,
+    IEnumerable<string> listProp = default,
+    IDictionary<string, string> dictProp = default)
+```
+
+**Generated Compatibility Method:**
+
+```csharp
+[EditorBrowsable(EditorBrowsableState.Never)]
+public static PublicModel1 PublicModel1(
+    string oldStringProp,
+    Thing oldModelProp,
+    IEnumerable<string> listProp)
+{
+    listProp ??= new ChangeTrackingList<string>();
+
+    return new PublicModel1(default, default, listProp.ToList(), default, additionalBinaryDataProperties: null);
+}
+```
+
+**Key Points:**
+
+- The previous (renamed) signature is preserved so existing source code continues to compile
+- Parameters whose names matched a current property (`listProp`) are threaded through; renamed parameters are passed as `default`
+- The new property is also passed as `default`
+- A separate visible method exposes the current signature with the new property and the renamed parameters
+
+### Model Properties
+
+The generator preserves the previous property type whenever it differs from the type produced by the current spec. This applies to all public model properties (scalars, enums, models, and collections), so any property type change is non-source-breaking by default. Users who want the new spec's type to take effect can override this behavior with custom code.
+
+#### Scenario: Collection Property Type Changed
+
+**Description:** When a property type changes from a read-only collection to a read-write collection (or vice versa), the generator preserves the previous property type to avoid breaking changes.
+
+**Example:**
+
+Previous version:
+
+```csharp
+public IReadOnlyList<string> Items { get; }
+```
+
+Current TypeSpec would generate:
+
+```csharp
+public IList<string> Items { get; set; }
+```
+
+**Result:** The generator detects the type mismatch and preserves the previous type:
+
+```csharp
+public IReadOnlyList<string> Items { get; }
+```
+
+#### Scenario: Scalar/Model Property Type Changed
+
+**Description:** When the type of a scalar, enum, or model property differs between the last contract and the current spec, the generator preserves the last contract's type shape. Nullable value-type differences also preserve the last contract's nullability.
+
+Reference types loaded from the last contract are nullable-oblivious, so their top-level nullability is not used as compatibility evidence. The generator retains the current TypeSpec top-level reference nullability while preserving any other last-contract type differences, including nested generic argument types. This prevents compatibility processing from adding null guards or null-unsafe collection conversions that contradict the current wire contract.
+
+**Example:**
+
+Previous version:
+
+```csharp
+public int? Count { get; set; }
+```
+
+Current TypeSpec would generate:
+
+```csharp
+public int Count { get; set; }
+```
+
+**Result:** The generator detects the type mismatch and preserves the previous nullable type:
+
+```csharp
+public int? Count { get; set; }
+```
+
+A diagnostic message is logged for every overridden property: `"Changed property {ModelName}.{PropertyName} type to {LastContractType} to match last contract."`
+
+### AdditionalProperties Type Preservation
+
+The generator maintains backward compatibility for the `AdditionalProperties` property type on models that extend or use `Record<unknown>`.
+
+#### Scenario: AdditionalProperties Type Changed from Object to BinaryData
+
+**Description:** When a model with additional properties was previously generated with `IDictionary<string, object>`, but the current generator would produce `IDictionary<string, BinaryData>`, the generator preserves the previous `object` type to maintain backward compatibility.
+
+This commonly occurs when:
+
+- Migrating from an older generator version that used `object` for unknown additional property values
+- Regenerating a library that was originally created with `IDictionary<string, object>` for `Record<unknown>` types
+
+**Example:**
+
+Previous version generated with object type:
+
+```csharp
+public partial class MyModel
+{
+    private readonly IDictionary<string, object> _additionalBinaryDataProperties;
+
+    public MyModel(string name, IDictionary<string, object> additionalProperties)
+    {
+        Name = name;
+        _additionalBinaryDataProperties = additionalProperties;
+    }
+
+    public string Name { get; set; }
+    public IDictionary<string, object> AdditionalProperties { get; }
+}
+```
+
+Current TypeSpec would generate with BinaryData:
+
+```csharp
+public partial class MyModel
+{
+    private readonly IDictionary<string, BinaryData> _additionalBinaryDataProperties;
+
+    public MyModel(string name, IDictionary<string, BinaryData> additionalProperties)
+    {
+        Name = name;
+        _additionalBinaryDataProperties = additionalProperties;
+    }
+
+    public string Name { get; set; }
+    public IDictionary<string, BinaryData> AdditionalProperties { get; }
+}
+```
+
+**Generated Compatibility Result:**
+
+When the last contract had `IDictionary<string, object>`, the generator preserves the object type:
+
+```csharp
+public partial class MyModel
+{
+    private readonly IDictionary<string, object> _additionalBinaryDataProperties;
+
+    public MyModel(string name, IDictionary<string, object> additionalProperties)
+    {
+        Name = name;
+        _additionalBinaryDataProperties = additionalProperties;
+    }
+
+    public string Name { get; set; }
+    public IDictionary<string, object> AdditionalProperties { get; }
+}
+```
+
+**Key Points:**
+
+- Applies to models with `AdditionalProperties` defined via `Record<unknown>` or similar patterns
+- The backing field type is changed from `IDictionary<string, BinaryData>` to `IDictionary<string, object>`
+- The property type matches the backing field type to avoid compilation errors
+- Serialization and deserialization automatically handle both `object` and `BinaryData` types
+- For object types, deserialization uses `JsonElement.GetObject()` instead of wrapping in `BinaryData`
+- For object types, serialization uses `Utf8JsonWriter.WriteObjectValue<object>()` to handle arbitrary values
+- Binary compatibility is fully maintained - existing client code continues to work without recompilation
+
+### Fixed Enum Members
+
+Fixed enums (C# `enum` types) preserve their previously shipped members and values by comparing the current spec against the last contract. Because the underlying value of an integer-backed enum member is part of its public API, the generator keeps those values stable across regenerations, aligns member order to the last contract, and re-adds members that were dropped from the current spec.
+
+> [!NOTE]
+> These behaviors apply to **integer-backed** fixed enums (`int`/`long`).
+
+#### Scenario: Explicit (Non-contiguous) Values Preserved
+
+**Description:** When an integer enum's members carry explicit, non-contiguous values, the generator preserves each member's exact value from the last contract instead of reassigning positional ordinals.
+
+**Example:**
+
+Previous version (GA surface):
+
+```csharp
+public enum CapacityReservationLevel
+{
+    OneHundred = 100,
+    TwoHundred = 200,
+    FiveHundred = 500,
+}
+```
+
+**Generated Result:** The members keep their exact values (`100`, `200`, `500`) rather than being reassigned to `0`, `1`, `2`.
+
+#### Scenario: Removed Integer Enum Member Re-added
+
+**Description:** When an integer enum member present in the last contract is dropped from the current spec, the generator re-adds it — at its original position and with its original explicit value — to avoid removing a previously shipped member.
+
+**Example:**
+
+Previous version:
+
+```csharp
+public enum SampleEnum
+{
+    Alpha = 0,
+    Beta = 1,
+    Gamma = 2,
+}
+```
+
+Current TypeSpec removes `Beta`:
+
+```csharp
+public enum SampleEnum
+{
+    Alpha = 0,
+    Gamma = 2,
+}
+```
+
+**Generated Result:** `Beta` is re-added at its original position with its original value:
+
+```csharp
+public enum SampleEnum
+{
+    Alpha = 0,
+    Beta = 1,
+    Gamma = 2,
+}
+```
+
+**Key Points:**
+
+- Members shared between the current spec and the last contract are ordered to match the last contract and keep their last-contract values
+- New members introduced by the current spec are appended after the last-contract members, keeping their spec values
+- The re-added member's underlying value is read from the previously published assembly's metadata (no debug symbols required)
+
+#### Scenario: Baseline-Accepted Removal Honored
+
+**Description:** When the removal of an enum member has been intentionally accepted in the [ApiCompat baseline](#apicompat-baseline-awareness) — recorded as a `MembersMustExist` removal or an `EnumValuesMustMatch` value-difference suppression — the generator honors that decision and does **not** re-add the member.
+
+**Key Points:**
+
+- Suppressed members are matched by the declaring enum's fully-qualified name and the member name
+- This lets a library intentionally drop a previously shipped enum member once the removal is reviewed and recorded in the baseline
+
+### Extensible Enum Members
+
+Extensible enums (C# `readonly partial struct` types) preserve their previously shipped members by comparing the current spec against the last contract. The generator re-adds an extensible enum member that was dropped from the current spec, restoring it with its original wire value to avoid removing a previously shipped member.
+
+#### Scenario: Removed Extensible Enum Member Re-added
+
+**Description:** When an extensible enum member present in the last contract is dropped from the current spec, the generator restores it — as a public static property backed by its recovered `const` wire value — to keep the previously shipped API.
+
+**Example:**
+
+Previous version:
+
+```csharp
+public readonly partial struct OperationStatusType : IEquatable<OperationStatusType>
+{
+    private const string CompletedValue = "Completed";
+    private const string FailedValue = "Failed";
+    private const string RunningValue = "Running";
+
+    public static OperationStatusType Completed { get; } = new OperationStatusType(CompletedValue);
+    public static OperationStatusType Failed { get; } = new OperationStatusType(FailedValue);
+    public static OperationStatusType Running { get; } = new OperationStatusType(RunningValue);
+    // ...
+}
+```
+
+Current TypeSpec removes `Running`. **Generated Result:** `Running` is re-added (appended after the current members) with its original wire value:
+
+```csharp
+public readonly partial struct OperationStatusType : IEquatable<OperationStatusType>
+{
+    private const string CompletedValue = "Completed";
+    private const string FailedValue = "Failed";
+    private const string RunningValue = "Running";
+
+    public static OperationStatusType Completed { get; } = new OperationStatusType(CompletedValue);
+    public static OperationStatusType Failed { get; } = new OperationStatusType(FailedValue);
+    public static OperationStatusType Running { get; } = new OperationStatusType(RunningValue);
+    // ...
+}
+```
+
+**Key Points:**
+
+- Members that already exist in the current spec, are provided by custom code, or whose removal is accepted in the [ApiCompat baseline](#apicompat-baseline-awareness) are not re-added
+- Restored members are appended after the current spec's members, preserving the current spec's order
+
+### API Version Enum
+
+Service version enums maintain backward compatibility by preserving version values from previous releases.
+
+#### Scenario: API Version Removed or Changed
+
+**Description:** When API versions are removed or changed in the TypeSpec, the generator preserves previous version enum members to prevent breaking existing code that references them.
+
+**Example:**
+
+Previous version had enum members:
+
+```csharp
+public enum ServiceVersion
+{
+    V2021_10_01 = 1,
+    V2022_01_01 = 2,
+    V2022_06_01 = 3,
+}
+```
+
+Current TypeSpec removes `V2021_10_01` and adds `V2023_01_01`:
+
+```csharp
+public enum ServiceVersion
+{
+    V2022_01_01 = 1,
+    V2022_06_01 = 2,
+    V2023_01_01 = 3,
+}
+```
+
+**Generated Result:**
+
+```csharp
+public enum ServiceVersion
+{
+    V2021_10_01 = 1,  // Preserved from previous version
+    V2022_01_01 = 2,
+    V2022_06_01 = 3,
+    V2023_01_01 = 4,
+}
+```
+
+**Key Points:**
+
+- Previous enum members are preserved even if removed from TypeSpec
+- Enum values are re-indexed to maintain sequential ordering
+- Version format and separator are detected from current versions and applied to previous versions
+
+### Non-abstract Base Models
+
+#### Scenario: The previous version of a base model was defined as non-abstract.
+
+**Description:** This can occur if the library was generated using a different generator that supported non-abstract base models. In such cases, the generator preserves the non-abstract nature of the base model to maintain compatibility.
+
+**Example:**
+
+Previous version generated using a different generator:
+
+```csharp
+public class BaseModel
+{
+    public string CommonProperty { get; set; }
+}
+```
+
+Current TypeSpec would generate:
+
+```csharp
+public class BaseModel
+{
+    public string CommonProperty { get; set; }
+}
+```
+
+### Model Constructors
+
+The generator maintains backward compatibility for model constructors on abstract base types to prevent breaking changes when constructor accessibility changes.
+
+#### Scenario: Public Constructor on Abstract Base Type
+
+**Description:** When an abstract base type had a public constructor in the previous version, but the current TypeSpec generation would create a `private protected` constructor, the generator automatically changes the modifier to `public` to maintain backward compatibility.
+
+This commonly occurs when:
+
+- Migrating from autorest-generated code to TypeSpec-generated code
+- Abstract base types with discriminators had public parameterless constructors in previous versions
+
+**Example:**
+
+Previous version had a public parameterless constructor:
+
+```csharp
+public abstract partial class SearchIndexerDataIdentity
+{
+    /// <summary> Initializes a new instance of SearchIndexerDataIdentity. </summary>
+    public SearchIndexerDataIdentity()
+    {
+    }
+}
+```
+
+Current TypeSpec would generate a private protected constructor:
+
+```csharp
+public abstract partial class SearchIndexerDataIdentity
+{
+    /// <summary> Initializes a new instance of SearchIndexerDataIdentity. </summary>
+    /// <param name="odataType"> A URI fragment specifying the type of identity. </param>
+    private protected SearchIndexerDataIdentity(string odataType)
+    {
+        OdataType = odataType;
+    }
+}
+```
+
+**Generated Compatibility Result:**
+
+When a matching public constructor exists in the last contract, the modifier is changed from `private protected` to `public`:
+
+```csharp
+public abstract partial class SearchIndexerDataIdentity
+{
+    /// <summary> Initializes a new instance of SearchIndexerDataIdentity. </summary>
+    /// <param name="odataType"> A URI fragment specifying the type of identity. </param>
+    public SearchIndexerDataIdentity(string odataType)
+    {
+        OdataType = odataType;
+    }
+}
+```
+
+**Key Points:**
+
+- Only applies to abstract base types
+- The constructor must have matching parameters (same count, types, and names)
+- The modifier is changed from `private protected` to `public`
+- No additional constructors are generated; only the accessibility is adjusted
+
+#### Scenario: Required Property Becomes Optional
+
+**Description:** When a required model property becomes optional, the current initialization constructor no longer includes that property. To preserve source compatibility for callers that construct the model positionally, the generator restores the previously published public constructor as an overload. The restored overload chains to the closest current public constructor and assigns the now-optional property.
+
+**Example:**
+
+Previous version required both properties:
+
+```csharp
+public partial class Widget
+{
+    public Widget(string name, string description)
+    {
+        Name = name;
+        Description = description;
+    }
+
+    public string Name { get; }
+    public string Description { get; }
+}
+```
+
+Current TypeSpec makes `description` optional:
+
+```csharp
+public partial class Widget
+{
+    public Widget(string name)
+    {
+        Name = name;
+    }
+
+    public string Name { get; }
+    public string Description { get; set; }
+}
+```
+
+**Generated Compatibility Result:**
+
+```csharp
+public Widget(string name, string description) : this(name)
+{
+    Description = description;
+}
+```
+
+**Key Points:**
+
+- The previous constructor must be public and no generated or custom constructor may already have the same parameters.
+- Every parameter removed from the current constructor must map to a public, settable property with the same type. Properties renamed through a code-generation customization are supported.
+- The current constructor used for chaining must have parameters that match an in-order subset of the previous constructor's parameters.
+- When no current public constructor is such an in-order subset, there is no safe chain target, so the previous constructor is not restored. A standalone constructor is not generated because it would bypass the current constructor's initialization (for example, the implicit `base()` call and inherited get-only properties).
+- If the constructor removal is accepted in an ApiCompat baseline, the generator does not restore it.
+
+#### Scenario: Parameterless Constructor Becomes Parameterized
+
+**Description:** When a model previously exposed an accessible parameterless constructor and a property later becomes required, generation replaces the parameterless constructor with one that accepts the required property. The generator restores the previous parameterless constructor and chains it to an appropriate current constructor with `default` values.
+
+**Example:**
+
+Previous version exposed a parameterless constructor:
+
+```csharp
+public partial class Widget
+{
+    protected Widget()
+    {
+    }
+
+    public string Name { get; set; }
+}
+```
+
+Current TypeSpec makes `name` required:
+
+```csharp
+public partial class Widget
+{
+    protected Widget(string name)
+    {
+        Name = name;
+    }
+
+    public string Name { get; }
+}
+```
+
+**Generated Compatibility Result:**
+
+```csharp
+protected Widget() : this(default)
+{
+}
+```
+
+**Key Points:**
+
+- The previous parameterless constructor must be accessible and no accessible generated or custom parameterless constructor may already exist.
+- The restored constructor retains the previous accessibility.
+- The generator prefers an accessible current constructor with the fewest required parameters as the chain target. When necessary, it can chain to a `private protected` initialization constructor.
+- The generated parameterless mocking constructor is removed so it does not duplicate the restored constructor.
+- If the constructor removal is accepted in an ApiCompat baseline, the generator does not restore it.
+
+#### Scenario: Constructor Parameter Name Restored by Signature Match
+
+**Description:** When a constructor keeps the same parameter types (in the same order and count) but one or more parameters would be renamed — because of a `@@clientName`, a spec/property rename, a generator naming-rule change, or a casing correction — the new names would appear on the generated constructor. Renaming a constructor parameter is source-breaking for callers using named arguments and is reported by ApiCompat as a `CP0017` parameter-name change, even though ordinary binary-compatibility checks may miss it. To avoid this, the generator matches the current constructor to the previously published one by signature and restores the previous parameter names.
+
+This covers straight renames, casing corrections, and parameter **swaps/rotations**. For a swap or rotation (every previous name is still present, just in a different position) the generator realigns the existing parameter objects to the previous positional order instead of renaming positionally, so a caller's named argument stays bound to the same property.
+
+**Example:**
+
+Previous version published `(name, vmSkuName)`:
+
+```csharp
+public MockInputModel(string name, string vmSkuName)
+{
+    Name = name;
+    VmSkuName = vmSkuName;
+}
+```
+
+Current TypeSpec orders the properties differently, which would normally produce `(vmSkuName, name)`. The generator restores the previous parameter order and names:
+
+```csharp
+public MockInputModel(string name, string vmSkuName)
+{
+    VmSkuName = vmSkuName;
+    Name = name;
+}
+```
+
+### Parameter Naming
+
+The generator maintains backward compatibility for parameter names to ensure that existing code continues to compile when parameter names are corrected, standardized, or converted to follow naming conventions.
+
+#### Scenario: Page Size Parameter Casing Correction
+
+**Description:** When a paging parameter name has incorrect casing in the TypeSpec (e.g., `maxpagesize` instead of `maxPageSize`), the generator handles it in two ways:
+
+1. **If the parameter exists in LastContractView**: The generator uses the exact casing from the previous version to maintain backward compatibility
+2. **If the parameter does NOT exist in LastContractView**: The generator normalizes common badly-cased variants to proper camelCase (e.g., `maxpagesize` → `maxPageSize`)
+
+This commonly occurs when:
+
+- TypeSpec defines a paging parameter with non-standard casing (e.g., all lowercase)
+- The generator needs to maintain API consistency while respecting the wire format
+- New paging operations need standardized parameter naming
+
+**Example:**
+
+**Case 1: Parameter exists in LastContractView - badly-cased is preserved (backward compatibility)**
+
+Previous version had badly-cased parameter name:
+
+```csharp
+public virtual AsyncPageable<Item> GetItemsAsync(int? maxpagesize = null, CancellationToken cancellationToken = default)
+{
+    HttpMessage CreateRequest()
+    {
+        var message = pipeline.CreateMessage();
+        var request = message.Request;
+        request.Method = RequestMethod.Get;
+        var uri = new RequestUriBuilder();
+        uri.Reset(endpoint);
+        uri.AppendPath("/items", false);
+        if (maxpagesize != null)
+        {
+            uri.AppendQuery("maxpagesize", maxpagesize.Value, true);  // Serialized name from spec
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+Current TypeSpec still defines parameter with bad casing:
+
+```typespec
+@query maxpagesize?: int32;  // Lowercase in spec
+```
+
+**Generated Compatibility Result:**
+
+The generator detects the parameter in LastContractView and preserves its exact badly-cased name to maintain backward compatibility:
+
+```csharp
+public virtual AsyncPageable<Item> GetItemsAsync(int? maxpagesize = null, CancellationToken cancellationToken = default)
+{
+    HttpMessage CreateRequest()
+    {
+        var message = pipeline.CreateMessage();
+        var request = message.Request;
+        request.Method = RequestMethod.Get;
+        var uri = new RequestUriBuilder();
+        uri.Reset(endpoint);
+        uri.AppendPath("/items", false);
+        if (maxpagesize != null)
+        {
+            uri.AppendQuery("maxpagesize", maxpagesize.Value, true);  // Still badly-cased for backward compatibility
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+**Case 2: Parameter does NOT exist in LastContractView - badly-cased is normalized**
+
+New paging operation with badly-cased parameter (no previous version):
+
+```typespec
+@query maxpagesize?: int32;  // Lowercase in spec
+```
+
+**Generated Result:**
+
+The generator normalizes the parameter name to proper camelCase since there's no previous version to maintain compatibility with:
+
+```csharp
+public virtual AsyncPageable<Item> GetItemsAsync(int? maxPageSize = null, CancellationToken cancellationToken = default)
+{
+    HttpMessage CreateRequest()
+    {
+        var message = pipeline.CreateMessage();
+        var request = message.Request;
+        request.Method = RequestMethod.Get;
+        var uri = new RequestUriBuilder();
+        uri.Reset(endpoint);
+        uri.AppendPath("/items", false);
+        if (maxPageSize != null)
+        {
+            uri.AppendQuery("maxpagesize", maxPageSize.Value, true);  // Serialized name still uses spec's casing
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+**Key Points:**
+
+- **Case 1 (Backward compatibility)**: If the parameter exists in LastContractView, its exact casing is preserved - even if badly-cased
+- **Case 2 (Normalization)**: If the parameter does NOT exist in LastContractView, badly-cased variants are normalized to proper camelCase
+- The HTTP query parameter always uses the original serialized name from the spec (e.g., `maxpagesize`)
+- Existing client code continues to compile without changes
+
+#### Scenario: Top Parameter Conversion to MaxCount
+
+**Description:** For paging operations, the generator converts the `top` parameter to `maxCount` to follow standard naming conventions. However, backward compatibility is maintained in two ways:
+
+1. **If the `top` parameter exists in LastContractView**: The generator preserves the `top` parameter name (with its exact casing) to maintain backward compatibility
+2. **If the `top` parameter does NOT exist in LastContractView**: The generator converts `top` to the standardized `maxCount` parameter name
+
+This commonly occurs when:
+
+- Migrating from an older API version or generator that used `top` for pagination limits
+- TypeSpec defines paging operations with a `top` parameter
+- The generator needs to standardize on `maxCount` while maintaining backward compatibility
+
+**Example:**
+
+**Case 1: Top parameter exists in LastContractView - preserved for backward compatibility**
+
+Previous version had `top` parameter:
+
+```csharp
+public virtual AsyncPageable<Item> GetItemsAsync(int? top = null, CancellationToken cancellationToken = default)
+{
+    HttpMessage CreateRequest()
+    {
+        var message = pipeline.CreateMessage();
+        var request = message.Request;
+        request.Method = RequestMethod.Get;
+        var uri = new RequestUriBuilder();
+        uri.Reset(endpoint);
+        uri.AppendPath("/items", false);
+        if (top != null)
+        {
+            uri.AppendQuery("top", top.Value, true);  // Serialized name from spec
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+Current TypeSpec still defines `top` parameter:
+
+```typespec
+op getItems(@query top?: int32): Page<Item>;
+```
+
+**Generated Compatibility Result:**
+
+The generator detects the `top` parameter in LastContractView and preserves it exactly to maintain backward compatibility:
+
+```csharp
+public virtual AsyncPageable<Item> GetItemsAsync(int? top = null, CancellationToken cancellationToken = default)
+{
+    HttpMessage CreateRequest()
+    {
+        var message = pipeline.CreateMessage();
+        var request = message.Request;
+        request.Method = RequestMethod.Get;
+        var uri = new RequestUriBuilder();
+        uri.Reset(endpoint);
+        uri.AppendPath("/items", false);
+        if (top != null)
+        {
+            uri.AppendQuery("top", top.Value, true);  // Still uses "top" for backward compatibility
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+**Case 2: Top parameter does NOT exist in LastContractView - converted to maxCount**
+
+New paging operation with `top` parameter (no previous version):
+
+```typespec
+op getItems(@query top?: int32): Page<Item>;
+```
+
+**Generated Result:**
+
+The generator converts the parameter name to standardized `maxCount` since there's no previous version to maintain compatibility with:
+
+```csharp
+public virtual AsyncPageable<Item> GetItemsAsync(int? maxCount = null, CancellationToken cancellationToken = default)
+{
+    HttpMessage CreateRequest()
+    {
+        var message = pipeline.CreateMessage();
+        var request = message.Request;
+        request.Method = RequestMethod.Get;
+        var uri = new RequestUriBuilder();
+        uri.Reset(endpoint);
+        uri.AppendPath("/items", false);
+        if (maxCount != null)
+        {
+            uri.AppendQuery("top", maxCount.Value, true);  // Serialized name still uses "top" from spec
+        }
+        // ...
+    }
+    // ...
+}
+```
+
+**Key Points:**
+
+- **Case 1 (Backward compatibility)**: If `top` parameter exists in LastContractView, its exact name and casing are preserved
+- **Case 2 (Standardization)**: If `top` parameter does NOT exist in LastContractView, it is converted to `maxCount` for consistency
+- The HTTP query parameter always uses the original serialized name from the spec (e.g., `top`)
+- This conversion is specific to paging operations only
+- Existing client code with `top` continues to compile without changes
+- New code benefits from the standardized `maxCount` naming convention
+
+#### Scenario: Method Parameter Name Preserved from Last Contract
+
+**Description:** When a service method parameter is renamed by the spec or by the generator (e.g., a `@@clientName`, a TypeSpec property rename, or a generator naming-rule change), the new name would normally appear on the generated convenience and protocol methods. Renaming a parameter is source-breaking for callers using named arguments and is not flagged by ApiCompat / binary-compat tooling. To avoid this, the generator looks up the parameter's original (spec) name in `LastContractView` and, when a previously-published parameter with that name exists on the matching method (matched by method name, allowing for the sync/async pair), restores the previously-published parameter name on the current method.
+
+This generalizes the paging-specific `top → maxCount` and page-size casing scenarios above so that any renamed parameter on any operation falls back to the prior published name.
+
+**Example:**
+
+Previous version exposed `oldParam` on `GetSomething`:
+
+```csharp
+public virtual ClientResult GetSomething(string oldParam, RequestOptions options = null)
+{
+    // ...
+}
+```
+
+Current TypeSpec renames the parameter to `newParam` (e.g., via `@@clientName` or a property rename), which would normally produce:
+
+```csharp
+public virtual ClientResult GetSomething(string newParam, RequestOptions options = null)
+{
+    // ...
+}
+```
+
+**Generated Compatibility Result:**
+
+The generator detects `oldParam` on the matching method in `LastContractView` and restores that name on the current method:
+
+```csharp
+public virtual ClientResult GetSomething(string oldParam, RequestOptions options = null)
+{
+    // body and HTTP request still use the spec's serialized name; only the public parameter name is preserved
+}
+```
+
+**Key Points:**
+
+- Lookup is scoped to the matching service method (allowing for the sync/async pair) so a parameter name shared across multiple methods cannot false-match another method's parameter
+- The HTTP query/path/header/body serialized name continues to use the spec's wire name — only the C# parameter identifier is restored
+- Existing source code using named arguments (e.g., `client.GetSomething(oldParam: "x")`) continues to compile
+- If no matching parameter is found in `LastContractView`, the generator uses the current (renamed) name
+
+### Content-Type Parameter Ordering
+
+The generator places the `contentType` parameter after the body (`content`) parameter in method signatures. However, backward compatibility is maintained when the last contract had a different ordering.
+
+#### Scenario: Content-Type Before Body Preserved from Last Contract
+
+**Description:** The generator places `contentType` after the `content` (body) parameter. However, if the last contract had `contentType` before `content`, the generator preserves that ordering to avoid breaking existing code.
+
+This commonly occurs when a library was previously generated with contentType before body and has already been released (GA'd).
+
+**Example:**
+
+**contentType before body exists in LastContractView - preserved for backward compatibility**
+
+Previous version had `contentType` before `content`:
+
+```csharp
+public virtual ClientResult UpdateSkillDefaultVersion(string skillId, string contentType, BinaryContent content, RequestOptions options = null)
+{
+    // ...
+}
+```
+
+Current TypeSpec defines a content type:
+
+```typespec
+op UpdateSkillDefaultVersion(
+  @path skill_id: string,
+  @header contentType: string,
+  @body body: SetDefaultSkillVersionBody,
+): SkillResource;
+```
+
+**Generated Compatibility Result:**
+
+The generator detects that the previous contract had `contentType` before `content` and preserves that ordering:
+
+```csharp
+public virtual ClientResult UpdateSkillDefaultVersion(string skillId, string contentType, BinaryContent content, RequestOptions options = null)
+{
+    // contentType stays before content for backward compatibility
+}
+```
+
+### Model Base Types
+
+The generator can preserve a previously shipped model base when the current TypeSpec hierarchy no longer contains it. Automatic restoration is intentionally limited to compatible generated root models and mapped `SystemObjectModelProvider` bases. For ordinary generated bases, both the derived model and displaced current base must be memberless. When a current input base exists, it remains the authoritative wire contract for mapped restoration while the shipped CLR property and constructor surface is restored.
+
+When no current provider represents the shipped CLR base, a downstream generator can override `TypeFactory.CreateLastContractModelBaseCore` to supply a mapping for its known inheritable framework types. The returned type is still subject to the standard mapped-base compatibility checks and remains local to the model being restored. A flat current model can also restore a mapped base when the downstream hook explicitly opts in. Restoration partitions its properties against the historical base: uniquely compatible inherited properties form a model-local projection, while unrelated properties remain on the generated model. The source input model, property ownership, and cached mapped providers are not changed. Incompatible CLR-name or known wire-path overlaps and ambiguous property mappings are rejected. An existing mapped provider alone does not bypass the downstream hook for a flat model; ambiguous existing mappings remain unsupported. Downstream generators must reject incompatible aliases known only to them before opting in, since historical CLR contracts do not necessarily carry wire metadata. Restoring inheritance does not add MRW methods to framework bases that do not participate in the existing serialization protocol; downstream mappings must also respect their generator's serialization requirements.
+
+The current base is retained when broader reconciliation would be required, including a conflicting custom base declaration, structs, polymorphic or derived hierarchies, arbitrary referenced types, and constructed generic bases. Unrelated custom members are permitted only for mapped-base restoration; generated-base restoration with custom code remains unsupported.
+
+A derived generator can override `ModelProvider.RequiresParameterlessBaseConstructor` to require a mapped constructor callable without arguments before the restored hierarchy is committed. ClientModel enables this requirement for JSON/XML and multipart-form-data models, because their serialization partials can emit an empty constructor with an implicit `base()` call. The constructor must be public or protected and pass the existing overload and attribute checks. This check does not apply to core providers or ClientModel models without JSON/XML or multipart-form-data serialization; it does not synthesize constructor arguments.
+
+Restoration checks the shipped property/accessor and method contracts, including nullable value types, parameter names, ref modifiers, `params`, optional defaults, and interface assignability. The default mapped input/property check requires matching value-type nullability; intentional downstream shape changes remain explicit compatibility-hook overrides. A selected historical constructor must also match its bound properties' value-type nullability. When a current property visitor removes a property, symbol-backed restoration does not reintroduce its historical declaration and the one-to-one checks reject restoration. Both full and initialization constructor calls must be provably callable on the mapped target; ambiguous overloads and changed omitted defaults are rejected. Generated-base constructors must remain property-backed. Historical generic methods, constants, by-ref returns, indexers, required-member properties, and defaults that cannot be represented losslessly are rejected rather than reconciled. Public or protected historical nested type declarations are also rejected for generated-base and symbol-backed mapped-base restoration; nested type emission and CLR nested-type reconciliation are not supported. These checks do not rediscover the complete CLR surface of an ordinary downstream mapping whose input omits members.
+
+### Client Methods
+
+#### Scenario: Client Method Parameter Ordering Changed
+
+**Description:** When only the parameter ordering changes in a client method, the generator restores the order from `LastContractView` on the current method instead of adding a compatibility overload. This preserves existing positional calls to both protocol and convenience methods, including their synchronous and asynchronous variants. A previous contract must be available; without it, the generator uses the current parameter order.
+
+**Example:**
+
+Previous version of the client:
+
+```csharp
+public virtual ClientResult GetData(BinaryContent content, int count, bool includeDetails, RequestOptions options = null);
+public virtual ClientResult<string> GetData(string data, int count, bool includeDetails, CancellationToken cancellationToken = default);
+```
+
+Current TypeSpec moves `includeDetails` before `count`, which would normally change the order of those parameters in the generated methods:
+
+```typespec
+op getData(@body data: string, @header includeDetails: boolean, @query count: int32): string;
+```
+
+**Generated Compatibility Result:**
+
+The generator keeps the previously published order on both methods:
+
+```csharp
+public virtual ClientResult GetData(BinaryContent content, int count, bool includeDetails, RequestOptions options = null);
+public virtual ClientResult<string> GetData(string data, int count, bool includeDetails, CancellationToken cancellationToken = default);
+```
+
+The corresponding `GetDataAsync` methods likewise preserve their own last-contract parameter order.
+
+**Key Points:**
+
+- The method name and return type must match the previous contract, with the same parameter count and parameters matched by normalized name and type. Adding or removing parameters or changing their types is not part of this scenario.
+- Protocol and convenience methods are matched independently, so their parameter orders can be restored separately or together.
+- When a protocol method is reordered, convenience method calls to it are updated to pass arguments in the restored order.
+- Parameter XML documentation is reordered to match the restored signature.
+
+#### Scenario: New Optional Non-Body Parameter Added to a Service Method
+
+**Description:** When the current TypeSpec adds one or more new optional non-body parameters (e.g. query, header, path) to an existing service method, the generator emits a hidden back-compat overload that matches the previous contract's signature and delegates to the new method, passing `default` for the new parameter(s). The behavior is **intentionally restricted to non-body parameters** because adding a body parameter typically reflects a schema change and is handled differently.
+
+**Rules:**
+
+- The previous method's parameters must appear, in the same relative order and matching by name and type, within the current method's parameters.
+- Every "extra" parameter on the current method must be optional (i.e. have a default value).
+- No "extra" parameter on the current method may be a body parameter; if any extra parameter is a body parameter, no back-compat overload is added.
+- The back-compat overload is hidden via `[EditorBrowsable(EditorBrowsableState.Never)]` and has all default values stripped from its parameters to avoid ambiguous call sites.
+
+**Example:**
+
+Previous version of the client:
+
+```csharp
+public virtual ClientResult GetData(int p1, BinaryContent body, RequestOptions options = null);
+public virtual Task<ClientResult> GetDataAsync(int p1, BinaryContent body, RequestOptions options = null);
+```
+
+Current TypeSpec adds an optional query parameter `p2`:
+
+```typespec
+op getData(@query p1: int32, @body body: SampleModel, @query p2?: boolean): string;
+```
+
+**Generated Client:**
+
+The generated client includes the current methods (with the new optional `p2` parameter) and the hidden back-compat overloads that match the previous contract's signature. Required parameters come first, followed by optional parameters, with `RequestOptions` last — matching the [Azure SDK parameter ordering guidelines](https://azure.github.io/azure-sdk/dotnet_implementation.html#parameter-presence-and-ordering).
+
+```csharp
+// Current sync method generated from the updated TypeSpec.
+public virtual ClientResult GetData(int p1, BinaryContent body, bool? p2 = default, RequestOptions options = null)
+{
+    // ... implementation ...
+}
+
+// Current async method generated from the updated TypeSpec.
+public virtual async Task<ClientResult> GetDataAsync(int p1, BinaryContent body, bool? p2 = default, RequestOptions options = null)
+{
+    // ... implementation ...
+}
+
+// Back-compat sync overload matching the previous contract's signature.
+[EditorBrowsable(EditorBrowsableState.Never)]
+public virtual ClientResult GetData(int p1, BinaryContent body, RequestOptions options)
+{
+    return this.GetData(p1: p1, body: body, p2: default, options: options);
+}
+
+// Back-compat async overload matching the previous contract's signature.
+[EditorBrowsable(EditorBrowsableState.Never)]
+public virtual Task<ClientResult> GetDataAsync(int p1, BinaryContent body, RequestOptions options)
+{
+    return this.GetDataAsync(p1: p1, body: body, p2: default, options: options);
+}
+```
+
+The back-compat overloads are hidden from IntelliSense via `[EditorBrowsable(EditorBrowsableState.Never)]`, have all default values stripped to avoid ambiguous call sites with the current methods, and delegate to the current method passing `default` for each new parameter.
+
+#### Scenario: Value-Type Parameter Nullability Removed
+
+**Description:** When a value-type parameter that was nullable in the last contract (`T?`) becomes non-nullable (`T`) in the current generation, the generator emits a hidden back-compat overload that reproduces the previous nullable signature and delegates to the current method, unwrapping the argument with `.Value`. The forwarded argument is guarded with `Argument.AssertNotNull` so a `null` argument produces a clear `ArgumentNullException` rather than an `InvalidOperationException` from `.Value`. This also covers extensible enums (which are read back from the last contract as structs), matched by fully-qualified type name.
+
+**Example:**
+
+Previous contract:
+
+```csharp
+public string GetData(string data, FileFormatType? value = default, bool? flag = default);
+```
+
+Current generation makes `value` non-nullable and required:
+
+```csharp
+public string GetData(string data, FileFormatType value, bool? flag = default);
+```
+
+**Generated Compatibility Overload:**
+
+```csharp
+[EditorBrowsable(EditorBrowsableState.Never)]
+public string GetData(string data, FileFormatType? value = default, bool? flag = default)
+{
+    Argument.AssertNotNull(value, nameof(value));
+    return this.GetData(data: data, value: value.Value, flag: flag);
+}
+```
+
+**Key Points:**
+
+- Only applies to value types (including extensible enums); reference-type nullability (`string?` vs `string`) cannot form distinct overloads and is not handled.
+- Only the `T?` → `T` direction (removing nullability) is handled, not the widening direction.
+- When the current parameter is required, the previous optional default is preserved so callers that omitted it still compile; the `AssertNotNull` guard turns a `null` argument into a clear `ArgumentNullException`.
+- A `ref`/`out` parameter is not eligible (its value cannot be forwarded through `.Value`), so no overload is generated in that case.
+- The overload is hidden via `[EditorBrowsable(EditorBrowsableState.Never)]`.
+
+#### Scenario: Nullable Optional Parameter Became Required
+
+**Description:** When a nullable parameter that was optional in the last contract (had a default value) becomes required in the current generation (same type, but no longer has a default), callers that omitted it no longer compile. The generator emits a hidden reduced-arity overload that drops the now-required parameter and delegates to the current method, supplying the parameter's previous default value.
+
+**Example:**
+
+Previous contract:
+
+```csharp
+public string GetData(string data, FileFormatType? value = default, bool? flag = default);
+```
+
+Current generation keeps `value` nullable but makes it required:
+
+```csharp
+public string GetData(string data, FileFormatType? value, bool? flag = default);
+```
+
+**Generated Compatibility Overload:**
+
+```csharp
+[EditorBrowsable(EditorBrowsableState.Never)]
+public string GetData(string data, bool? flag = default)
+{
+    return this.GetData(data: data, value: default, flag: flag);
+}
+```
+
+**Key Points:**
+
+- Applies only to a single nullable parameter that changed from optional to required; the parameter's type is otherwise unchanged.
+- The dropped parameter's type must differ from every other parameter's type so the reduced-arity overload's call sites stay unambiguous.
+- The optionality of the remaining parameters is preserved, and the overload is hidden via `[EditorBrowsable(EditorBrowsableState.Never)]`.
+- Unlike the nullability-removal scenario, the delegation passes the previous default — there is no `.Value` unwrap and no runtime throw.

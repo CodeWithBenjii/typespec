@@ -1,0 +1,43 @@
+export type {
+  DefaultResponseDecorator,
+  ExtensionDecorator,
+  ExternalDocsDecorator,
+  InfoDecorator,
+} from "../generated-defs/TypeSpec.OpenAPI.js";
+export {
+  $defaultResponse,
+  $extension,
+  $externalDocs,
+  $info,
+  $operationId,
+  getExtensions,
+  getExternalDocs,
+  getInfo,
+  getOperationId,
+  getTagsMetadata,
+  isDefaultResponse,
+  resolveInfo,
+  setExtension,
+  setInfo,
+  setOperationId,
+} from "./decorators.js";
+export {
+  checkDuplicateTypeName,
+  getOpenAPITypeName,
+  getParameterKey,
+  isReadonlyProperty,
+  resolveOperationId,
+  shouldInline,
+} from "./helpers.js";
+export type {
+  AdditionalInfo,
+  Contact,
+  ExtensionKey,
+  ExternalDocs,
+  License,
+  TagMetadata,
+  TagMetadataWithName,
+} from "./types.js";
+
+/** @internal */
+export { $decorators } from "./tsp-index.js";

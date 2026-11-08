@@ -1,0 +1,414 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using Microsoft.TypeSpec.Generator.Input;
+using Microsoft.TypeSpec.Generator.Input.Extensions;
+using Microsoft.TypeSpec.Generator.Primitives;
+using Microsoft.TypeSpec.Generator.SourceInput;
+using Microsoft.TypeSpec.Generator.Statements;
+using Microsoft.TypeSpec.Generator.Utilities;
+
+namespace Microsoft.TypeSpec.Generator.Providers
+{
+    internal class CanonicalTypeProvider : TypeProvider
+    {
+        private readonly TypeProvider _generatedTypeProvider;
+        private readonly Dictionary<string, InputModelProperty> _specPropertiesMap;
+        private readonly HashSet<string> _exactSpecPropertyNames;
+        private readonly Dictionary<string, string?> _serializedNameMap;
+        private readonly Dictionary<InputModelProperty, PropertyProvider> _propertyProviderMap = new();
+        private readonly HashSet<string> _renamedProperties;
+        private readonly HashSet<string> _renamedFields;
+        private readonly IReadOnlyList<InputModelProperty> _specProperties;
+
+        public CanonicalTypeProvider(TypeProvider generatedTypeProvider, InputType? inputType)
+        {
+            _generatedTypeProvider = generatedTypeProvider;
+            var inputModel = inputType as InputModelType;
+            var externalReplacements = GetExternalPropertyReplacements(inputModel);
+            _specProperties = [.. inputModel?.Properties ?? [], .. externalReplacements.Select(replacement => replacement.Property)];
+            _specPropertiesMap = [];
+            _exactSpecPropertyNames = [];
+            foreach (var property in _specProperties)
+            {
+                var name = property.IsExactName ? property.Name : property.Name.ToIdentifierName();
+                _specPropertiesMap.TryAdd(name, property);
+                _exactSpecPropertyNames.Add(name);
+            }
+            foreach (var replacement in externalReplacements)
+            {
+                _specPropertiesMap.TryAdd(replacement.EmittedName, replacement.Property);
+            }
+            foreach (var property in _specProperties.Where(p => !p.IsExactName))
+            {
+                var name = property.Name.ToIdentifierName();
+                _specPropertiesMap.TryAdd(name.NormalizeCSharpAcronyms(property.Type.IsDateTimeInputType()), property);
+            }
+            _serializedNameMap = BuildSerializationNameMap();
+            _renamedProperties = (_generatedTypeProvider.CustomCodeView?.Properties ?? [])
+                .Where(p => p.OriginalName != null).Select(p => p.OriginalName!).ToHashSet();
+            _renamedFields = (_generatedTypeProvider.CustomCodeView?.Fields ?? [])
+                .Where(p => p.OriginalName != null).Select(p => p.OriginalName!).ToHashSet();
+        }
+
+        /// <summary>
+        /// Collects explicitly claimed properties in declaration order, visiting the nearest external base first.
+        /// The custom-name set is used only for membership checks; its enumeration order does not affect property order.
+        /// </summary>
+        private IReadOnlyList<(InputModelProperty Property, string EmittedName)> GetExternalPropertyReplacements(InputModelType? inputModel)
+        {
+            List<(InputModelProperty Property, string EmittedName)> result = [];
+            var replacements = (_generatedTypeProvider.CustomCodeView?.Properties ?? [])
+                .Where(property => property.OriginalName is not null)
+                .Select(property => property.OriginalName!)
+                .ToHashSet(StringComparer.Ordinal);
+            for (var baseModel = inputModel?.BaseModel; baseModel?.External is not null; baseModel = baseModel.BaseModel)
+            {
+                foreach (var generatedProperty in CodeModelGenerator.Instance.TypeFactory.CreateModel(baseModel)?.Properties ?? [])
+                {
+                    if (generatedProperty.InputProperty is not InputModelProperty property)
+                    {
+                        continue;
+                    }
+                    var name = property.IsExactName ? property.Name : property.Name.ToIdentifierName();
+                    // CodeGenMember accepts raw spec names as well as C# names. The emitted name already
+                    // respects IsExactName, including the enclosing-type collision suffix.
+                    if (replacements.Contains(property.Name) || replacements.Contains(name) ||
+                        replacements.Contains(generatedProperty.Name) ||
+                        (!property.IsExactName && replacements.Contains(name.NormalizeCSharpAcronyms(property.Type.IsDateTimeInputType()))))
+                    {
+                        result.Add((property, generatedProperty.Name));
+                    }
+                }
+            }
+            return result;
+        }
+
+        protected override string BuildRelativeFilePath() => throw new InvalidOperationException("This type should not be writing in generation");
+
+        protected override string BuildName() => _generatedTypeProvider.Name;
+
+        protected override string BuildNamespace() => _generatedTypeProvider.Type.Namespace;
+
+        protected override TypeSignatureModifiers BuildDeclarationModifiers() => _generatedTypeProvider.DeclarationModifiers;
+
+        private protected override bool FilterCustomizedMembers => false;
+
+        protected override IReadOnlyList<MethodBodyStatement> BuildAttributes()
+        {
+            // TODO https://github.com/microsoft/typespec/issues/11232: Move this generated/custom attribute merge into a shared TypeProvider API.
+            return DeduplicateAttributes(
+                _generatedTypeProvider.Attributes,
+                _generatedTypeProvider.CustomCodeView?.Attributes);
+        }
+
+        private static IReadOnlyList<AttributeStatement> DeduplicateAttributes(params IEnumerable<AttributeStatement>?[] attributeSets)
+        {
+            var seen = new HashSet<string>();
+            var attributes = new List<AttributeStatement>();
+            foreach (var attribute in attributeSets.SelectMany(static attributeSet => attributeSet ?? []))
+            {
+                if (seen.Add(attribute.ToDisplayString()))
+                {
+                    attributes.Add(attribute);
+                }
+            }
+
+            return attributes;
+        }
+
+        private protected override CanonicalTypeProvider BuildCanonicalView() => this;
+
+        protected internal override ConstructorProvider[] BuildConstructors()
+        {
+            return [.. FilterCustomizedConstructors(_generatedTypeProvider.Constructors), .. _generatedTypeProvider.CustomCodeView?.Constructors ?? []];
+        }
+
+        protected internal override MethodProvider[] BuildMethods()
+        {
+            return [.. FilterCustomizedMethods(_generatedTypeProvider.Methods), .. _generatedTypeProvider.CustomCodeView?.Methods ?? []];
+        }
+
+        protected internal override PropertyProvider[] BuildProperties()
+        {
+            // Building Properties populates GeneratedPropertiesBySpecName as part of customization filtering.
+            // Keep these reads together and in this order so the map is never observed mid-build.
+            var generatedProperties = _generatedTypeProvider.Properties;
+            var generatedPropertiesBySpecName = _generatedTypeProvider.GeneratedPropertiesBySpecName;
+            var customProperties = _generatedTypeProvider.CustomCodeView?.Properties ?? [];
+
+            // Exact emitted names take precedence over canonical aliases. A canonical alias from an earlier
+            // property must not shadow a later property that actually emits that name.
+            foreach (var generatedProperty in generatedPropertiesBySpecName.Values)
+            {
+                if (generatedProperty.InputProperty is InputModelProperty preservedSpecProperty &&
+                    _exactSpecPropertyNames.Add(generatedProperty.Name))
+                {
+                    _specPropertiesMap[generatedProperty.Name] = preservedSpecProperty;
+                }
+            }
+
+            // Update the serializedName of generated properties if necessary
+            foreach (var generatedProperty in generatedProperties)
+            {
+                if (_serializedNameMap.TryGetValue(generatedProperty.Name, out var serializedName) && serializedName != null)
+                {
+                    generatedProperty.WireInfo!.SerializedName = serializedName;
+                }
+
+                if (generatedProperty.InputProperty is InputModelProperty specProperty)
+                {
+                    _propertyProviderMap[specProperty] = generatedProperty;
+                }
+            }
+
+            foreach (var customProperty in customProperties)
+            {
+                InputModelProperty? specProperty = null;
+
+                if (TryGetSpecProperty(customProperty, out var candidateSpecProperty))
+                {
+                    specProperty = candidateSpecProperty;
+                    customProperty.WireInfo = new PropertyWireInformation(specProperty);
+                    customProperty.IsDiscriminator = customProperty.WireInfo.IsDiscriminator;
+                    customProperty.Update(description: customProperty.WireInfo.Description);
+
+                    _propertyProviderMap[specProperty] = customProperty;
+                }
+
+                string? serializedName = specProperty?.SerializedName;
+                bool hasCustomSerialization = false;
+                // Update the serializedName of custom properties if necessary
+                if (_serializedNameMap.TryGetValue(customProperty.Name, out var customSerializedName) ||
+                    (customProperty.OriginalName != null && _serializedNameMap.TryGetValue(customProperty.OriginalName, out customSerializedName)))
+                {
+                    hasCustomSerialization = true;
+                    if (customSerializedName != null)
+                    {
+                        serializedName = customSerializedName;
+                    }
+                }
+
+                if (serializedName != null || hasCustomSerialization)
+                {
+                    if (specProperty == null)
+                    {
+                        customProperty.WireInfo = new(
+                            SerializationFormat.Default,
+                            false,
+                            !customProperty.Body.HasSetter,
+                            customProperty.Type.IsNullable,
+                            false,
+                            serializedName ?? customProperty.Name.ToVariableName(),
+                            false,
+                            false);
+                    }
+                    else
+                    {
+                        customProperty.WireInfo!.SerializedName = serializedName!;
+                    }
+                }
+
+                customProperty.Type = customProperty.Type.ApplyInputSpecProperty(specProperty);
+                customProperty.InputProperty = specProperty;
+            }
+
+            // Filter out generated properties that have been customized to avoid duplicates.
+            // This is needed because EnsureBuilt caches members without applying customization
+            // filtering, so _generatedTypeProvider.Properties may contain unfiltered results.
+            var filteredGeneratedProperties = FilterCustomizedProperties(
+                generatedProperties,
+                generatedPropertiesBySpecName);
+
+            if (_specProperties.Count > 0)
+            {
+                // Include local spec properties and explicitly claimed external-base properties.
+                var inputProperties = new HashSet<InputProperty>(_specProperties.Count);
+                var nonSpecProperties = new List<PropertyProvider>();
+
+                // Process all properties in single pass, categorizing them
+                foreach (var prop in filteredGeneratedProperties)
+                {
+                    if (prop.InputProperty != null)
+                    {
+                        inputProperties.Add(prop.InputProperty);
+                    }
+                    else
+                    {
+                        nonSpecProperties.Add(prop);
+                    }
+                }
+
+                foreach (var prop in customProperties)
+                {
+                    // Check if custom property is in spec.
+                    if ((prop.OriginalName != null && TryGetSpecProperty(prop.OriginalName, out var specProp)) ||
+                        _specPropertiesMap.TryGetValue(prop.Name, out specProp))
+                    {
+                        inputProperties.Add(specProp);
+                    }
+                    else
+                    {
+                        nonSpecProperties.Add(prop);
+                    }
+                }
+
+                var specCount = _specProperties.Count(p => inputProperties.Contains(p));
+                var result = new List<PropertyProvider>(specCount + nonSpecProperties.Count);
+
+                // Add spec properties in order
+                foreach (var specProp in _specProperties)
+                {
+                    if (inputProperties.Contains(specProp) &&
+                        _propertyProviderMap.TryGetValue(specProp, out var provider))
+                    {
+                        result.Add(provider);
+                    }
+                }
+
+                // Add non-spec properties
+                result.AddRange(nonSpecProperties);
+
+                return [.. result];
+            }
+
+            // For other types, there is no canonical order, so we can just return generated followed by custom properties.
+            return [.. filteredGeneratedProperties, .. customProperties];
+        }
+
+        protected internal override FieldProvider[] BuildFields()
+        {
+            var generatedFields = _generatedTypeProvider.Fields;
+            var customFields = _generatedTypeProvider.CustomCodeView?.Fields ?? [];
+
+            // Update the serializedName of generated properties if necessary
+            foreach (var generatedField in generatedFields)
+            {
+                if (_serializedNameMap.TryGetValue(generatedField.Name, out var serializedName) && serializedName != null)
+                {
+                    generatedField.WireInfo!.SerializedName = serializedName;
+                }
+            }
+
+            foreach (var customField in customFields)
+            {
+                InputProperty? specProperty = null;
+
+                if (TryGetSpecProperty(customField, out var candidateSpecProperty))
+                {
+                    specProperty = candidateSpecProperty;
+                    customField.WireInfo = new PropertyWireInformation(specProperty);
+                    customField.Update(description: customField.WireInfo.Description);
+                }
+
+                string? serializedName = specProperty?.SerializedName;
+                bool hasCustomSerialization = false;
+                // Update the serializedName of custom properties if necessary
+                if (_serializedNameMap.TryGetValue(customField.Name, out var customSerializedName) ||
+                    (customField.OriginalName != null && _serializedNameMap.TryGetValue(customField.OriginalName, out customSerializedName)))
+                {
+                    hasCustomSerialization = true;
+                    if (customSerializedName != null)
+                    {
+                        serializedName = customSerializedName;
+                    }
+                }
+
+                if (serializedName != null || hasCustomSerialization)
+                {
+                    if (specProperty == null)
+                    {
+                        customField.WireInfo = new(
+                            SerializationFormat.Default,
+                            false,
+                            true,
+                            customField.Type.IsNullable,
+                            false,
+                            serializedName ?? customField.Name.ToVariableName(),
+                            false,
+                            false);
+                    }
+                    else
+                    {
+                        customField.WireInfo!.SerializedName = serializedName!;
+                    }
+                }
+
+                customField.Type = customField.Type.ApplyInputSpecProperty(specProperty);
+            }
+
+            // Order is not important for fields, so we can just return generated followed by custom fields
+            return [.. FilterCustomizedFields(generatedFields), .. customFields];
+        }
+
+        private bool TryGetSpecProperty(
+            PropertyProvider customProperty,
+            [NotNullWhen(true)] out InputModelProperty? candidateSpecProperty)
+        {
+            if (customProperty.OriginalName != null && TryGetSpecProperty(customProperty.OriginalName, out candidateSpecProperty))
+            {
+                return true;
+            }
+
+            if (_specPropertiesMap.TryGetValue(customProperty.Name, out candidateSpecProperty) &&
+                !_renamedProperties.Contains(customProperty.Name) &&
+                !_renamedFields.Contains(customProperty.Name))
+            {
+                return true;
+            }
+
+            candidateSpecProperty = null;
+            return false;
+        }
+
+        private bool TryGetSpecProperty(FieldProvider customField, [NotNullWhen(true)] out InputModelProperty? candidateSpecProperty)
+        {
+            if (customField.OriginalName != null && TryGetSpecProperty(customField.OriginalName, out candidateSpecProperty))
+            {
+                return true;
+            }
+
+            if (_specPropertiesMap.TryGetValue(customField.Name, out candidateSpecProperty) &&
+                !_renamedProperties.Contains(customField.Name))
+            {
+                return true;
+            }
+
+            candidateSpecProperty = null;
+            return false;
+        }
+
+        private bool TryGetSpecProperty(string name, [NotNullWhen(true)] out InputModelProperty? candidateSpecProperty)
+        {
+            if (_specPropertiesMap.TryGetValue(name, out candidateSpecProperty))
+            {
+                return true;
+            }
+
+            return _specPropertiesMap.TryGetValue(name.ToIdentifierName(), out candidateSpecProperty);
+        }
+
+        private Dictionary<string, string?> BuildSerializationNameMap()
+        {
+            var serializedNameMapping = new Dictionary<string, string?>();
+            foreach (var serializationAttribute in _generatedTypeProvider.CustomCodeView?.Attributes ?? [])
+            {
+                if (CodeGenAttributes.TryGetCodeGenSerializationAttributeValue(
+                        serializationAttribute,
+                        out var propertyName,
+                        out string? serializationName,
+                        out _,
+                        out _,
+                        out _))
+                {
+                    serializedNameMapping[propertyName] = serializationName;
+                }
+            }
+            return serializedNameMapping;
+        }
+    }
+}

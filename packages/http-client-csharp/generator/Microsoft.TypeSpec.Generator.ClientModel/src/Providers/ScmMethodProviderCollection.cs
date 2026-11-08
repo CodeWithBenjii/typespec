@@ -1,0 +1,2303 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+using System;
+using System.ClientModel;
+using System.ClientModel.Primitives;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net.ServerSentEvents;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Microsoft.TypeSpec.Generator.ClientModel.Primitives;
+using Microsoft.TypeSpec.Generator.ClientModel.Snippets;
+using Microsoft.TypeSpec.Generator.ClientModel.Utilities;
+using Microsoft.TypeSpec.Generator.EmitterRpc;
+using Microsoft.TypeSpec.Generator.Expressions;
+using Microsoft.TypeSpec.Generator.Input;
+using Microsoft.TypeSpec.Generator.Primitives;
+using Microsoft.TypeSpec.Generator.Providers;
+using Microsoft.TypeSpec.Generator.Snippets;
+using Microsoft.TypeSpec.Generator.Statements;
+using Microsoft.TypeSpec.Generator.Utilities;
+using static Microsoft.TypeSpec.Generator.Snippets.Snippet;
+
+namespace Microsoft.TypeSpec.Generator.ClientModel.Providers
+{
+    public class ScmMethodProviderCollection : IReadOnlyList<ScmMethodProvider>
+    {
+        private readonly MethodProvider _createRequestMethod;
+        private static readonly CancellationTokenExtensionsDefinition _cancellationTokenExtensionsDefinition = new();
+        private const string JsonMediaType = "application/json";
+        private const string XmlMediaType = "application/xml";
+        private readonly InputPagingServiceMethod? _pagingServiceMethod;
+        private IReadOnlyList<ScmMethodProvider>? _methods;
+        private readonly bool _generateConvenienceMethod;
+        private readonly Lazy<InputStreamingType?> _streamingResponse;
+
+        private ClientProvider Client { get; }
+        protected InputServiceMethod ServiceMethod { get; }
+        protected TypeProvider EnclosingType { get; }
+        public IReadOnlyList<ScmMethodProvider> MethodProviders => _methods ??= BuildMethods();
+
+        public ScmMethodProvider this[int index]
+        {
+            get { return MethodProviders[index]; }
+        }
+
+        public int Count
+        {
+            get { return MethodProviders.Count; }
+        }
+
+        public IEnumerator<ScmMethodProvider> GetEnumerator()
+        {
+            return MethodProviders.GetEnumerator();
+        }
+
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
+        }
+
+        public ScmMethodProviderCollection(InputServiceMethod serviceMethod, TypeProvider enclosingType)
+        {
+            ServiceMethod = serviceMethod;
+            EnclosingType = enclosingType;
+
+            Client = enclosingType as ClientProvider ?? throw new InvalidOperationException("Scm methods can only be built for client types.");
+            _createRequestMethod = Client.RestClient.GetCreateRequestMethod(ServiceMethod.Operation);
+            _generateConvenienceMethod = ServiceMethod.Operation.GenerateConvenienceMethod;
+            _streamingResponse = new(GetStreamingResponseCore);
+
+            if (serviceMethod is InputPagingServiceMethod pagingServiceMethod)
+            {
+                _pagingServiceMethod = pagingServiceMethod;
+            }
+        }
+
+        protected virtual IReadOnlyList<ScmMethodProvider> BuildMethods()
+        {
+            bool shouldMakeParametersRequired = ShouldMakeProtocolMethodParametersRequired();
+
+            var asyncProtocol = BuildProtocolMethod(_createRequestMethod, true, shouldMakeParametersRequired);
+            if (_streamingResponse.Value != null)
+            {
+                if (_generateConvenienceMethod && ProtocolMethodExists(asyncProtocol))
+                {
+                    var convenienceMethod = BuildConvenienceMethod(asyncProtocol, true);
+                    return
+                    [
+                        asyncProtocol,
+                        convenienceMethod
+                    ];
+                }
+
+                return [asyncProtocol];
+            }
+
+            var syncProtocol = BuildProtocolMethod(_createRequestMethod, false, shouldMakeParametersRequired);
+
+            if (_generateConvenienceMethod)
+            {
+                var methods = new List<ScmMethodProvider>
+                {
+                    syncProtocol,
+                    asyncProtocol,
+                };
+
+                if (_pagingServiceMethod != null)
+                {
+                    methods.Add(BuildConvenienceMethod(syncProtocol, false));
+                    methods.Add(BuildConvenienceMethod(asyncProtocol, true));
+                }
+                else
+                {
+                    if (!HasStreamingRequestOrResponse() && ProtocolMethodExists(syncProtocol))
+                    {
+                        methods.Add(BuildConvenienceMethod(syncProtocol, false));
+                    }
+
+                    if (ProtocolMethodExists(asyncProtocol))
+                    {
+                        methods.Add(BuildConvenienceMethod(asyncProtocol, true));
+                    }
+                }
+
+                return methods;
+            }
+
+            return
+            [
+                syncProtocol,
+                asyncProtocol,
+            ];
+        }
+
+        private bool ProtocolMethodExists(MethodProvider generatedProtocolMethod)
+        {
+            if (!generatedProtocolMethod.IsMethodSuppressed())
+            {
+                return true;
+            }
+
+            foreach (var method in EnclosingType.CustomCodeView?.Methods ?? [])
+            {
+                if (!method.IsPartialMethod &&
+                    MethodSignatureBase.SignatureComparer.Equals(method.Signature, generatedProtocolMethod.Signature))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private ScmMethodProvider BuildConvenienceMethod(MethodProvider protocolMethod, bool isAsync)
+        {
+            if (EnclosingType is not ClientProvider client)
+            {
+                throw new InvalidOperationException("Protocol methods can only be built for client types.");
+            }
+
+            var methodName = isAsync ? ServiceMethod.Name + "Async" : ServiceMethod.Name;
+            var convenienceParameters = RestClientProvider.GetMethodParameters(ServiceMethod, ScmMethodKind.Convenience, Client);
+            ParameterProvider[] signatureParameters = [.. convenienceParameters, ScmKnownParameters.CreateCancellationToken()];
+
+            // Detect a partial method declaration in the client's custom code matching this convenience method.
+            MethodSignature? customSignature = null;
+            PartialMethodCustomization.TryFindCustomSignature(client, methodName, signatureParameters, out customSignature);
+
+            // Parameters used to construct the method body. When customizing, we clone the generator's
+            // parameter providers with the customer's names but keep all generator metadata so that the
+            // body construction (param conversions, request invocation, etc.) still works.
+            IReadOnlyList<ParameterProvider> convenienceBodyParameters;
+
+            MethodSignature methodSignature;
+
+            if (customSignature != null)
+            {
+                var renamedSignatureParameters = PartialMethodCustomization.RenameAndCloneParameters(
+                    signatureParameters,
+                    customSignature.Parameters,
+                    removeDefaults: true);
+
+                // The generator-controlled body params are the leading parameters (everything except the trailing CancellationToken).
+                var bodyParams = new ParameterProvider[convenienceParameters.Count];
+                for (int i = 0; i < convenienceParameters.Count; i++)
+                {
+                    bodyParams[i] = renamedSignatureParameters[i];
+                }
+                convenienceBodyParameters = bodyParams;
+
+                methodSignature = PartialMethodCustomization.BuildPartialSignature(
+                    customSignature,
+                    renamedSignatureParameters,
+                    additionalModifiers: isAsync && _pagingServiceMethod == null
+                        ? MethodSignatureModifiers.Async
+                        : MethodSignatureModifiers.None);
+            }
+            else
+            {
+                convenienceBodyParameters = signatureParameters[..^1];
+                methodSignature = new MethodSignature(
+                    methodName,
+                    DocHelpers.GetFormattableDescription(ServiceMethod.Operation.Summary, ServiceMethod.Operation.Doc) ?? FormattableStringHelpers.FromString(ServiceMethod.Operation.Name),
+                    GetConvenienceMethodModifiers(protocolMethod.Signature.Modifiers, signatureParameters),
+                    GetResponseType(ServiceMethod.Operation.Responses, true, isAsync, out _),
+                    null,
+                    signatureParameters);
+            }
+
+            ApplyExperimentalAttributes(methodSignature, customSignature, BuildConvenienceMethodAttributes() ?? []);
+            ApplyDeprecationAttribute(methodSignature, customSignature);
+
+            // Recompute the response body type so we can branch the body accordingly.
+            GetResponseType(ServiceMethod.Operation.Responses, true, isAsync, out var responseBodyType);
+            var streamingResponse = _streamingResponse.Value;
+
+            MethodBodyStatement[] methodBody;
+            TypeProvider? collection = null;
+            if (_pagingServiceMethod != null)
+            {
+                collection = ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.CreateClientCollectionResultDefinition(Client, _pagingServiceMethod, responseBodyType, isAsync);
+                var createRequestSignature = Client.RestClient.GetCreateRequestMethod(ServiceMethod.Operation).Signature;
+                methodBody =
+                [
+                    .. GetPagingMethodBody(
+                        collection,
+                        createRequestSignature,
+                        convenienceBodyParameters,
+                        methodSignature.Parameters[^1])
+                ];
+            }
+            else if (streamingResponse != null)
+            {
+                var conversionStatements = GetStackVariablesForProtocolParamConversion(
+                    convenienceBodyParameters,
+                    out var declarations);
+                var protocolArguments = GetMethodArguments(_createRequestMethod.Signature, declarations, convenienceBodyParameters, methodSignature.Parameters[^1]);
+                var requestOptions = protocolArguments[^1];
+                methodBody =
+                [
+                    .. conversionStatements,
+                    UsingDeclare(
+                        "message",
+                        ScmCodeModelGenerator.Instance.TypeFactory.HttpMessageApi.HttpMessageType,
+                        This.Invoke(_createRequestMethod.Signature, protocolArguments),
+                        out var message),
+                    message.ToApi<HttpMessageApi>().BufferResponse().Assign(False).Terminate(),
+                    Return(CreateStreamingResultExpression(
+                        streamingResponse,
+                        client.PipelineProperty.ToApi<ClientPipelineApi>().ProcessMessage(
+                            message,
+                            requestOptions.ToApi<HttpRequestOptionsApi>(),
+                            true),
+                        methodSignature.Parameters[^1],
+                        useConvenienceType: true))
+                ];
+            }
+            else if (responseBodyType is null || ServiceMethod.Operation.ResponseAsBool)
+            {
+                methodBody =
+                [
+                    .. GetStackVariablesForProtocolParamConversion(convenienceBodyParameters, out var declarations),
+                    Return(This.Invoke(protocolMethod.Signature, [.. GetMethodArguments(protocolMethod.Signature, declarations, convenienceBodyParameters, methodSignature.Parameters[^1])], isAsync))
+                ];
+            }
+            else
+            {
+                methodBody =
+                [
+                    .. GetStackVariablesForProtocolParamConversion(convenienceBodyParameters, out var paramDeclarations),
+                    Declare("result", This.Invoke(protocolMethod.Signature, [.. GetMethodArguments(protocolMethod.Signature, paramDeclarations, convenienceBodyParameters, methodSignature.Parameters[^1])], isAsync).ToApi<ClientResponseApi>(), out ClientResponseApi result),
+                    .. GetStackVariablesForReturnValueConversion(result, responseBodyType, isAsync, out var resultDeclarations),
+                    IsConvertibleFromBinaryData(responseBodyType)
+                        || GetPlainTextParseType(responseBodyType, out _) is not null
+                        ? GetResultConversionStatements(result, result.GetRawResponse(), responseBodyType, resultDeclarations)
+                        :
+                        new[]
+                        {
+                            Declare("data", result.GetRawResponse().Content(), out var data),
+                            UsingDeclare("document", data.Parse(), out var jsonDocument),
+                            Declare("element", jsonDocument.RootElement(), out var jsonElement),
+                            Return(result.FromValue(
+                                ScmCodeModelGenerator.Instance.TypeFactory.DeserializeJsonValue(
+                                responseBodyType,
+                                jsonElement,
+                                data,
+                                ScmCodeModelGenerator.Instance.ModelSerializationExtensionsDefinition.WireOptionsField.As<ModelReaderWriterOptions>(),
+                                SerializationFormat.Default),
+                                result.GetRawResponse()))
+                        },
+                ];
+            }
+
+            var convenienceMethod = new ScmMethodProvider(methodSignature, methodBody, EnclosingType, ScmMethodKind.Convenience, collectionDefinition: collection, serviceMethod: ServiceMethod);
+            ExperimentalApiHelpers.AddDependencySuppressions(convenienceMethod, ServiceMethod.Operation);
+            var customProtocol = client.CustomCodeView?.Methods.FirstOrDefault(method =>
+                MethodSignatureBase.SignatureComparer.Equals(method.Signature, protocolMethod.Signature));
+            var declarationSuppressions = ExperimentalApiHelpers.GetAttributeSuppressions(
+                methodSignature.Attributes.Concat(customSignature?.Attributes ?? []));
+            convenienceMethod.Update(suppressions: ExperimentalApiHelpers.MergeSuppressions(
+                convenienceMethod.Suppressions,
+                ExperimentalApiHelpers.GetAttributeSuppressions(
+                    protocolMethod.Signature.Attributes.Concat(customProtocol?.Signature.Attributes ?? []))
+                    .ExceptBy(declarationSuppressions.Select(suppression => suppression.Code.ToDisplayString()),
+                        suppression => suppression.Code.ToDisplayString())));
+
+            if (convenienceMethod.XmlDocs != null)
+            {
+                var exceptions = new List<XmlDocExceptionStatement>(convenienceMethod.XmlDocs.Exceptions);
+                exceptions.Add(new(ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientResponseExceptionType.FrameworkType, "Service returned a non-success status code.", []));
+                convenienceMethod.XmlDocs.Update(exceptions: exceptions);
+            }
+
+            return convenienceMethod;
+        }
+
+        private MethodSignatureModifiers GetConvenienceMethodModifiers(
+            MethodSignatureModifiers modifiers,
+            IReadOnlyList<ParameterProvider> signatureParameters)
+        {
+            modifiers &= ~MethodSignatureModifiers.Partial;
+            // The convenience method's public/internal accessibility follows the service method's
+            // accessibility, independent of the protocol method. The protocol method may be internal
+            // (e.g. when `@protocolAPI(false)` sets GenerateProtocolMethod to false) while the
+            // convenience method should still be public.
+            if (ServiceMethod.Accessibility == "public")
+            {
+                modifiers &= ~MethodSignatureModifiers.Internal;
+                modifiers |= MethodSignatureModifiers.Public;
+            }
+
+            var enclosingTypeModifiers = EnclosingType.DeclarationModifiers;
+            if (modifiers.HasFlag(MethodSignatureModifiers.Public) &&
+                !enclosingTypeModifiers.HasFlag(TypeSignatureModifiers.Internal) &&
+                !enclosingTypeModifiers.HasFlag(TypeSignatureModifiers.Private) &&
+                signatureParameters.Any(p => !p.Type.IsPublic))
+            {
+                modifiers &= ~MethodSignatureModifiers.Public;
+                modifiers |= MethodSignatureModifiers.Internal;
+            }
+
+            return modifiers;
+        }
+
+        private IEnumerable<MethodBodyStatement> GetStackVariablesForProtocolParamConversion(IReadOnlyList<ParameterProvider> convenienceMethodParameters, out Dictionary<string, ValueExpression> declarations)
+        {
+            List<MethodBodyStatement> statements = new List<MethodBodyStatement>();
+            var localDeclarations = declarations = new Dictionary<string, ValueExpression>();
+            var requestContentType = ScmCodeModelGenerator.Instance.TypeFactory.RequestContentApi.RequestContentType;
+
+            // Serializes the body via Utf8JsonWriter to stay AOT/trim safe (avoids BinaryData.FromObjectAsJson<T>, which trips IL2026/IL3050).
+            void AddUtf8JsonContent(CSharpType serializationType, ValueExpression value)
+            {
+                statements.Add(Declare("content", New.Instance<Utf8JsonBinaryContentDefinition>(), out var content));
+                statements.Add(ScmCodeModelGenerator.Instance.TypeFactory.SerializeJsonValue(
+                    serializationType,
+                    value,
+                    content.JsonWriter(),
+                    ScmCodeModelGenerator.Instance.ModelSerializationExtensionsDefinition.WireOptionsField.As<ModelReaderWriterOptions>(),
+                    SerializationFormat.Default));
+                localDeclarations["content"] = content;
+            }
+
+            foreach (var parameter in convenienceMethodParameters)
+            {
+                if (parameter.SpreadSource != null)
+                {
+                    continue;
+                }
+
+                if (parameter.Location == ParameterLocation.Body)
+                {
+                    if (parameter.Type.IsIAsyncEnumerableOfT)
+                    {
+                        var contentType = new JsonLinesBinaryContentDefinition().Type.MakeGenericType([parameter.Type.Arguments[0]]);
+                        var inputParameter = ServiceMethod.Parameters.FirstOrDefault(p =>
+                            p.Location == InputRequestLocation.Body &&
+                            string.Equals(p.Name, parameter.Name, StringComparison.OrdinalIgnoreCase));
+                        ValueExpression contentExpression = inputParameter is { IsRequired: false }
+                            ? new TernaryConditionalExpression(
+                                parameter.Equal(Null),
+                                Null,
+                                New.Instance(contentType, parameter))
+                            : New.Instance(contentType, parameter);
+                        statements.Add(UsingDeclare("content", requestContentType, contentExpression, out var content));
+                        declarations["content"] = content;
+                    }
+                    else if (parameter.Type.IsReadOnlyMemory)
+                    {
+                        statements.Add(UsingDeclare("content", requestContentType, BinaryContentHelperSnippets.FromEnumerable(parameter.Property("Span")), out var content));
+                        declarations["content"] = content;
+                    }
+                    else if (parameter.Type.IsList)
+                    {
+                        if (TryGetXmlCollectionNames(parameter, out var rootName, out var childName))
+                        {
+                            statements.Add(UsingDeclare("content", requestContentType, BinaryContentHelperSnippets.FromEnumerable(parameter, Literal(rootName), Literal(childName)), out var content));
+                            declarations["content"] = content;
+                        }
+                        else
+                        {
+                            statements.Add(UsingDeclare("content", requestContentType, BinaryContentHelperSnippets.FromEnumerable(parameter), out var content));
+                            declarations["content"] = content;
+                        }
+                    }
+                    else if (parameter.Type.IsDictionary)
+                    {
+                        statements.Add(UsingDeclare("content", requestContentType, BinaryContentHelperSnippets.FromDictionary(parameter), out var content));
+                        declarations["content"] = content;
+                    }
+                    else if (parameter.Type.Equals(typeof(string)))
+                    {
+                        if (ServiceMethod.Operation.RequestMediaTypes?.Contains("application/json") == true)
+                        {
+                            AddUtf8JsonContent(parameter.Type, parameter);
+                        }
+                        else
+                        {
+                            statements.Add(UsingDeclare("content", RequestContentApiSnippets.Create(BinaryDataSnippets.FromString(parameter)), out var content));
+                            declarations["content"] = content;
+                        }
+                    }
+                    else if (parameter.Type.IsEnum)
+                    {
+                        AddUtf8JsonContent(parameter.Type, parameter);
+                    }
+                    else if (parameter.Type.IsFrameworkType && !parameter.Type.Equals(typeof(BinaryData)) && IsConvertibleFromBinaryData(parameter.Type))
+                    {
+                        statements.Add(UsingDeclare("content", requestContentType, BinaryContentHelperSnippets.FromObject(parameter), out var content));
+                        declarations["content"] = content;
+                    }
+                    else if (parameter.Type.IsFrameworkType && !parameter.Type.Equals(typeof(BinaryData)))
+                    {
+                        AddUtf8JsonContent(parameter.Type.FrameworkType, parameter);
+                    }
+                    else
+                    {
+                        // Check if this is a dual-format model that needs explicit serialization
+                        ModelProvider? bodyModel = null;
+                        InputModelType? bodyInputModel = null;
+                        InputMethodParameter? inputParam = null;
+                        if (parameter.Type is { IsFrameworkType: false })
+                        {
+                            inputParam = ServiceMethod.Parameters.FirstOrDefault(p => p.Location == InputRequestLocation.Body);
+                            if (inputParam?.Type is InputModelType model)
+                            {
+                                bodyInputModel = model;
+                                bodyModel = ScmCodeModelGenerator.Instance.TypeFactory.CreateModel(model);
+                            }
+                        }
+
+                        if (TryGetFormatArgumentForDualFormatModel(bodyModel, bodyInputModel, out var format))
+                        {
+                            // Create using declaration for BinaryContent
+                            var methodName = $"To{requestContentType.Name}";
+                            statements.Add(UsingDeclare("content", requestContentType, parameter.Invoke(methodName, format), out var content));
+                            declarations["content"] = content;
+                        }
+                        else if (bodyInputModel?.Usage.HasFlag(InputModelTypeUsage.MultipartFormData) == true)
+                        {
+                            var bodyExpression = inputParam is { IsRequired: false }
+                                ? parameter.NullConditional()
+                                : parameter;
+                            statements.Add(UsingDeclare("content", MultiPartFormContentSnippets.Type, MultiPartFormContentSnippets.ToMultipartFormContent(bodyExpression), out var content));
+                            declarations["content"] = content;
+                        }
+                        // else rely on implicit operator to convert to BinaryContent
+                        // For BinaryData we have special handling as well
+                    }
+                }
+            }
+
+            // add spread parameter model variable declaration
+            var spreadSource = convenienceMethodParameters.FirstOrDefault(p => p.SpreadSource != null)?.SpreadSource;
+            if (spreadSource is not null)
+            {
+                statements.Add(Declare("spreadModel", New.Instance(spreadSource.Type, [.. GetSpreadConversion(spreadSource, convenienceMethodParameters)]).As(spreadSource.Type), out var spread));
+                declarations["spread"] = spread;
+            }
+
+            return statements;
+        }
+
+        private List<ValueExpression> GetSpreadConversion(TypeProvider spreadSource, IReadOnlyList<ParameterProvider> convenienceMethodParameters)
+        {
+            // Match convenience method parameters to constructor parameters by wire (serialized) name
+            // to handle cases where C# names diverge due to @clientName renames, @encodedName,
+            // or casing differences between the convenience parameters and model properties.
+            var convenienceMethodParamsByWireName = new Dictionary<string, ParameterProvider>(StringComparer.OrdinalIgnoreCase);
+            foreach (var p in convenienceMethodParameters)
+            {
+                if (p.WireInfo?.SerializedName != null)
+                {
+                    convenienceMethodParamsByWireName.TryAdd(p.WireInfo.SerializedName, p);
+                }
+            }
+
+            // For customized properties (where OriginalName identifies the original property),
+            // use the original property's wire info to ensure the dictionary has the correct mapping.
+            foreach (var property in spreadSource.CanonicalView.Properties)
+            {
+                if (property.OriginalName != null && property.WireInfo?.SerializedName is { } wireName)
+                {
+                    var matchedParam = convenienceMethodParameters.FirstOrDefault(
+                        p => string.Equals(p.WireInfo?.SerializedName, wireName, StringComparison.OrdinalIgnoreCase));
+                    if (matchedParam != null)
+                    {
+                        convenienceMethodParamsByWireName.TryAdd(wireName, matchedParam);
+                    }
+                }
+            }
+
+            // Build a lookup from property name to wire name so we can resolve wire names
+            // for custom constructor parameters that don't have a Property reference.
+            var propertyWireNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var property in spreadSource.CanonicalView.Properties)
+            {
+                if (property.WireInfo?.SerializedName is { } propWireName)
+                {
+                    propertyWireNames.TryAdd(property.Name, propWireName);
+                }
+            }
+
+            List<ValueExpression> expressions = new(spreadSource.Properties.Count);
+            // we should make this find more deterministic
+            var ctor = spreadSource.CanonicalView.Constructors.First(c =>
+                c.Signature.Parameters.Count == spreadSource.CanonicalView.Properties.Count + 1 ||
+                    (c.EnclosingType is ScmModelProvider { IsDynamicModel: true } && c.Signature.Parameters.Count == spreadSource.CanonicalView.Properties.Count));
+
+            foreach (var param in ctor.Signature.Parameters)
+            {
+                // Get wire name from the parameter's property if available, otherwise resolve
+                // from the model's properties by matching the parameter name to a property name.
+                var property = param.Property;
+                var wireName = property?.WireInfo?.SerializedName;
+                if (wireName == null)
+                {
+                    propertyWireNames.TryGetValue(param.Name, out wireName);
+                }
+
+                if (property == null && wireName != null)
+                {
+                    property = spreadSource.CanonicalView.Properties.FirstOrDefault(
+                        p => string.Equals(p.WireInfo?.SerializedName, wireName, StringComparison.OrdinalIgnoreCase));
+                }
+
+                ParameterProvider? convenienceParam = null;
+                if (wireName != null)
+                {
+                    convenienceMethodParamsByWireName.TryGetValue(wireName, out convenienceParam);
+                }
+
+                if (convenienceParam != null)
+                {
+                    if (convenienceParam.Type.IsList)
+                    {
+                        var interfaceType = property?.WireInfo?.IsReadOnly == true
+                            ? new CSharpType(typeof(IReadOnlyList<>), convenienceParam.Type.Arguments)
+                            : new CSharpType(typeof(IList<>), convenienceParam.Type.Arguments);
+                        expressions.Add(new AsExpression(convenienceParam.NullConditional().ToList(), interfaceType)
+                            .NullCoalesce(New.Instance(convenienceParam.Type.PropertyInitializationType, [])));
+                    }
+                    else if (convenienceParam.Type.IsDictionary)
+                    {
+                        expressions.Add(convenienceParam.NullCoalesce(New.Instance(convenienceParam.Type.PropertyInitializationType)));
+                    }
+                    else
+                    {
+                        expressions.Add(convenienceParam);
+                    }
+                }
+                else if (param.Property is { Body: AutoPropertyBody { InitializationExpression: not null } body })
+                {
+                    expressions.Add(body.InitializationExpression);
+                }
+                else
+                {
+                    expressions.Add(Default);
+                }
+            }
+
+            return expressions;
+        }
+
+        private IEnumerable<MethodBodyStatement> GetStackVariablesForReturnValueConversion(ClientResponseApi result, CSharpType responseBodyType, bool isAsync, out Dictionary<string, ValueExpression> declarations)
+        {
+            declarations = [];
+
+            if (responseBodyType.IsList)
+            {
+                var elementType = responseBodyType.Arguments[0];
+
+                // Check if the response uses XML content type
+                if (TryGetXmlCollectionNamesForResponse(elementType, out var rootName, out var childName))
+                {
+                    return BuildXmlCollectionConversionForResult(
+                        result,
+                        responseBodyType,
+                        elementType,
+                        rootName,
+                        childName,
+                        out declarations);
+                }
+
+                return BuildCollectionConversionForResult(
+                    result,
+                    responseBodyType,
+                    elementType,
+                    ShouldUseJsonDocForDeserializingType(elementType),
+                    out declarations);
+            }
+
+            if (responseBodyType.IsDictionary)
+            {
+                var keyType = responseBodyType.Arguments[0];
+                var valueType = responseBodyType.Arguments[1];
+                return BuildDictionaryConversionForResult(
+                    result,
+                    responseBodyType,
+                    keyType,
+                    valueType,
+                    ShouldUseJsonDocForDeserializingType(valueType),
+                    out declarations);
+            }
+
+            if ((IsConvertibleFromBinaryData(responseBodyType) || GetPlainTextParseType(responseBodyType, out _) is not null)
+                && (responseBodyType.IsFrameworkType || responseBodyType.IsEnum)
+                && !responseBodyType.Equals(typeof(BinaryData))
+                && !HasOnlyPlainTextContentType())
+            {
+                var data = result.GetRawResponse().Content();
+                var statements = new MethodBodyStatement[]
+                {
+                    UsingDeclare("document", data.Parse(), out var document)
+                };
+                declarations["data"] = data;
+                declarations["document"] = document;
+                return statements;
+            }
+
+            return [];
+        }
+
+        private List<MethodBodyStatement> BuildCollectionConversionForResult(ClientResponseApi result, CSharpType responseBodyType, CSharpType elementType, bool usesJsonDocument, out Dictionary<string, ValueExpression> declarations)
+        {
+            var listType = new CSharpType(typeof(List<>), elementType);
+            var statements = new List<MethodBodyStatement>
+            {
+                Declare("value", New.Instance(listType).As(listType), out var value),
+                Declare("data", result.GetRawResponse().Content(), out var data)
+            };
+            declarations = new Dictionary<string, ValueExpression> { { "value", value } };
+
+            if (usesJsonDocument)
+            {
+                statements.Add(UsingDeclare("document", data.Parse(), out var document));
+                statements.Add(ForEachStatement.Create("item", document.RootElement().EnumerateArray(), out ScopedApi<JsonElement> item)
+                    .Add(GetElementConversion(elementType, data, item, value)));
+                return statements;
+            }
+
+            if (ShouldBuildStackVarForFrameworkType(elementType))
+            {
+                var readerVar = new VariableExpression(typeof(Utf8JsonReader), "jsonReader");
+                statements.Add(Declare(readerVar, New.Instance(typeof(Utf8JsonReader), ReadOnlyMemorySnippets.Span(data.ToMemory()))));
+
+                var readMethod = readerVar.Read();
+                statements.Add(readMethod.Terminate());
+                statements.Add(new WhileStatement(readMethod)
+                {
+                    new IfStatement(readerVar.TokenType().Equal(JsonTokenTypeSnippets.EndArray)) { Break },
+                    GetFrameworkTypeConversionFromReader(elementType, readerVar, value, null)
+                });
+            }
+
+            return statements;
+        }
+
+        private List<MethodBodyStatement> BuildXmlCollectionConversionForResult(
+            ClientResponseApi result,
+            CSharpType responseBodyType,
+            CSharpType elementType,
+            string rootName,
+            string childName,
+            out Dictionary<string, ValueExpression> declarations)
+        {
+            var listType = new CSharpType(typeof(List<>), elementType);
+            var defaultValue = new VariableExpression(responseBodyType, "value");
+            var statements = new List<MethodBodyStatement>
+            {
+                Declare(defaultValue, Default),
+                Declare("data", result.GetRawResponse().Content(), out var data)
+            };
+            declarations = new Dictionary<string, ValueExpression> { { "value", defaultValue } };
+
+            // Build the inner loop
+            var arrayVar = new VariableExpression(listType, "array");
+
+            statements.Add(
+                new UsingScopeStatement(typeof(Stream), "stream", data.ToStream(), out var streamVar)
+                {
+                    Declare("document", typeof(XDocument), Static(typeof(XDocument)).Invoke(nameof(XDocument.Load), [streamVar, XmlLinqSnippets.PreserveWhitespace]), out var documentVar),
+                    new IfStatement(documentVar.Invoke(nameof(XDocument.Element), Literal(rootName)).Is(Declare<XElement>("element", out var rootElementVar)))
+                    {
+                        Declare(arrayVar, New.Instance(listType)),
+                        ForEachStatement.Create(
+                            "item",
+                            rootElementVar.Elements(Literal(childName)),
+                            out ScopedApi<XElement> item)
+                            .Add(arrayVar.As(listType).Add(
+                                MrwSerializationTypeDefinition.GetDeserializationMethodInvocationForType(
+                                    elementType,
+                                    item,
+                                    null,
+                                    ModelSerializationExtensionsSnippets.Wire))),
+                        defaultValue.Assign(arrayVar).Terminate()
+                    }
+                });
+
+            return statements;
+        }
+
+        private List<MethodBodyStatement> BuildDictionaryConversionForResult(ClientResponseApi result, CSharpType responseBodyType, CSharpType keyType, CSharpType valueType, bool usesJsonDocument, out Dictionary<string, ValueExpression> declarations)
+        {
+            var dictType = new CSharpType(typeof(Dictionary<,>), keyType, valueType);
+            var statements = new List<MethodBodyStatement>
+            {
+                Declare("value", New.Instance(dictType).As(responseBodyType), out var value),
+                Declare("data", result.GetRawResponse().Content(), out var data)
+            };
+            declarations = new Dictionary<string, ValueExpression> { { "value", value } };
+
+            if (usesJsonDocument)
+            {
+                statements.Add(UsingDeclare("document", data.Parse(), out var document));
+                statements.Add(ForEachStatement.Create("item", document.RootElement().EnumerateObject(), out ScopedApi<JsonProperty> item)
+                    .Add(GetElementConversion(valueType, data, item.Value(), value, item.Name())));
+                return statements;
+            }
+
+            if (ShouldBuildStackVarForFrameworkType(valueType))
+            {
+                var readerVar = new VariableExpression(typeof(Utf8JsonReader), "jsonReader");
+                statements.Add(Declare(readerVar, New.Instance(typeof(Utf8JsonReader), ReadOnlyMemorySnippets.Span(data.ToMemory()))));
+
+                var readMethod = readerVar.Read();
+                statements.Add(readMethod.Terminate());
+                statements.Add(new WhileStatement(readMethod)
+                {
+                    new IfStatement(readerVar.TokenType().Equal(JsonTokenTypeSnippets.EndObject)) { Break },
+                    Declare("propertyName", typeof(string), readerVar.GetString(), out var propertyName),
+                    readMethod.Terminate(),
+                    GetFrameworkTypeConversionFromReader(valueType, readerVar, value, propertyName)
+                });
+            }
+
+            return statements;
+        }
+
+        private MethodBodyStatement GetElementConversion(CSharpType elementType, ScopedApi<BinaryData> data, ScopedApi<JsonElement> item, ScopedApi value, ValueExpression? dictKey = null)
+        {
+            if (elementType.Equals(typeof(TimeSpan)))
+            {
+                return AddElement(dictKey, item.Invoke("GetTimeSpan", Literal("P")), value);
+            }
+            else if (elementType.Equals(typeof(BinaryData)))
+            {
+                return new IfElseStatement(
+                    item.ValueKind().Equal(JsonValueKindSnippets.Null),
+                    AddElement(dictKey, Null, value),
+                    AddElement(dictKey, item.GetUtf8Bytes(), value));
+            }
+            else
+            {
+                return AddElement(
+                    dictKey,
+                    MrwSerializationTypeDefinition.GetDeserializationMethodInvocationForType(elementType, item, data, ModelSerializationExtensionsSnippets.Wire),
+                    value);
+            }
+        }
+
+        private MethodBodyStatement GetFrameworkTypeConversionFromReader(CSharpType elementType, VariableExpression reader, ScopedApi value, ValueExpression? dictKey)
+        {
+            var frameworkType = elementType.FrameworkType;
+
+            // Special handling for string
+            if (frameworkType == typeof(string))
+            {
+                var getString = reader.GetString();
+                return AddElement(dictKey, getString.As<string>(), value);
+            }
+
+            // Map framework types to their Utf8JsonReader method names
+            var readerMethodName = frameworkType switch
+            {
+                Type t when t == typeof(short) => nameof(Utf8JsonReader.GetInt16),
+                Type t when t == typeof(ushort) => nameof(Utf8JsonReader.GetUInt16),
+                Type t when t == typeof(int) => nameof(Utf8JsonReader.GetInt32),
+                Type t when t == typeof(uint) => nameof(Utf8JsonReader.GetUInt32),
+                Type t when t == typeof(long) => nameof(Utf8JsonReader.GetInt64),
+                Type t when t == typeof(ulong) => nameof(Utf8JsonReader.GetUInt64),
+                Type t when t == typeof(bool) => nameof(Utf8JsonReader.GetBoolean),
+                Type t when t == typeof(double) => nameof(Utf8JsonReader.GetDouble),
+                Type t when t == typeof(float) => nameof(Utf8JsonReader.GetSingle),
+                Type t when t == typeof(decimal) => nameof(Utf8JsonReader.GetDecimal),
+                Type t when t == typeof(DateTimeOffset) => nameof(Utf8JsonReader.GetDateTimeOffset),
+                Type t when t == typeof(Guid) => nameof(Utf8JsonReader.GetGuid),
+                _ => null
+            };
+
+            if (readerMethodName != null)
+            {
+                if (elementType.IsNullable)
+                {
+                    // For nullable types, check if token is null, otherwise call the reader method
+                    var nullCheck = reader.TokenType().Equal(FrameworkEnumValue(JsonTokenType.Null));
+                    var nullableType = new CSharpType(frameworkType, isNullable: true);
+                    var nullableValue = new TernaryConditionalExpression(nullCheck, Null, reader.Invoke(readerMethodName).As(nullableType));
+                    return AddElement(dictKey, nullableValue, value);
+                }
+                else
+                {
+                    // For non-nullable types, directly call the reader method
+                    return AddElement(dictKey, reader.Invoke(readerMethodName), value);
+                }
+            }
+
+            ScmCodeModelGenerator.Instance.Emitter.ReportDiagnostic(
+                DiagnosticCodes.UnsupportedFrameworkType,
+                $"Unsupported framework type: {frameworkType}. Element will be skipped.",
+                ServiceMethod.Operation.CrossLanguageDefinitionId,
+                EmitterDiagnosticSeverity.Error);
+
+            return MethodBodyStatement.Empty;
+        }
+
+        private MethodBodyStatement AddElement(ValueExpression? dictKey, ValueExpression element, ScopedApi scopedApi)
+        {
+            if (dictKey != null)
+            {
+                // Add items to dictionary
+                return scopedApi.Add(dictKey, element);
+            }
+            // Add items to list
+            return scopedApi.Add(element);
+        }
+
+        private MethodBodyStatement[] GetResultConversionStatements(ClientResponseApi result, HttpResponseApi response, CSharpType responseBodyType, Dictionary<string, ValueExpression> declarations)
+        {
+            var plainTextParseType = GetPlainTextParseType(responseBodyType, out var enumType);
+            if (!responseBodyType.Equals(typeof(string)) && plainTextParseType is not null && HasOnlyPlainTextContentType())
+            {
+                return
+                [
+                    Declare("value", responseBodyType, GetPlainTextValueConversion(responseBodyType, plainTextParseType, enumType, response.Content().InvokeToString()), out var value),
+                    Return(result.FromValue(value, response))
+                ];
+            }
+
+            var isSpecialCaseType = responseBodyType.Equals(typeof(BinaryData))
+                || responseBodyType.IsCollection
+                || (responseBodyType.Equals(typeof(string)) && HasOnlyPlainTextContentType());
+
+            if (!isSpecialCaseType && (responseBodyType.IsFrameworkType || responseBodyType.IsEnum))
+            {
+                var element = declarations["document"].As<JsonDocument>().RootElement();
+                var deserializedValue = ScmCodeModelGenerator.Instance.TypeFactory.DeserializeJsonValue(
+                    responseBodyType.WithNullable(false),
+                    element,
+                    declarations["data"].As<BinaryData>(),
+                    ScmCodeModelGenerator.Instance.ModelSerializationExtensionsDefinition.WireOptionsField.As<ModelReaderWriterOptions>(),
+                    responseBodyType.Equals(typeof(TimeSpan)) || responseBodyType.Equals(typeof(TimeSpan?))
+                        ? SerializationFormat.Duration_Constant
+                        : SerializationFormat.Default);
+                var valueExpression = responseBodyType.IsNullable
+                    ? new TernaryConditionalExpression(element.ValueKindEqualsNull(), Null.CastTo(responseBodyType), deserializedValue)
+                    : deserializedValue;
+
+                return
+                [
+                    Declare("value", responseBodyType, valueExpression, out var value),
+                    Return(result.FromValue(value, response))
+                ];
+            }
+
+            return [Return(result.FromValue(GetResultConversion(result, response, responseBodyType, declarations), response))];
+        }
+
+        private ValueExpression GetResultConversion(ClientResponseApi result, HttpResponseApi response, CSharpType responseBodyType, Dictionary<string, ValueExpression> declarations)
+        {
+            if (responseBodyType.Equals(typeof(BinaryData)))
+            {
+                return response.Content();
+            }
+            if (responseBodyType.IsReadOnlyMemory)
+            {
+                return New.Instance(responseBodyType, declarations["value"].Invoke(nameof(List<>.ToArray)));
+            }
+            if (responseBodyType.IsList)
+            {
+                return declarations["value"].CastTo(new CSharpType(responseBodyType.OutputType.FrameworkType, responseBodyType.Arguments[0]));
+            }
+            if (responseBodyType.IsDictionary)
+            {
+                return declarations["value"].CastTo(new CSharpType(responseBodyType.OutputType.FrameworkType, responseBodyType.Arguments[0], responseBodyType.Arguments[1]));
+            }
+            if (responseBodyType.Equals(typeof(string)) && HasOnlyPlainTextContentType())
+            {
+                return response.Content().InvokeToString();
+            }
+            return result.CastTo(responseBodyType);
+        }
+
+        private ValueExpression GetPlainTextValueConversion(CSharpType responseBodyType, Type parseType, CSharpType? enumType, ValueExpression content)
+        {
+            var invariantCulture = new MemberExpression(typeof(CultureInfo), nameof(CultureInfo.InvariantCulture));
+            var deserializedValue = parseType switch
+            {
+                Type t when t == typeof(string) => content,
+                Type t when t == typeof(bool) => Static<bool>().Invoke(nameof(bool.Parse), content).As<bool>(),
+                Type t when t == typeof(Guid) => Static<Guid>().Invoke(nameof(Guid.Parse), content).As<Guid>(),
+                Type t when t == typeof(Uri) => New.Instance<Uri>(content, FrameworkEnumValue(UriKind.RelativeOrAbsolute)),
+                Type t when t == typeof(TimeSpan) => GetPlainTextTimeSpanConversion(content, invariantCulture),
+                Type t when t == typeof(DateTimeOffset) => content.As<string>().ParseDateTimeOffset(Literal(GetResponseSerializationFormat().ToFormatSpecifier())),
+                // The remaining supported types are numeric and all expose a static Parse(string, IFormatProvider) method.
+                _ => Static(parseType).Invoke(nameof(int.Parse), [content, invariantCulture]).As(parseType)
+            };
+
+            if (enumType is not null)
+            {
+                deserializedValue = enumType.ToEnum(deserializedValue);
+            }
+
+            return responseBodyType.IsNullable
+                ? new TernaryConditionalExpression(content.As<string>().Trim().Equal(Literal("null")), Null.CastTo(responseBodyType), deserializedValue)
+                : deserializedValue;
+        }
+
+        /// <summary>
+        /// Builds the raw-text conversion for a <see cref="TimeSpan"/> response, honoring the response body's wire
+        /// encoding. Numeric duration encodings (seconds/milliseconds) parse the content as a number and construct
+        /// the <see cref="TimeSpan"/> from it, matching <see cref="MrwSerializationTypeDefinition"/>'s JSON handling;
+        /// all other encodings (ISO 8601, constant, plain time) parse the content directly using the corresponding
+        /// format specifier.
+        /// </summary>
+        private ValueExpression GetPlainTextTimeSpanConversion(ValueExpression content, ValueExpression invariantCulture)
+        {
+            var format = GetResponseSerializationFormat();
+            switch (format)
+            {
+                case SerializationFormat.Duration_Seconds:
+                    return TimeSpanSnippets.FromSeconds(ParseNumeric<int>(content, invariantCulture));
+                case SerializationFormat.Duration_Seconds_Int64:
+                    return TimeSpanSnippets.FromSeconds(ParseNumeric<long>(content, invariantCulture));
+                case SerializationFormat.Duration_Seconds_Float:
+                case SerializationFormat.Duration_Seconds_Double:
+                    // Float and Double wire encodings are intentionally collapsed to a single double.Parse,
+                    // matching MrwSerializationTypeDefinition's JSON path, which uses GetDouble() for both.
+                    return TimeSpanSnippets.FromSeconds(ParseNumeric<double>(content, invariantCulture));
+                case SerializationFormat.Duration_Milliseconds:
+                    return TimeSpanSnippets.FromMilliseconds(ParseNumeric<int>(content, invariantCulture));
+                case SerializationFormat.Duration_Milliseconds_Int64:
+                    return TimeSpanSnippets.FromMilliseconds(ParseNumeric<long>(content, invariantCulture));
+                case SerializationFormat.Duration_Milliseconds_Float:
+                case SerializationFormat.Duration_Milliseconds_Double:
+                    // See the Duration_Seconds_Float/Double comment above.
+                    return TimeSpanSnippets.FromMilliseconds(ParseNumeric<double>(content, invariantCulture));
+            }
+
+            var formatSpecifier = format.ToFormatSpecifier();
+            if (formatSpecifier is null)
+            {
+                ScmCodeModelGenerator.Instance.Emitter.ReportDiagnostic(
+                    DiagnosticCodes.UnsupportedSerialization,
+                    $"Unsupported duration serialization format: {format}. Falling back to constant duration format.",
+                    ServiceMethod.Operation.CrossLanguageDefinitionId);
+                formatSpecifier = SerializationFormat.Duration_Constant.ToFormatSpecifier()!;
+            }
+
+            // ISO 8601 ("P"), constant ("c") and plain time ("T") encodings all parse the content directly.
+            return content.As<string>().ParseTimeSpan(Literal(formatSpecifier));
+        }
+
+        /// <summary>
+        /// Builds a <c>T.Parse(content, invariantCulture)</c> invocation for the given numeric <typeparamref name="T"/>.
+        /// </summary>
+        private static ScopedApi<T> ParseNumeric<T>(ValueExpression content, ValueExpression invariantCulture)
+            where T : struct
+        {
+            // Static members on a generic type parameter cannot be referenced by nameof.
+            return Static<T>().Invoke("Parse", [content, invariantCulture]).As<T>();
+        }
+
+        /// <summary>
+        /// Gets the framework type that a raw text response body is parsed into, or <c>null</c> when the response body
+        /// type isn't a primitive or enum that can be parsed from raw text. Types such as <see cref="BinaryData"/>,
+        /// collections and generated models keep their existing conversion.
+        /// </summary>
+        private static Type? GetPlainTextParseType(CSharpType responseBodyType, out CSharpType? enumType)
+        {
+            enumType = null;
+            var typeToParse = responseBodyType.WithNullable(false);
+            if (typeToParse is { IsEnum: true, UnderlyingEnumType: { } underlyingEnumType })
+            {
+                enumType = typeToParse;
+                typeToParse = underlyingEnumType;
+            }
+
+            if (!typeToParse.IsFrameworkType)
+            {
+                return null;
+            }
+
+            var frameworkType = typeToParse.FrameworkType;
+            return frameworkType switch
+            {
+                Type t when t == typeof(string)
+                    || t == typeof(bool)
+                    || t == typeof(Guid)
+                    || t == typeof(Uri)
+                    || t == typeof(TimeSpan)
+                    || t == typeof(DateTimeOffset)
+                    || t == typeof(byte)
+                    || t == typeof(sbyte)
+                    || t == typeof(short)
+                    || t == typeof(ushort)
+                    || t == typeof(int)
+                    || t == typeof(uint)
+                    || t == typeof(long)
+                    || t == typeof(ulong)
+                    || t == typeof(float)
+                    || t == typeof(double)
+                    || t == typeof(decimal) => frameworkType,
+                _ => null
+            };
+        }
+
+        private bool HasOnlyPlainTextContentType()
+        {
+            var contentTypes = ServiceMethod.Operation.Responses
+                .Where(r => r.IsErrorResponse is false)
+                .SelectMany(r => r.ContentTypes);
+            return contentTypes.Any() && contentTypes.All(IsPlainTextContentType);
+        }
+
+        private static bool IsPlainTextContentType(string contentType)
+        {
+            return contentType.Split(';')[0].Trim().Equals("text/plain", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private SerializationFormat GetResponseSerializationFormat()
+        {
+            var responseBodyType = ServiceMethod.Operation.Responses
+                .FirstOrDefault(r => r.IsErrorResponse is false)?.BodyType;
+            return responseBodyType is null
+                ? SerializationFormat.Default
+                : ScmCodeModelGenerator.Instance.TypeFactory.GetSerializationFormat(responseBodyType);
+        }
+
+        private static bool ShouldBuildStackVarForFrameworkType(CSharpType type)
+        {
+            if (!type.IsFrameworkType)
+            {
+                return false;
+            }
+
+            return type.Equals(typeof(string)) ||
+                   type.Equals(typeof(short)) ||
+                   type.Equals(typeof(short?)) ||
+                   type.Equals(typeof(ushort)) ||
+                   type.Equals(typeof(ushort?)) ||
+                   type.Equals(typeof(int)) ||
+                   type.Equals(typeof(int?)) ||
+                   type.Equals(typeof(uint)) ||
+                   type.Equals(typeof(uint?)) ||
+                   type.Equals(typeof(long)) ||
+                   type.Equals(typeof(long?)) ||
+                   type.Equals(typeof(ulong)) ||
+                   type.Equals(typeof(ulong?)) ||
+                   type.Equals(typeof(double)) ||
+                   type.Equals(typeof(double?)) ||
+                   type.Equals(typeof(float)) ||
+                   type.Equals(typeof(float?)) ||
+                   type.Equals(typeof(decimal)) ||
+                   type.Equals(typeof(decimal?)) ||
+                   type.Equals(typeof(bool)) ||
+                   type.Equals(typeof(bool?)) ||
+                   type.Equals(typeof(DateTimeOffset)) ||
+                   type.Equals(typeof(DateTimeOffset?)) ||
+                   type.Equals(typeof(Guid)) ||
+                   type.Equals(typeof(Guid?));
+        }
+
+        private static bool IsConvertibleFromBinaryData(CSharpType type)
+        {
+            if (type.Equals(typeof(BinaryData)))
+            {
+                return true;
+            }
+
+            if (!type.IsFrameworkType)
+            {
+                // generated types will have the explicit operator from ClientResult defined
+                return true;
+            }
+
+            if (type.IsList)
+            {
+                return IsConvertibleFromBinaryData(type.Arguments[0]);
+            }
+
+            if (type.IsDictionary)
+            {
+                return IsConvertibleFromBinaryData(type.Arguments[1]);
+            }
+
+            return type.Equals(typeof(string)) ||
+                   type.Equals(typeof(short)) ||
+                   type.Equals(typeof(short?)) ||
+                   type.Equals(typeof(ushort)) ||
+                   type.Equals(typeof(ushort?)) ||
+                   type.Equals(typeof(int)) ||
+                   type.Equals(typeof(int?)) ||
+                   type.Equals(typeof(uint)) ||
+                   type.Equals(typeof(uint?)) ||
+                   type.Equals(typeof(long)) ||
+                   type.Equals(typeof(long?)) ||
+                   type.Equals(typeof(ulong)) ||
+                   type.Equals(typeof(ulong?)) ||
+                   type.Equals(typeof(double)) ||
+                   type.Equals(typeof(double?)) ||
+                   type.Equals(typeof(float)) ||
+                   type.Equals(typeof(float?)) ||
+                   type.Equals(typeof(decimal)) ||
+                   type.Equals(typeof(decimal?)) ||
+                   type.Equals(typeof(bool)) ||
+                   type.Equals(typeof(bool?)) ||
+                   type.Equals(typeof(DateTimeOffset)) ||
+                   type.Equals(typeof(DateTimeOffset?)) ||
+                   type.Equals(typeof(TimeSpan)) ||
+                   type.Equals(typeof(TimeSpan?));
+        }
+
+        private IReadOnlyList<AttributeStatement>? BuildConvenienceMethodAttributes()
+        {
+            if (ExperimentalApiHelpers.BuildAttribute(ServiceMethod.Operation) is { } experimentalAttribute)
+            {
+                return [experimentalAttribute];
+            }
+
+            var bodyInputParam = ServiceMethod.Parameters.FirstOrDefault(p => p.Location == InputRequestLocation.Body);
+            if (bodyInputParam?.Type is InputModelType bodyModel
+                && bodyModel.Usage.HasFlag(InputModelTypeUsage.MultipartFormData))
+            {
+                return [new AttributeStatement(typeof(ExperimentalAttribute), [Literal(ScmModelProvider.FileBinaryContentDiagnosticId)])];
+            }
+
+            return null;
+        }
+
+        private static void ApplyExperimentalAttributes(
+            MethodSignature signature,
+            MethodSignature? customSignature,
+            IReadOnlyList<AttributeStatement> generatedAttributes)
+        {
+            if (customSignature?.Attributes.Any(ExperimentalApiHelpers.IsExperimentalAttribute) != true
+                && generatedAttributes.Count > 0)
+            {
+                signature.Update(attributes: [.. signature.Attributes, .. generatedAttributes]);
+            }
+        }
+
+        private void ApplyDeprecationAttribute(MethodSignature signature, MethodSignature? customSignature)
+        {
+            if (customSignature?.Attributes.Any(DeprecationApiHelpers.IsObsoleteAttribute) != true
+                && !signature.Attributes.Any(DeprecationApiHelpers.IsObsoleteAttribute)
+                && DeprecationApiHelpers.BuildAttribute(ServiceMethod.Operation.Deprecated) is { } attribute)
+            {
+                signature.Update(attributes: [.. signature.Attributes, attribute]);
+            }
+        }
+
+        private IReadOnlyList<ValueExpression> GetMethodArguments(
+            MethodSignature signature,
+            Dictionary<string, ValueExpression> declarations,
+            IReadOnlyList<ParameterProvider> convenienceMethodParameters,
+            ParameterProvider cancellationToken)
+        {
+            List<ValueExpression> conversions = [];
+            bool addedSpreadSource = false;
+            var requestOptionsParameter = signature.Parameters[^1];
+
+            ModelProvider? bodyModel = null;
+            InputParameter? methodBodyParameter = ServiceMethod.Parameters.FirstOrDefault(p => p.Location == InputRequestLocation.Body);
+            if (methodBodyParameter?.Type is InputModelType model)
+            {
+                bodyModel = ScmCodeModelGenerator.Instance.TypeFactory.CreateModel(model);
+            }
+
+            var bodyParamProvider = convenienceMethodParameters.FirstOrDefault(p => p.Location == ParameterLocation.Body);
+            var nonBodyProperties = bodyModel?.CanonicalView.Properties
+                .Where(p => p.WireInfo?.IsHttpMetadata == true)
+                .ToDictionary(p => p.WireInfo!.SerializedName, p => p);
+
+            var convenienceParamsMap = convenienceMethodParameters.ToDictionary(
+                parameter => parameter.InputParameter?.Name ?? parameter.WireInfo.SerializedName,
+                StringComparer.OrdinalIgnoreCase);
+
+            bool requireNamedArgs = false;
+            foreach (var protocolParam in signature.Parameters)
+            {
+                // Skip RequestOptions parameter as it's added at the end
+                if (protocolParam.Type.Equals(ScmCodeModelGenerator.Instance.TypeFactory.HttpRequestOptionsApi.HttpRequestOptionsType))
+                {
+                    continue;
+                }
+
+                // Try to find the corresponding convenience parameter using MethodParameterSegments
+                if (protocolParam.InputParameter?.MethodParameterSegments is { Count: > 1 }
+                    && nonBodyProperties?.ContainsKey(protocolParam.Name) != true)
+                {
+                    // The MethodParameterSegments represents a path (e.g., ['Params', 'foo'] means params.foo)
+                    var rootParameterName = protocolParam.InputParameter.MethodParameterSegments[0].Name;
+                    if (!convenienceParamsMap.TryGetValue(rootParameterName, out var convenienceParam))
+                    {
+                        continue;
+                    }
+
+                    // Body parameters are handled separately.
+                    if (convenienceParam.Location == ParameterLocation.Body)
+                    {
+                        if (protocolParam.IsContentParameter
+                            && convenienceParam.Type.IsIAsyncEnumerableOfT
+                            && declarations.TryGetValue("content", out var streamingContent))
+                        {
+                            AddArgument(protocolParam, streamingContent);
+                        }
+                        continue;
+                    }
+
+                    // Navigate through the property path
+                    var propertySegments = protocolParam.InputParameter.MethodParameterSegments
+                        .Skip(1)
+                        .Select(p => p.Name)
+                        .ToList();
+
+                    if (ScmCodeModelGenerator.Instance.TypeFactory.CSharpTypeMap.TryGetValue(convenienceParam.Type, out var typeProvider) &&
+                        typeProvider is ModelProvider paramModel)
+                    {
+                        var propertyExpression = paramModel.GetPropertyExpression(convenienceParam, propertySegments, out var leafProperty);
+
+                        // When the options property is an enum but the protocol method flattens it to its
+                        // serialized (string/number) form, serialize it before forwarding, mirroring the
+                        // conversion applied to non-grouped enum convenience parameters below.
+                        if (leafProperty.Type.IsEnum && !protocolParam.Type.IsEnum)
+                        {
+                            if (leafProperty.Type.IsNullable)
+                            {
+                                propertyExpression = propertyExpression.NullConditional();
+                            }
+                            propertyExpression = leafProperty.Type.ToSerial(propertyExpression);
+                        }
+
+                        AddArgument(protocolParam, propertyExpression);
+                    }
+                }
+                else
+                {
+                    var sourceName = protocolParam.InputParameter?.Name ?? protocolParam.WireInfo.SerializedName;
+                    if (!convenienceParamsMap.TryGetValue(sourceName, out var convenienceParam))
+                    {
+                        if (protocolParam.IsContentParameter)
+                        {
+                            convenienceParam = bodyParamProvider;
+                        }
+                    }
+
+                    if (convenienceParam == null)
+                    {
+                        // When the convenience surface drops a literal Content-Type header (which
+                        // can happen for multipart operations where the actual wire value includes
+                        // a boundary computed at runtime), forward the value from the multipart
+                        // content's MediaType property to the protocol method.
+                        if (ServiceMethod.Operation.IsMultipartFormData
+                            && string.Equals(protocolParam.WireInfo.SerializedName, ScmKnownParameters.ContentType.WireInfo.SerializedName, StringComparison.OrdinalIgnoreCase)
+                            && declarations.TryGetValue("content", out ValueExpression? multipartContent))
+                        {
+                            // When the body is optional, `content` may be null, so we forward `content?.MediaType`.
+                            var bodyInputParam = ServiceMethod.Parameters.FirstOrDefault(p => p.Location == InputRequestLocation.Body);
+                            var mediaTypeExpression = bodyInputParam is { IsRequired: false }
+                                ? new MemberExpression(new NullConditionalExpression(multipartContent), "MediaType")
+                                : multipartContent.Property("MediaType");
+                            AddArgument(protocolParam, mediaTypeExpression);
+                            continue;
+                        }
+
+                        if (TryGetNonBodyModelPropertyConversion(protocolParam, out var conversion))
+                        {
+                            AddArgument(protocolParam, conversion);
+                        }
+                        else
+                        {
+                            requireNamedArgs = true;
+                            // The protocol parameter might be required due to our need to avoid ambiguity with overloads. In this
+                            // case, the parameter should have also been made nullable.
+                            if (protocolParam.DefaultValue == null && protocolParam.Type.IsNullable)
+                            {
+                                AddArgument(protocolParam, Null);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Handle spread
+                    if (convenienceParam.SpreadSource is not null)
+                    {
+                        if (!addedSpreadSource && declarations.TryGetValue("spread", out ValueExpression? spread))
+                        {
+                            AddArgument(protocolParam, spread);
+                            addedSpreadSource = true;
+                        }
+                    }
+                    else if (convenienceParam.Location == ParameterLocation.Body)
+                    {
+                        if (convenienceParam.Type.IsReadOnlyMemory || convenienceParam.Type.IsList || convenienceParam.Type.IsIAsyncEnumerableOfT)
+                        {
+                            AddArgument(protocolParam, declarations["content"]);
+                        }
+                        else if (convenienceParam.Type.IsEnum)
+                        {
+                            AddArgument(protocolParam, declarations["content"]);
+                        }
+                        else if (convenienceParam.Type.Equals(typeof(BinaryData)))
+                        {
+                            AddArgument(protocolParam, RequestContentApiSnippets.Create(convenienceParam));
+                        }
+                        else if (convenienceParam.Type.IsFrameworkType)
+                        {
+                            AddArgument(protocolParam, declarations["content"]);
+                        }
+                        else
+                        {
+                            // Check if we created a using declaration for dual-format model
+                            if (declarations.TryGetValue("content", out var content))
+                            {
+                                AddArgument(protocolParam, content);
+                            }
+                            else
+                            {
+                                // Use implicit operator as fallback
+                                AddArgument(protocolParam, convenienceParam);
+                            }
+                        }
+                    }
+                    else if (convenienceParam.Type.IsEnum)
+                    {
+                        AddArgument(protocolParam, convenienceParam.Type.ToSerial(convenienceParam));
+                    }
+                    else
+                    {
+                        AddArgument(protocolParam, convenienceParam);
+                    }
+                }
+            }
+
+            // RequestOptions argument
+            var requestOptionsApi = ScmCodeModelGenerator.Instance.TypeFactory.HttpRequestOptionsApi;
+            // Build method name like "ToRequestOptions" or "ToRequestContext" based on the parameter name
+            var toRequestOptionsMethodName = $"ToRequest{char.ToUpper(requestOptionsApi.ParameterName[0])}{requestOptionsApi.ParameterName.Substring(1)}";
+            AddArgument(requestOptionsParameter, cancellationToken.Invoke(toRequestOptionsMethodName, extensionType: _cancellationTokenExtensionsDefinition.Type));
+
+            void AddArgument(ParameterProvider protocolParam, ValueExpression argument)
+            {
+                conversions.Add(requireNamedArgs ? protocolParam.PositionalReference(argument) : argument);
+            }
+
+            bool TryGetNonBodyModelPropertyConversion(ParameterProvider protocolParam, out ValueExpression conversion)
+            {
+                conversion = Default;
+                if (bodyParamProvider is null || bodyModel is null || nonBodyProperties is null)
+                {
+                    return false;
+                }
+
+                if (!bodyParamProvider.Type.Equals(bodyModel.Type) || protocolParam.Location == ParameterLocation.Body)
+                {
+                    return false;
+                }
+
+                if (nonBodyProperties.TryGetValue(protocolParam.WireInfo.SerializedName, out var nonBodyProperty) ||
+                    nonBodyProperties.TryGetValue(protocolParam.Name, out nonBodyProperty))
+                {
+                    conversion = bodyParamProvider.Property(nonBodyProperty.Name);
+                    return true;
+                }
+
+                return false;
+            }
+
+            return conversions;
+        }
+
+        private ScmMethodProvider BuildProtocolMethod(MethodProvider createRequestMethod, bool isAsync, bool shouldMakeParametersRequired)
+        {
+            if (EnclosingType is not ClientProvider client)
+            {
+                throw new InvalidOperationException("Protocol methods can only be built for client types.");
+            }
+
+            var methodModifiers = ServiceMethod.Accessibility == "public" && ServiceMethod.Operation.GenerateProtocolMethod ?
+                MethodSignatureModifiers.Public :
+                MethodSignatureModifiers.Internal;
+
+            methodModifiers |= MethodSignatureModifiers.Virtual;
+
+            if (isAsync && _pagingServiceMethod == null)
+            {
+                methodModifiers |= MethodSignatureModifiers.Async;
+            }
+
+            var requiredParameters = new List<ParameterProvider>();
+            var optionalParameters = new List<ParameterProvider>();
+            var convertedRequiredParameters = new List<ParameterProvider>();
+            var protocolParameters = RestClientProvider.GetMethodParameters(ServiceMethod, ScmMethodKind.Protocol, Client);
+            var contentIndex = protocolParameters.FindIndex(parameter => parameter.IsContentParameter);
+            var hasOptionalContent = contentIndex >= 0 && protocolParameters[contentIndex].DefaultValue != null;
+            var makeOptionalRequired = shouldMakeParametersRequired
+                && (contentIndex < 0 || hasOptionalContent);
+            for (var i = 0; i < protocolParameters.Count; i++)
+            {
+                var parameter = protocolParameters[i];
+                if (makeOptionalRequired && parameter.DefaultValue != null && (contentIndex < 0 || i <= contentIndex))
+                {
+                    // Keep the optional source unchanged when constructing the required-nullable protocol variant.
+                    parameter = parameter.IsContentParameter
+                        ? ScmKnownParameters.CreateRequestContent(parameter.InputParameter, nullable: true)
+                        : new ParameterProvider(
+                            parameter.Name,
+                            parameter.Description,
+                            parameter.Type.WithNullable(true),
+                            isRef: parameter.IsRef,
+                            isOut: parameter.IsOut,
+                            isIn: parameter.IsIn,
+                            isParams: parameter.IsParams,
+                            attributes: parameter.Attributes,
+                            property: parameter.Property,
+                            field: parameter.Field,
+                            initializationValue: parameter.InitializationValue,
+                            location: parameter.Location,
+                            wireInfo: parameter.WireInfo,
+                            validation: parameter.Validation,
+                            inputParameter: parameter.InputParameter)
+                        {
+                            SpreadSource = parameter.SpreadSource
+                        };
+                    // Preserve the old async required-first order and sync order after optional promotion.
+                    (isAsync ? convertedRequiredParameters : requiredParameters).Add(parameter);
+                    continue;
+                }
+                if (parameter.DefaultValue is null)
+                {
+                    requiredParameters.Add(parameter);
+                }
+                else
+                {
+                    optionalParameters.Add(parameter);
+                }
+            }
+            requiredParameters.AddRange(convertedRequiredParameters);
+            var requestOptionsParameter = ScmKnownParameters.CreateRequestOptions(
+                optional: !shouldMakeParametersRequired || contentIndex >= 0);
+
+            // A grouped options bag adopted by the protocol method can carry the same name as the request
+            // options/context parameter, which would emit a duplicate parameter name. Rename the request
+            // options parameter when that happens.
+            requestOptionsParameter = ResolveRequestOptionsNameCollision(
+                requestOptionsParameter,
+                requiredParameters,
+                optionalParameters);
+
+            ParameterProvider[] parameters = [.. requiredParameters, .. optionalParameters, requestOptionsParameter];
+            var methodName = isAsync ? ServiceMethod.Name + "Async" : ServiceMethod.Name;
+
+            // Detect a partial method declaration in the client's custom code matching this protocol method.
+            // When found, we use the customized signature (modifiers, name, parameter names) and emit the
+            // generated body using the customized parameter references.
+            MethodSignature? customSignature = null;
+            PartialMethodCustomization.TryFindCustomSignature(client, methodName, parameters, out customSignature);
+
+            MethodSignature methodSignature;
+            ParameterProvider[] bodyParameters;
+
+            if (customSignature != null)
+            {
+                // Partial methods cannot have optional parameters in the implementation.
+                var requiredCustomParameters = PartialMethodCustomization.RenameAndCloneParameters(
+                    parameters,
+                    customSignature.Parameters,
+                    removeDefaults: true).ToArray();
+
+                methodSignature = PartialMethodCustomization.BuildPartialSignature(
+                    customSignature,
+                    requiredCustomParameters,
+                    additionalModifiers: isAsync && _pagingServiceMethod == null
+                        ? MethodSignatureModifiers.Async
+                        : MethodSignatureModifiers.None);
+
+                bodyParameters = requiredCustomParameters;
+                // Re-resolve the request options parameter from the customized parameter list so the
+                // generated body references the user-named options parameter (typically the last param).
+                requestOptionsParameter = requiredCustomParameters[requiredCustomParameters.Length - 1];
+            }
+            else
+            {
+                methodSignature = new MethodSignature(
+                    methodName,
+                    DocHelpers.GetFormattableDescription(ServiceMethod.Operation.Summary, ServiceMethod.Operation.Doc) ?? FormattableStringHelpers.FromString(ServiceMethod.Operation.Name),
+                    methodModifiers,
+                    GetResponseType(ServiceMethod.Operation.Responses, false, isAsync, out _),
+                    $"The response returned from the service.",
+                    parameters);
+                bodyParameters = parameters;
+            }
+
+            ApplyExperimentalAttributes(methodSignature, customSignature, ExperimentalApiHelpers.BuildAttributes(ServiceMethod.Operation.Experimental));
+            ApplyDeprecationAttribute(methodSignature, customSignature);
+
+            TypeProvider? collection = null;
+            MethodBodyStatement[] methodBody;
+            if (_pagingServiceMethod != null)
+            {
+                collection = ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.CreateClientCollectionResultDefinition(Client, _pagingServiceMethod, null, isAsync);
+                methodBody = [.. GetPagingMethodBody(collection, createRequestMethod.Signature, bodyParameters)];
+            }
+            else
+            {
+                var streamingResponse = _streamingResponse.Value;
+                methodBody =
+                [
+                    UsingDeclare("message", ScmCodeModelGenerator.Instance.TypeFactory.HttpMessageApi.HttpMessageType,
+                        This.Invoke(createRequestMethod.Signature,
+                            BuildCreateRequestArguments(createRequestMethod.Signature, bodyParameters)), out var message),
+                    .. ServiceMethod.Operation.BufferResponse
+                        ? []
+                        : new MethodBodyStatement[] { message.ToApi<HttpMessageApi>().BufferResponse().Assign(False).Terminate() },
+                    Return(ServiceMethod.Operation.ResponseAsBool
+                        ? client.PipelineProperty.ToApi<ClientPipelineApi>().ProcessHeadAsBoolMessage(
+                            message,
+                            requestOptionsParameter.ToApi<HttpRequestOptionsApi>(),
+                            isAsync)
+                        : streamingResponse != null
+                        ? CreateStreamingResultExpression(
+                            streamingResponse,
+                            client.PipelineProperty.ToApi<ClientPipelineApi>().ProcessMessage(
+                                message,
+                                requestOptionsParameter.ToApi<HttpRequestOptionsApi>(),
+                                isAsync),
+                            cancellationToken: null,
+                            useConvenienceType: false)
+                        : ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ToExpression().FromResponse(client
+                            .PipelineProperty.ToApi<ClientPipelineApi>().ProcessMessage(
+                                message,
+                                requestOptionsParameter.ToApi<HttpRequestOptionsApi>(),
+                                isAsync)))
+                ];
+            }
+
+            var protocolMethod =
+                new ScmMethodProvider(methodSignature, methodBody, EnclosingType, ScmMethodKind.Protocol, collectionDefinition: collection, serviceMethod: ServiceMethod);
+            ExperimentalApiHelpers.AddDependencySuppressions(protocolMethod, ServiceMethod.Operation);
+
+            if (protocolMethod.XmlDocs != null)
+            {
+                var exceptions = new List<XmlDocExceptionStatement>(protocolMethod.XmlDocs.Exceptions);
+                exceptions.Add(new(ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientResponseExceptionType.FrameworkType, "Service returned a non-success status code.", []));
+
+                List<XmlDocStatement> listItems =
+                [
+                    new XmlDocStatement("item", [], new XmlDocStatement("description", [$"This <see href=\"https://aka.ms/azsdk/net/protocol-methods\">protocol method</see> allows explicit creation of the request and processing of the response for advanced scenarios."]))
+                ];
+                XmlDocStatement listXmlDoc = new XmlDocStatement($"<list type=\"bullet\">", $"</list>", [], innerStatements: [.. listItems]);
+                var summary = new XmlDocSummaryStatement([$"[Protocol Method] {DocHelpers.GetDescription(ServiceMethod.Operation.Summary, ServiceMethod.Operation.Doc) ?? ServiceMethod.Operation.Name}"], listXmlDoc);
+
+                protocolMethod.XmlDocs.Update(summary: summary, exceptions: exceptions);
+            }
+            return protocolMethod;
+        }
+
+        private static ParameterProvider ResolveRequestOptionsNameCollision(
+            ParameterProvider requestOptionsParameter,
+            IReadOnlyList<ParameterProvider> requiredParameters,
+            IReadOnlyList<ParameterProvider> optionalParameters)
+        {
+            var otherParameters = requiredParameters.Concat(optionalParameters).ToList();
+            if (!otherParameters.Any(p => string.Equals(p.Name, requestOptionsParameter.Name, StringComparison.OrdinalIgnoreCase)))
+            {
+                return requestOptionsParameter;
+            }
+
+            var baseName = "request"
+                + char.ToUpperInvariant(requestOptionsParameter.Name[0])
+                + requestOptionsParameter.Name.Substring(1);
+            var uniqueName = baseName;
+            var suffix = 1;
+            while (otherParameters.Any(p => string.Equals(p.Name, uniqueName, StringComparison.OrdinalIgnoreCase)))
+            {
+                uniqueName = baseName + suffix++;
+            }
+
+            return new ParameterProvider(
+                uniqueName,
+                requestOptionsParameter.Description,
+                requestOptionsParameter.Type,
+                requestOptionsParameter.DefaultValue,
+                location: requestOptionsParameter.Location,
+                wireInfo: requestOptionsParameter.WireInfo,
+                validation: requestOptionsParameter.Validation,
+                inputParameter: requestOptionsParameter.InputParameter);
+        }
+
+        // The protocol method orders its parameters required-first (optional parameters and the
+        // request options/context parameter are moved to the end so they can have default values).
+        // This order can differ from the CreateRequest method's parameter order, which follows the
+        // operation/declaration order. Passing the protocol parameters positionally would therefore
+        // bind them to the wrong CreateRequest parameters (for example, swapping an optional path
+        // parameter with the request body). Reorder the arguments to match the CreateRequest
+        // signature by matching each CreateRequest parameter to its protocol parameter, even when
+        // customization changes its name. If they cannot be reconciled, retain positional behavior.
+        private ValueExpression[] BuildCreateRequestArguments(
+            MethodSignature createRequestSignature,
+            IReadOnlyList<ParameterProvider> bodyParameters)
+        {
+            var createRequestParameters = createRequestSignature.Parameters;
+
+            // When the protocol method exposes an options bag, its parameters no longer line up with the
+            // CreateRequest method's flattened wire parameters. Expand each grouped parameter back out of
+            // the bag (e.g. `options.Top`) so CreateRequest still receives the individual values.
+            if (RestClientProvider.ShouldGroupProtocolParameters(ServiceMethod))
+            {
+                var groupedArguments = BuildGroupedCreateRequestArguments(createRequestParameters, bodyParameters);
+                if (groupedArguments is not null)
+                {
+                    return groupedArguments;
+                }
+            }
+
+            if (createRequestParameters.Count == bodyParameters.Count)
+            {
+                var arguments = new ValueExpression[createRequestParameters.Count];
+                bool allMatched = true;
+                for (int i = 0; i < createRequestParameters.Count; i++)
+                {
+                    var match = FindUngroupedArgument(bodyParameters, createRequestParameters[i]);
+                    if (match is null)
+                    {
+                        allMatched = false;
+                        break;
+                    }
+
+                    arguments[i] = match;
+                }
+
+                if (allMatched)
+                {
+                    return arguments;
+                }
+            }
+
+            return [.. bodyParameters.Select(p => (ValueExpression)p)];
+        }
+
+        private static ValueExpression[]? BuildGroupedCreateRequestArguments(
+            IReadOnlyList<ParameterProvider> createRequestParameters,
+            IReadOnlyList<ParameterProvider> protocolParameters)
+        {
+            var arguments = new ValueExpression[createRequestParameters.Count];
+
+            for (int i = 0; i < createRequestParameters.Count; i++)
+            {
+                var createRequestParameter = createRequestParameters[i];
+                var segments = createRequestParameter.InputParameter?.MethodParameterSegments;
+
+                if (segments is not { Count: > 1 })
+                {
+                    var match = FindUngroupedArgument(protocolParameters, createRequestParameter);
+                    if (match is null)
+                    {
+                        return null;
+                    }
+
+                    arguments[i] = match;
+                    continue;
+                }
+
+                var groupParameter = protocolParameters.FirstOrDefault(
+                    p => string.Equals(p.InputParameter?.Name, segments[0].Name, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(p.Name, segments[0].Name, StringComparison.OrdinalIgnoreCase));
+                if (groupParameter is null
+                    || !ScmCodeModelGenerator.Instance.TypeFactory.CSharpTypeMap.TryGetValue(groupParameter.Type, out var typeProvider)
+                    || typeProvider is not ModelProvider groupModel)
+                {
+                    return null;
+                }
+
+                var propertySegments = segments.Skip(1).Select(s => s.Name).ToList();
+                var propertyExpression = groupModel.GetPropertyExpression(groupParameter, propertySegments, out var leafProperty);
+
+                // CreateRequest takes the serialized (string/number) form of an enum, so convert before forwarding.
+                if (leafProperty.Type.IsEnum && !createRequestParameter.Type.IsEnum)
+                {
+                    if (leafProperty.Type.IsNullable)
+                    {
+                        propertyExpression = propertyExpression.NullConditional();
+                    }
+                    propertyExpression = leafProperty.Type.ToSerial(propertyExpression);
+                }
+
+                arguments[i] = propertyExpression;
+            }
+
+            return arguments;
+        }
+
+        /// <summary>
+        /// Locates the protocol parameter to forward for a <c>CreateRequest</c> parameter that was not
+        /// folded into the options bag. Input identity survives custom parameter renames. The name
+        /// alone is not reliable: a bag named after the request
+        /// options parameter causes that parameter to be renamed, so the original name now resolves to
+        /// the bag. The type disambiguates in that case.
+        /// </summary>
+        private static ParameterProvider? FindUngroupedArgument(
+            IReadOnlyList<ParameterProvider> protocolParameters,
+            ParameterProvider createRequestParameter)
+        {
+            foreach (var parameter in protocolParameters)
+            {
+                if (createRequestParameter.InputParameter != null
+                    && ReferenceEquals(parameter.InputParameter, createRequestParameter.InputParameter))
+                {
+                    return parameter;
+                }
+
+                if (string.Equals(parameter.Name, createRequestParameter.Name, StringComparison.OrdinalIgnoreCase)
+                    && parameter.Type.Equals(createRequestParameter.Type))
+                {
+                    return parameter;
+                }
+            }
+
+            ParameterProvider? typeMatch = null;
+            foreach (var parameter in protocolParameters)
+            {
+                if (!parameter.Type.Equals(createRequestParameter.Type))
+                {
+                    continue;
+                }
+
+                if (typeMatch is not null)
+                {
+                    return null;
+                }
+
+                typeMatch = parameter;
+            }
+
+            return typeMatch;
+        }
+
+        private IEnumerable<MethodBodyStatement> GetPagingMethodBody(
+            TypeProvider collection,
+            MethodSignature createRequestSignature,
+            IReadOnlyList<ParameterProvider> parameters,
+            ParameterProvider? cancellationToken = null)
+        {
+            if (cancellationToken != null)
+            {
+                var conversionStatements = GetStackVariablesForProtocolParamConversion(parameters, out var declarations);
+                var constructorArguments = GetMethodArguments(createRequestSignature, declarations, parameters, cancellationToken);
+
+                return
+                    [
+                        .. conversionStatements,
+                        Return(New.Instance(
+                        collection.Type,
+                        [
+                            This,
+                            .. constructorArguments
+                        ]))
+                    ];
+            }
+
+            return Return(New.Instance(
+                collection.Type,
+                [
+                    This,
+                    .. BuildCreateRequestArguments(createRequestSignature, parameters)
+                ]));
+        }
+
+        private CSharpType GetResponseType(IReadOnlyList<InputOperationResponse> responses, bool isConvenience, bool isAsync, out CSharpType? responseBodyType)
+        {
+            responseBodyType = null;
+
+            if (ServiceMethod.Operation.ResponseAsBool)
+            {
+                responseBodyType = typeof(bool);
+                var boolResultType = new CSharpType(ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientResponseOfTType.FrameworkType, responseBodyType);
+                return isAsync ? new CSharpType(typeof(Task<>), boolResultType) : boolResultType;
+            }
+
+            if (isConvenience)
+            {
+                return GetConvenienceReturnType(responses, isAsync, out responseBodyType);
+            }
+
+            if (_pagingServiceMethod != null)
+            {
+                return isAsync
+                    ? ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientCollectionAsyncResponseType
+                    : ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientCollectionResponseType;
+            }
+
+            var streamingResponse = responses.FirstOrDefault(r => !r.IsErrorResponse)?.BodyType as InputStreamingType;
+            if (streamingResponse != null)
+            {
+                responseBodyType = GetRawStreamingItemType(streamingResponse);
+                var resultType = AsyncStreamingResultSnippets.Of(responseBodyType);
+                return new CSharpType(typeof(Task<>), resultType);
+            }
+
+            var returnType = ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientResponseType;
+
+            return isAsync ? new CSharpType(typeof(Task<>), returnType) : returnType;
+        }
+
+        private CSharpType GetConvenienceReturnType(IReadOnlyList<InputOperationResponse> responses, bool isAsync, out CSharpType? responseBodyType)
+        {
+            var response = responses.FirstOrDefault(r => !r.IsErrorResponse);
+            var responseType = ServiceMethod is InputBasicServiceMethod ? ServiceMethod.Response.Type : response?.BodyType;
+            if (responseType is InputStreamingType streamingType)
+            {
+                responseBodyType = GetConvenienceStreamingItemType(streamingType);
+                var resultType = AsyncStreamingResultSnippets.Of(responseBodyType);
+                return isAsync ? new CSharpType(typeof(Task<>), resultType) : resultType;
+            }
+
+            responseBodyType = GetResponseBodyType(responseType);
+
+            if (_pagingServiceMethod != null)
+            {
+                if (responseBodyType == null)
+                {
+                    return isAsync ?
+                        ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientCollectionAsyncResponseType :
+                        ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientCollectionResponseType;
+                }
+
+                return new CSharpType(
+                    isAsync ?
+                        ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientCollectionAsyncResponseOfTType.FrameworkType :
+                        ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientCollectionResponseOfTType.FrameworkType,
+                    responseBodyType);
+            }
+
+            var returnType = responseBodyType == null
+                ? ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientResponseType
+                : new CSharpType(ScmCodeModelGenerator.Instance.TypeFactory.ClientResponseApi.ClientResponseOfTType.FrameworkType, responseBodyType.OutputType);
+
+            return isAsync ? new CSharpType(typeof(Task<>), returnType) : returnType;
+        }
+
+        private static CSharpType GetRawStreamingItemType(InputStreamingType streamingType)
+        {
+            var binaryDataType = CreateRequiredCSharpType(
+                InputPrimitiveType.Any,
+                streamingType,
+                "Unable to resolve the raw streaming item type.");
+            return streamingType.StreamKind == InputStreamingType.SseStreamKind
+                ? new CSharpType(typeof(SseItem<>), binaryDataType)
+                : binaryDataType;
+        }
+
+        private static CSharpType GetConvenienceStreamingItemType(InputStreamingType streamingType)
+        {
+            if (streamingType.StreamKind != InputStreamingType.SseStreamKind)
+            {
+                return CreateRequiredCSharpType(
+                    streamingType.ValueType,
+                    streamingType,
+                    "Unable to resolve JSON Lines stream item type.");
+            }
+
+            var payloadType = GetSseConveniencePayloadType(streamingType);
+            var payloadCSharpType = payloadType is null
+                ? CreateRequiredCSharpType(
+                    InputPrimitiveType.Any,
+                    streamingType,
+                    "Unable to resolve the raw SSE stream item type.")
+                : CreateRequiredCSharpType(
+                    payloadType,
+                    streamingType,
+                    "Unable to resolve SSE stream item type.");
+            return new CSharpType(typeof(SseItem<>), payloadCSharpType);
+        }
+
+        private static InputType? GetSseConveniencePayloadType(InputStreamingType streamingType)
+        {
+            if (streamingType.ValueType is not InputUnionType unionType)
+            {
+                return streamingType.ValueType;
+            }
+
+            var payloadTypes = unionType.VariantTypes
+                .Where(type => type is not InputLiteralType literal ||
+                    !Equals(literal.Value, streamingType.TerminalEventValue))
+                .ToArray();
+            if (payloadTypes.Length == 0)
+            {
+                return null;
+            }
+
+            var firstCSharpType = ScmCodeModelGenerator.Instance.TypeFactory.CreateCSharpType(payloadTypes[0]);
+            return firstCSharpType != null &&
+                payloadTypes.Skip(1).All(type =>
+                    firstCSharpType.Equals(
+                        ScmCodeModelGenerator.Instance.TypeFactory.CreateCSharpType(type)))
+                ? payloadTypes[0]
+                : null;
+        }
+
+        private static ValueExpression CreateStreamingResultExpression(
+            InputStreamingType streamingType,
+            ValueExpression response,
+            ValueExpression? cancellationToken,
+            bool useConvenienceType)
+        {
+            if (streamingType.StreamKind == InputStreamingType.SseStreamKind)
+            {
+                var terminalPredicate = CreateSseTerminalPredicate(streamingType);
+                var payloadType = useConvenienceType
+                    ? GetSseConveniencePayloadType(streamingType)
+                    : null;
+                if (payloadType != null)
+                {
+                    var payloadCSharpType = CreateRequiredCSharpType(
+                        payloadType,
+                        streamingType,
+                        "Unable to resolve SSE stream item type.");
+                    var parser = CreateSseParser(payloadCSharpType);
+                    var arguments = cancellationToken != null
+                        ? new ValueExpression[] { response, parser, terminalPredicate, cancellationToken }
+                        : [response, parser, terminalPredicate];
+                    return AsyncStreamingResultSnippets.CreateSse(
+                        response,
+                        arguments[1..],
+                        payloadCSharpType);
+                }
+
+                var rawArguments = cancellationToken != null
+                    ? new ValueExpression[] { response, terminalPredicate, cancellationToken }
+                    : terminalPredicate == Null
+                        ? [response]
+                        : [response, terminalPredicate];
+                return AsyncStreamingResultSnippets.CreateSse(response, rawArguments[1..]);
+            }
+
+            if (!useConvenienceType)
+            {
+                return AsyncStreamingResultSnippets.CreateJsonLines(
+                    response,
+                    cancellationToken != null
+                        ? [cancellationToken]
+                        : []);
+            }
+
+            var itemType = CreateRequiredCSharpType(
+                streamingType.ValueType,
+                streamingType,
+                "Unable to resolve JSON Lines stream item type.");
+            var data = new VariableExpression(typeof(BinaryData), "data");
+            var jsonLinesParser = new FuncExpression(
+                [data.Declaration],
+                ModelReaderWriterSnippets.Read(
+                    itemType,
+                    data,
+                    ModelSerializationExtensionsSnippets.Wire));
+            var jsonLinesArguments = cancellationToken != null
+                ? new ValueExpression[]
+                {
+                    response,
+                    jsonLinesParser,
+                    cancellationToken
+                }
+                :
+                [
+                    response,
+                    jsonLinesParser
+                ];
+            return AsyncStreamingResultSnippets.CreateJsonLines(
+                response,
+                jsonLinesArguments[1..],
+                itemType);
+        }
+
+        private static ValueExpression CreateSseTerminalPredicate(InputStreamingType streamingType)
+        {
+            if (streamingType.TerminalEventValue is null)
+            {
+                return Null;
+            }
+
+            var sseItemType = new CSharpType(typeof(SseItem<>), typeof(BinaryData));
+            var item = new VariableExpression(sseItemType, "item");
+            ValueExpression isTerminal = item.Property("Data")
+                .Invoke("ToString")
+                .Equal(Literal(streamingType.TerminalEventValue));
+            if (streamingType.TerminalEventType != null)
+            {
+                isTerminal = item.Property("EventType")
+                    .Equal(Literal(streamingType.TerminalEventType))
+                    .And(isTerminal);
+            }
+            return new FuncExpression([item.Declaration], isTerminal);
+        }
+
+        private static ValueExpression CreateSseParser(CSharpType payloadCSharpType)
+        {
+            var eventType = new VariableExpression(typeof(string), "_");
+            var data = new VariableExpression(typeof(ReadOnlySpan<byte>), "data");
+            var binaryData = Static(typeof(BinaryData)).Invoke(
+                "FromBytes",
+                [data.Invoke("ToArray")]);
+            return new FuncExpression(
+                [eventType.Declaration, data.Declaration],
+                ModelReaderWriterSnippets.Read(
+                    payloadCSharpType,
+                    binaryData,
+                    ModelSerializationExtensionsSnippets.Wire));
+        }
+
+        private CSharpType? GetResponseBodyType(InputType? responseType)
+        {
+            if (responseType is null)
+            {
+                return null;
+            }
+
+            if (_pagingServiceMethod != null)
+            {
+                var modelType = responseType as InputModelType;
+
+                foreach (var segment in _pagingServiceMethod!.PagingMetadata.ItemPropertySegments)
+                {
+                    var property = modelType!
+                        .GetSelfAndBaseModels()
+                        .SelectMany(m => m.Properties)
+                        .FirstOrDefault(p => p.SerializedName == segment);
+                    var propertyType = property?.Type;
+
+                    if (propertyType is InputArrayType arrayType)
+                    {
+                        var valueType = arrayType.ValueType;
+                        return ScmCodeModelGenerator.Instance.TypeFactory.CreateCSharpType(valueType);
+                    }
+
+                    if (propertyType is InputModelType type)
+                    {
+                        modelType = type;
+                    }
+                }
+
+                // Never found an array property, so there was invalid paging metadata.
+                ScmCodeModelGenerator.Instance.Emitter.ReportDiagnostic(
+                    DiagnosticCodes.NoMatchingItemsProperty,
+                    "No property was found in the response model matching the items property",
+                    ServiceMethod.Operation.CrossLanguageDefinitionId,
+                    EmitterDiagnosticSeverity.Error);
+                return null;
+            }
+
+            if (responseType is InputModelType inputModelType)
+            {
+                var model = ScmCodeModelGenerator.Instance.TypeFactory.CreateModel(inputModelType);
+                return model?.Type;
+            }
+
+            return ScmCodeModelGenerator.Instance.TypeFactory.CreateCSharpType(responseType);
+        }
+
+        private static CSharpType CreateRequiredCSharpType(
+            InputType inputType,
+            InputStreamingType streamingType,
+            string message)
+        {
+            var cSharpType = ScmCodeModelGenerator.Instance.TypeFactory.CreateCSharpType(inputType);
+            if (cSharpType != null)
+            {
+                return cSharpType;
+            }
+
+            ScmCodeModelGenerator.Instance.Emitter.ReportDiagnostic(
+                DiagnosticCodes.UnsupportedStreamingType,
+                message,
+                streamingType.CrossLanguageDefinitionId,
+                EmitterDiagnosticSeverity.Error);
+            throw new InvalidOperationException(message);
+        }
+
+        private InputStreamingType? GetStreamingResponseCore()
+            => ServiceMethod.Operation.Responses
+                .FirstOrDefault(response => !response.IsErrorResponse)?.BodyType as InputStreamingType;
+
+        private bool HasStreamingRequestOrResponse()
+            => _streamingResponse.Value != null ||
+                ServiceMethod.Parameters.Any(parameter => parameter.Type is InputStreamingType);
+
+        private bool ShouldMakeProtocolMethodParametersRequired()
+        {
+            if (!_generateConvenienceMethod)
+            {
+                return false;
+            }
+            var convenienceParameters = RestClientProvider.GetMethodParameters(ServiceMethod, ScmMethodKind.Convenience, Client);
+            var convenienceMethodParameterCount = convenienceParameters.Count;
+            if (convenienceMethodParameterCount == 0)
+            {
+                return true;
+            }
+
+            var protocolParameters = RestClientProvider.GetMethodParameters(ServiceMethod, ScmMethodKind.Protocol, Client);
+            for (int i = 0; i < convenienceMethodParameterCount; i++)
+            {
+                // If protocol parameter is required, and convenience is optional, we don't need any changes.
+                if (protocolParameters[i].DefaultValue == null && convenienceParameters[i].DefaultValue != null)
+                {
+                    return false;
+                }
+                // If convenience is optional, and protocol is optional, we do need to make the protocol required.
+                if (convenienceParameters[i].DefaultValue != null)
+                {
+                    return true;
+                }
+                if (!protocolParameters[i].Type.Equals(convenienceParameters[i].Type))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool ShouldUseJsonDocForDeserializingType(CSharpType type)
+        {
+            if (!type.IsFrameworkType)
+            {
+                return true;
+            }
+
+            return type.Equals(typeof(TimeSpan)) || type.Equals(typeof(BinaryData));
+        }
+
+        private bool TryGetFormatArgumentForDualFormatModel(
+            ModelProvider? bodyModel,
+            InputModelType? bodyInputModel,
+            [NotNullWhen(true)] out ScopedApi<string>? format)
+        {
+            format = null;
+
+            // Find the first JSON or XML media type
+            string? matchedMediaType = null;
+            if (ServiceMethod.Operation.RequestMediaTypes != null)
+            {
+                foreach (var mediaType in ServiceMethod.Operation.RequestMediaTypes)
+                {
+                    if (mediaType.Contains(XmlMediaType, StringComparison.OrdinalIgnoreCase) ||
+                        mediaType.Contains(JsonMediaType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matchedMediaType = mediaType;
+                        break;
+                    }
+                }
+            }
+
+            // Check if this is a dual-format model
+            if (matchedMediaType != null &&
+                bodyModel != null &&
+                bodyInputModel != null &&
+                bodyInputModel.Usage.HasFlag(InputModelTypeUsage.Json) &&
+                bodyInputModel.Usage.HasFlag(InputModelTypeUsage.Xml))
+            {
+                // Determine the format: XML or JSON
+                format = matchedMediaType.Contains(XmlMediaType, StringComparison.OrdinalIgnoreCase)
+                    ? ModelReaderWriterOptionsSnippets.XmlFormat
+                    : ModelReaderWriterOptionsSnippets.JsonFormat;
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Tries to get the XML root and child element names for a list body parameter
+        /// when the operation uses XML content type.
+        /// </summary>
+        private bool TryGetXmlCollectionNames(
+            ParameterProvider parameter,
+            [NotNullWhen(true)] out string? rootName,
+            [NotNullWhen(true)] out string? childName)
+        {
+            rootName = null;
+            childName = null;
+
+            // Check if the request uses XML content type
+            if (ServiceMethod.Operation.RequestMediaTypes == null ||
+                !ServiceMethod.Operation.RequestMediaTypes.Any(m => m.Contains(XmlMediaType, StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            // The element type must be a non-framework (model) type
+            if (!parameter.Type.IsList || parameter.Type.Arguments[0].IsFrameworkType)
+            {
+                return false;
+            }
+
+            // Get the body parameter from the operation to get the serialized name (root element name)
+            var operationBodyParam = ServiceMethod.Operation.Parameters.OfType<InputBodyParameter>().FirstOrDefault();
+            if (operationBodyParam == null)
+            {
+                return false;
+            }
+
+            // TODO: https://github.com/Azure/typespec-azure/issues/3978 - fix root name calculation once the issue is resolved.
+            rootName = operationBodyParam.Type.Name;
+
+            // Get the element type's XML name
+            if (operationBodyParam.Type is InputArrayType arrayType &&
+                arrayType.ValueType is InputModelType elementModelType &&
+                elementModelType.SerializationOptions.Xml?.Name is string xmlName)
+            {
+                childName = xmlName;
+            }
+            else
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Tries to get the XML root and child element names for a list response body
+        /// when the operation response uses XML content type.
+        /// </summary>
+        private bool TryGetXmlCollectionNamesForResponse(
+            CSharpType elementType,
+            [NotNullWhen(true)] out string? rootName,
+            [NotNullWhen(true)] out string? childName)
+        {
+            rootName = null;
+            childName = null;
+
+            // Check if the response is serialized as XML using the propagated serialization options
+            var response = ServiceMethod.Operation.Responses.FirstOrDefault(r => !r.IsErrorResponse);
+            if (response?.SerializationOptions?.Xml is null)
+            {
+                return false;
+            }
+
+            // The element type must be a non-framework (model) type
+            if (elementType.IsFrameworkType)
+            {
+                return false;
+            }
+
+            // Get the response body type to extract XML names
+            if (response.BodyType is InputArrayType arrayType)
+            {
+                if (arrayType.ValueType is InputModelType elementModelType &&
+                    elementModelType.SerializationOptions.Xml?.Name is string xmlChildName)
+                {
+                    childName = xmlChildName;
+                }
+                else
+                {
+                    return false;
+                }
+
+                // TODO: https://github.com/Azure/typespec-azure/issues/3978 - fix root name calculation once the issue is resolved.
+                rootName = arrayType.Name;
+            }
+
+            return rootName != null && childName != null;
+        }
+    }
+}

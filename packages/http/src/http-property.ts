@@ -1,0 +1,372 @@
+import type { DiagnosticResult, Model, Type } from "@typespec/compiler";
+import {
+  compilerAssert,
+  createDiagnosticCollector,
+  walkPropertiesInherited,
+  type Diagnostic,
+  type ModelProperty,
+  type Program,
+} from "@typespec/compiler";
+import type { PathOptions, QueryOptions } from "../generated-defs/TypeSpec.Http.js";
+import {
+  getCookieParamOptions,
+  getHeaderFieldOptions,
+  getPathOptions,
+  getQueryOptions,
+  isBody,
+  isBodyIgnore,
+  isBodyRoot,
+  isMultipartBodyProperty,
+  isStatusCode,
+  resolvePathOptionsWithDefaults,
+  resolveQueryOptionsWithDefaults,
+} from "./decorators.js";
+import { createDiagnostic } from "./lib.js";
+import type { Visibility } from "./metadata.js";
+import { isVisible } from "./metadata.js";
+import { HttpPayloadDisposition } from "./payload.js";
+import type {
+  CookieParameterOptions,
+  HeaderFieldOptions,
+  PathParameterOptions,
+  QueryParameterOptions,
+} from "./types.js";
+
+/**
+ * A visible request or response property classified by its HTTP role.
+ * The discriminant distinguishes wire metadata, explicit body roots, and implicit body members.
+ */
+export type HttpProperty =
+  | HeaderProperty
+  | CookieProperty
+  | ContentTypeProperty
+  | QueryProperty
+  | PathProperty
+  | StatusCodeProperty
+  | BodyProperty
+  | BodyRootProperty
+  | MultipartBodyProperty
+  | BodyPropertyProperty;
+
+/** Source location shared by classified HTTP properties, including nested properties. */
+export interface HttpPropertyBase {
+  /** Original TypeSpec property supplying this value or annotation. */
+  readonly property: ModelProperty;
+  /** Path from the root of the operation parameters/returnType to the property. */
+  readonly path: (string | number)[];
+}
+
+/** A property carried in a header, other than a separately classified Content-Type header. */
+export interface HeaderProperty extends HttpPropertyBase {
+  /** Selects header metadata rather than payload data. */
+  readonly kind: "header";
+  /** Header wire name and configured serialization options. */
+  readonly options: HeaderFieldOptions;
+}
+
+/** A property carried in a request cookie. */
+export interface CookieProperty extends HttpPropertyBase {
+  /** Selects cookie metadata rather than payload data. */
+  readonly kind: "cookie";
+  /** Cookie options with the wire name resolved. */
+  readonly options: CookieParameterOptions;
+}
+
+/** A Content-Type header used to determine the payload's supported media types. */
+export interface ContentTypeProperty extends HttpPropertyBase {
+  /** Selects media-type metadata rather than an ordinary header. */
+  readonly kind: "contentType";
+}
+
+/** A query parameter declared by `@query` or inferred from a URI template. */
+export interface QueryProperty extends HttpPropertyBase {
+  /** Selects URI query metadata rather than payload data. */
+  readonly kind: "query";
+  /** Query wire name and serialization settings with defaults resolved. */
+  readonly options: Required<QueryOptions>;
+}
+/** A path parameter declared by `@path` or inferred from a URI template. */
+export interface PathProperty extends HttpPropertyBase {
+  /** Selects URI path interpolation rather than payload data. */
+  readonly kind: "path";
+  /** Path wire name and expansion settings with defaults resolved. */
+  readonly options: Required<PathOptions>;
+}
+/** A property whose type or constraints determine response status codes. */
+export interface StatusCodeProperty extends HttpPropertyBase {
+  /** Selects response status metadata rather than payload data. */
+  readonly kind: "statusCode";
+}
+/** A property marked `@body`, whose type supplies the complete payload. */
+export interface BodyProperty extends HttpPropertyBase {
+  /** Selects an explicit body whose nested HTTP annotations are ignored. */
+  readonly kind: "body";
+}
+
+/** Property annotated with `@bodyIgnore` */
+export interface BodyIgnoreProperty extends HttpPropertyBase {
+  readonly kind: "bodyIgnore";
+}
+/** A property marked `@bodyRoot`, allowing metadata to be resolved within its type. */
+export interface BodyRootProperty extends HttpPropertyBase {
+  /** Selects a body root whose nested metadata remains applicable. */
+  readonly kind: "bodyRoot";
+}
+/** A property marked `@multipartBody`, whose model or tuple describes the parts. */
+export interface MultipartBodyProperty extends HttpPropertyBase {
+  /** Selects explicit multipart body resolution. */
+  readonly kind: "multipartBody";
+}
+/** Property to include inside the body */
+export interface BodyPropertyProperty extends HttpPropertyBase {
+  /**
+   * Selects a property included in the body for this payload context.
+   * Also used for metadata that does not apply here, such as `@statusCode` in a request
+   * or `@query` and `@path` in a response.
+   */
+  readonly kind: "bodyProperty";
+}
+
+export interface GetHttpPropertyOptions {
+  implicitParameter?: (
+    param: ModelProperty,
+  ) => PathParameterOptions | QueryParameterOptions | undefined;
+  /**
+   * When true, treat `Content-Type` headers as regular headers.
+   */
+  treatContentTypeAsHeader?: boolean;
+}
+/**
+ * Find the type of a property in a model
+ */
+function getHttpProperty(
+  program: Program,
+  property: ModelProperty,
+  path: (string | number)[],
+  options: GetHttpPropertyOptions = {},
+): [HttpProperty | BodyIgnoreProperty, readonly Diagnostic[]] {
+  const diagnostics: Diagnostic[] = [];
+
+  function createResult<T extends Omit<HttpProperty | BodyIgnoreProperty, "path" | "property">>(
+    opts: T,
+  ): [HttpProperty & T, readonly Diagnostic[]] {
+    return [{ ...opts, property, path } as any, diagnostics];
+  }
+
+  const annotations = {
+    header: getHeaderFieldOptions(program, property),
+    cookie: getCookieParamOptions(program, property),
+    query: getQueryOptions(program, property),
+    path: getPathOptions(program, property),
+    body: isBody(program, property),
+    bodyRoot: isBodyRoot(program, property),
+    multipartBody: isMultipartBodyProperty(program, property),
+    statusCode: isStatusCode(program, property),
+  };
+  const defined = Object.entries(annotations).filter((x) => !!x[1]);
+  const implicit = options.implicitParameter?.(property);
+
+  if (implicit && defined.length > 0) {
+    if (implicit.type === "path" && annotations.path) {
+      if (
+        annotations.path.explode !== undefined ||
+        annotations.path.style !== undefined ||
+        annotations.path.allowReserved !== undefined
+      ) {
+        diagnostics.push(
+          createDiagnostic({
+            code: "use-uri-template",
+            format: {
+              param: property.name,
+            },
+            target: property,
+          }),
+        );
+      }
+    } else if (implicit.type === "query" && annotations.query) {
+      if (annotations.query.explode !== undefined) {
+        diagnostics.push(
+          createDiagnostic({
+            code: "use-uri-template",
+            format: {
+              param: property.name,
+            },
+            target: property,
+          }),
+        );
+      }
+    } else {
+      diagnostics.push(
+        createDiagnostic({
+          code: "incompatible-uri-param",
+          format: {
+            param: property.name,
+            uriKind: implicit.type,
+            annotationKind: defined[0][0],
+          },
+          target: property,
+        }),
+      );
+    }
+  }
+  // if implicit just returns as it is. Validation above would have checked nothing was set explicitly apart from the type and that the type match
+  if (implicit) {
+    return createResult({
+      kind: implicit.type,
+      options: implicit as any,
+      property,
+    });
+  }
+  if (defined.length === 0) {
+    return isBodyIgnore(program, property)
+      ? createResult({ kind: "bodyIgnore" })
+      : createResult({ kind: "bodyProperty" });
+  } else if (defined.length > 1) {
+    diagnostics.push(
+      createDiagnostic({
+        code: "operation-param-duplicate-type",
+        format: { paramName: property.name, types: defined.map((x) => x[0]).join(", ") },
+        target: property,
+      }),
+    );
+  }
+
+  if (annotations.header) {
+    if (
+      annotations.header.name.toLowerCase() === "content-type" &&
+      !options.treatContentTypeAsHeader
+    ) {
+      return createResult({ kind: "contentType" });
+    }
+    return createResult({ kind: "header", options: annotations.header });
+  } else if (annotations.cookie) {
+    return createResult({ kind: "cookie", options: annotations.cookie });
+  } else if (annotations.query) {
+    return createResult({
+      kind: "query",
+      options: resolveQueryOptionsWithDefaults(annotations.query),
+    });
+  } else if (annotations.path) {
+    return createResult({
+      kind: "path",
+      options: resolvePathOptionsWithDefaults(annotations.path),
+    });
+  } else if (annotations.statusCode) {
+    return createResult({ kind: "statusCode" });
+  } else if (annotations.body) {
+    return createResult({ kind: "body" });
+  } else if (annotations.bodyRoot) {
+    return createResult({ kind: "bodyRoot" });
+  } else if (annotations.multipartBody) {
+    return createResult({ kind: "multipartBody" });
+  }
+  compilerAssert(false, `Unexpected http property type`);
+}
+
+/**
+ * Walks the given input(request parameters or response) and return all the properties and where they should be included(header, query, path, body, as a body property, etc.)
+ *
+ * @param rootMapOut If provided, the map will be populated to link nested metadata properties to their root properties.
+ */
+export function resolvePayloadProperties(
+  program: Program,
+  type: Type,
+  visibility: Visibility,
+  disposition: HttpPayloadDisposition,
+  options: GetHttpPropertyOptions = {},
+): DiagnosticResult<HttpProperty[]> {
+  const diagnostics = createDiagnosticCollector();
+  const httpProperties = new Map<ModelProperty, HttpProperty>();
+
+  if (type.kind !== "Model" || (type.properties.size === 0 && !type.baseModel)) {
+    return diagnostics.wrap([]);
+  }
+
+  const visited = new Set();
+  function checkModel(model: Model, path: string[]) {
+    visited.add(model);
+    let foundBody = false;
+    let foundBodyProperty = false;
+    for (const property of walkPropertiesInherited(model)) {
+      const propPath = [...path, property.name];
+
+      if (!isVisible(program, property, visibility)) {
+        continue;
+      }
+
+      let httpProperty = diagnostics.pipe(getHttpProperty(program, property, propPath, options));
+      if (
+        httpProperty.kind !== "bodyIgnore" &&
+        shouldTreatAsBodyProperty(httpProperty, disposition)
+      ) {
+        httpProperty = { kind: "bodyProperty", property, path: propPath };
+      }
+
+      // Ignore cookies in response to avoid future breaking changes to @cookie.
+      // https://github.com/microsoft/typespec/pull/4761#discussion_r1805082132
+      if (httpProperty.kind === "cookie" && disposition === HttpPayloadDisposition.Response) {
+        diagnostics.add(
+          createDiagnostic({
+            code: "response-cookie-not-supported",
+            target: property,
+            format: { propName: property.name },
+          }),
+        );
+        continue;
+      }
+
+      if (
+        httpProperty.kind === "body" ||
+        httpProperty.kind === "bodyRoot" ||
+        httpProperty.kind === "multipartBody"
+      ) {
+        foundBody = true;
+      }
+
+      if (
+        !(httpProperty.kind === "body" || httpProperty.kind === "multipartBody") &&
+        isModelWithProperties(property.type) &&
+        !visited.has(property.type)
+      ) {
+        if (checkModel(property.type, propPath)) {
+          foundBody = true;
+          continue;
+        }
+      }
+      if (httpProperty.kind === "bodyProperty") {
+        foundBodyProperty = true;
+      }
+      if (httpProperty.kind !== "bodyIgnore") {
+        httpProperties.set(property, httpProperty);
+      }
+    }
+    return foundBody && !foundBodyProperty;
+  }
+
+  checkModel(type, []);
+
+  return diagnostics.wrap([...httpProperties.values()]);
+}
+
+function isModelWithProperties(type: Type): type is Model {
+  return type.kind === "Model" && !type.indexer && type.properties.size > 0;
+}
+
+function shouldTreatAsBodyProperty(
+  property: HttpProperty,
+  disposition: HttpPayloadDisposition,
+): boolean {
+  switch (disposition) {
+    case HttpPayloadDisposition.Request:
+      return property.kind === "statusCode";
+    case HttpPayloadDisposition.Response:
+      return property.kind === "query" || property.kind === "path";
+    case HttpPayloadDisposition.Multipart:
+      return (
+        property.kind === "path" || property.kind === "query" || property.kind === "statusCode"
+      );
+    default:
+      void (disposition satisfies never);
+      return false;
+  }
+}

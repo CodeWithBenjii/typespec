@@ -1,0 +1,496 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Reflection.Metadata;
+using Microsoft.TypeSpec.Generator.Expressions;
+using Microsoft.TypeSpec.Generator.Input;
+using Microsoft.TypeSpec.Generator.Input.Extensions;
+using Microsoft.TypeSpec.Generator.Primitives;
+using Microsoft.TypeSpec.Generator.Snippets;
+using Microsoft.TypeSpec.Generator.Statements;
+using Microsoft.TypeSpec.Generator.Utilities;
+
+namespace Microsoft.TypeSpec.Generator.Providers
+{
+    [DebuggerDisplay("{GetDebuggerDisplay(),nq}")]
+    public class PropertyProvider
+    {
+        private VariableExpression? _variable;
+        private Lazy<ParameterProvider> _parameter;
+        internal InputProperty? InputProperty { get; set; }
+
+        private readonly SerializationFormat _serializationFormat;
+        private FormattableString? _customDescription;
+
+        public FormattableString? Description { get; private set; }
+        public MethodSignatureModifiers Modifiers { get; internal set; }
+        public CSharpType Type { get; internal set; }
+        public string Name { get; internal set; }
+        public PropertyBody Body { get; internal set; }
+        public CSharpType? ExplicitInterface { get; private set; }
+        public XmlDocProvider? XmlDocs { get; private set; }
+        public PropertyWireInformation? WireInfo { get; internal set; }
+        public bool IsDiscriminator { get; internal set; }
+        public bool IsAdditionalProperties { get; init; }
+        public FieldProvider? BackingField { get; set; }
+        public PropertyProvider? BaseProperty { get; set; }
+        public bool IsRef { get; private set; }
+        internal bool IsInitOnly { get; set; }
+        // Preserve the fact that a symbol has accessor/member metadata this provider cannot model.
+        internal bool HasUnsupportedBaseContract { get; init; }
+        public SerializationFormat SerializationFormat => _serializationFormat;
+
+        /// <summary>
+        /// Converts this property to a parameter.
+        /// </summary>
+        public ParameterProvider AsParameter => _parameter.Value;
+
+        public TypeProvider EnclosingType { get; private set; }
+
+        public IReadOnlyList<AttributeStatement> Attributes { get; private set; }
+        public IReadOnlyList<SuppressionStatement> Suppressions { get; private set; } = [];
+
+        public string? OriginalName { get; internal init; }
+
+        internal Lazy<NamedTypeSymbolProvider?>? CustomProvider { get; init; }
+
+        private readonly bool _isRequiredNonNullableConstant;
+
+        // for mocking
+#pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
+        protected PropertyProvider()
+#pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
+        {
+        }
+
+        internal static bool TryCreate(InputProperty inputProperty, TypeProvider enclosingType, [NotNullWhen(true)] out PropertyProvider? property)
+        {
+            var type = CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(inputProperty.Type);
+            if (type == null)
+            {
+                property = null;
+                return false;
+            }
+            property = new PropertyProvider(inputProperty, type, enclosingType);
+            return true;
+        }
+
+        public PropertyProvider(InputProperty inputProperty, TypeProvider enclosingType)
+        : this(
+            inputProperty,
+            CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(inputProperty.Type) ?? throw new InvalidOperationException($"Could not create CSharpType for property {inputProperty.Name}"),
+            enclosingType)
+        {
+        }
+
+        private PropertyProvider(InputProperty inputProperty, CSharpType propertyType, TypeProvider enclosingType)
+        {
+            InputProperty = inputProperty;
+            if (!inputProperty.IsRequired && !propertyType.IsCollection)
+            {
+                propertyType = propertyType.WithNullable(true);
+            }
+
+            EnclosingType = enclosingType;
+            _serializationFormat = CodeModelGenerator.Instance.TypeFactory.GetSerializationFormat(inputProperty);
+            _isRequiredNonNullableConstant = inputProperty.IsRequired && propertyType is { IsLiteral: true, IsNullable: false };
+            var propHasSetter = PropertyHasSetter(propertyType, inputProperty);
+            MethodSignatureModifiers setterModifier = !propHasSetter ? MethodSignatureModifiers.None
+                : inputProperty.IsReadOnly && !IsDiscriminatorProperty(inputProperty)
+                    ? MethodSignatureModifiers.Private | MethodSignatureModifiers.Protected
+                    : MethodSignatureModifiers.Public;
+
+            Type = inputProperty.IsReadOnly ? propertyType.OutputType : propertyType;
+            IsDiscriminator = IsDiscriminatorProperty(inputProperty);
+            var hasOutputUsage = inputProperty.EnclosingType?.Usage.HasFlag(InputModelTypeUsage.Output) ?? false;
+            Modifiers = IsDiscriminator || (!hasOutputUsage && _isRequiredNonNullableConstant) ? MethodSignatureModifiers.Internal : MethodSignatureModifiers.Public;
+            var identifierName = inputProperty.IsExactName ? inputProperty.Name : inputProperty.Name.ToIdentifierName();
+            if (!inputProperty.IsExactName)
+            {
+                var isDateTime = inputProperty.Type.IsDateTimeInputType();
+                var canonicalName = identifierName.NormalizeCSharpAcronyms(isDateTime);
+                var enclosingTypeName = enclosingType.Name;
+                var lastContractProperties = enclosingType.LastContractView?.Properties
+                    .Where(p => MethodSignatureHelper.IsPublicApi(p.Modifiers, p.Attributes))
+                    .ToList();
+
+                // An exact input-identifier match is authoritative: it is the name this property would have had
+                // before normalization, so it does not need the disambiguation required by normalized candidates.
+                // The shipped member may carry the enclosing-type collision suffix, so candidates are compared
+                // against the collision-adjusted form of each name we are looking for.
+                var previousProperty =
+                    lastContractProperties?.FirstOrDefault(p => p.Name == AvoidPropertyNameCollision(identifierName, enclosingTypeName))
+                    ?? lastContractProperties?.FirstOrDefault(p =>
+                        p.Name == AvoidPropertyNameCollision(canonicalName, enclosingTypeName) &&
+                        !IsClaimedBySiblingProperty(p.Name, inputProperty, enclosingType));
+
+                if (previousProperty is null &&
+                    isDateTime &&
+                    !identifierName.EndsWith("On", StringComparison.Ordinal))
+                {
+                    // Both the current and previous conventions render date-time names as <stem>On. Requiring
+                    // that suffix on the contract name prevents a removed property such as StartDate from being
+                    // mistaken for the historical name of StartTime even though both normalize to StartsOn.
+                    var specStem = identifierName.NormalizeCSharpAcronyms().GetDateTimeStem();
+                    previousProperty = specStem is null
+                        ? null
+                        : lastContractProperties?.FirstOrDefault(p =>
+                            HasDateTimeStem(p.Name, specStem, enclosingTypeName) &&
+                            p.Type.WithNullable(false).Equals(Type.WithNullable(false)) &&
+                            !IsClaimedBySiblingProperty(p.Name, inputProperty, enclosingType));
+                }
+                identifierName = previousProperty?.Name ?? canonicalName;
+            }
+            Name = AvoidPropertyNameCollision(identifierName, enclosingType.Name);
+            Body = new AutoPropertyBody(propHasSetter, setterModifier, GetPropertyInitializationValue(propertyType, inputProperty));
+
+            WireInfo = new PropertyWireInformation(inputProperty);
+            Attributes = ExperimentalApiHelpers.BuildAttributes(inputProperty.Experimental);
+            Suppressions = ExperimentalApiHelpers.MergeSuppressions(
+                ExperimentalApiHelpers.GetDependencySuppressions(inputProperty.Experimental),
+                ExperimentalApiHelpers.GetReferenceSuppressions(inputProperty.Type),
+                ExperimentalApiHelpers.GetReferenceSuppressions(inputProperty.DefaultValue?.Type));
+
+            InitializeParameter(DocHelpers.GetFormattableDescription(inputProperty.Summary, inputProperty.Doc) ?? FormattableStringHelpers.Empty);
+            BuildDocs();
+        }
+
+        public PropertyProvider(
+            FormattableString? description,
+            MethodSignatureModifiers modifiers,
+            CSharpType type,
+            string name,
+            PropertyBody body,
+            TypeProvider enclosingType,
+            CSharpType? explicitInterface = null,
+            PropertyWireInformation? wireInfo = null,
+            bool isRef = false,
+            IEnumerable<AttributeStatement>? attributes = null,
+            IEnumerable<SuppressionStatement>? suppressions = null)
+        {
+            Modifiers = modifiers;
+            Type = type;
+            Name = name;
+            Body = body;
+            ExplicitInterface = explicitInterface;
+            IsRef = isRef;
+
+            WireInfo = wireInfo;
+            EnclosingType = enclosingType;
+            Attributes = (attributes as IReadOnlyList<AttributeStatement>) ?? [];
+            Suppressions = suppressions?.ToArray() ?? [];
+
+            InitializeParameter(description ?? FormattableStringHelpers.Empty);
+            _customDescription = description;
+            BuildDocs();
+        }
+
+        private void BuildDocs()
+        {
+            if (InputProperty != null)
+            {
+                Description = DocHelpers.GetFormattableDescription(InputProperty.Summary, InputProperty.Doc) ??
+                              PropertyDescriptionBuilder.CreateDefaultPropertyDescription(Name, !Body.HasSetter);
+                XmlDocs = new XmlDocProvider(PropertyDescriptionBuilder.BuildPropertyDescription(
+                    Type,
+                    _serializationFormat,
+                    Description))
+                {
+                    // TODO -- should write parameter xml doc if this is an IndexerDeclaration: https://github.com/microsoft/typespec/issues/3276
+                };
+            }
+            else
+            {
+                Description = _customDescription ?? (IsPropertyPrivate(Modifiers, EnclosingType.DeclarationModifiers) ? null
+                    : PropertyDescriptionBuilder.CreateDefaultPropertyDescription(Name, !Body.HasSetter));
+
+                if (Description != null)
+                {
+                    XmlDocs = new XmlDocProvider(new XmlDocSummaryStatement([Description]));
+                }
+            }
+        }
+
+        private static string AvoidPropertyNameCollision(string propertyName, string enclosingTypeName) =>
+            propertyName == enclosingTypeName ? $"{propertyName}Property" : propertyName;
+
+        private static bool HasDateTimeStem(string contractName, string specStem, string enclosingTypeName)
+        {
+            if (contractName == AvoidPropertyNameCollision(enclosingTypeName, enclosingTypeName))
+            {
+                contractName = enclosingTypeName;
+            }
+
+            return contractName.EndsWith("On", StringComparison.Ordinal) &&
+                contractName.GetDateTimeStem() == specStem;
+        }
+
+        private static bool IsClaimedBySiblingProperty(
+            string contractName,
+            InputProperty inputProperty,
+            TypeProvider enclosingType)
+        {
+            var enclosingTypeName = enclosingType.Name;
+
+            foreach (var sibling in inputProperty.EnclosingType?.Properties ?? [])
+            {
+                if (ReferenceEquals(sibling, inputProperty))
+                {
+                    continue;
+                }
+
+                if (sibling.IsExactName)
+                {
+                    if (AvoidPropertyNameCollision(sibling.Name, enclosingTypeName) == contractName)
+                    {
+                        return true;
+                    }
+
+                    continue;
+                }
+
+                // Compare both the raw identifier and the name the sibling actually emits, since acronym
+                // normalization can move it onto the shipped name even when the identifier does not match.
+                var siblingIdentifier = sibling.Name.ToIdentifierName();
+                var siblingGenerated = siblingIdentifier.NormalizeCSharpAcronyms(sibling.Type.IsDateTimeInputType());
+                if (AvoidPropertyNameCollision(siblingIdentifier, enclosingTypeName) == contractName ||
+                    AvoidPropertyNameCollision(siblingGenerated, enclosingTypeName) == contractName)
+                {
+                    return true;
+                }
+            }
+
+            // A customization that explicitly targets a different spec property owns its public name outright.
+            // A raw-name customization is excluded: it has no declared target, so it is intended to replace
+            // whichever generated property ends up with that name, including a preserved one. Fields are
+            // included because customization filtering treats a custom field as a claim on a property name.
+            foreach (var customName in GetExplicitlyRenamedCustomNames(enclosingType))
+            {
+                if (customName.OriginalName == inputProperty.Name ||
+                    customName.OriginalName == inputProperty.Name.ToIdentifierName())
+                {
+                    continue;
+                }
+
+                if (customName.Name == contractName)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<(string Name, string OriginalName)> GetExplicitlyRenamedCustomNames(TypeProvider enclosingType)
+        {
+            foreach (var customProperty in enclosingType.CustomCodeView?.Properties ?? [])
+            {
+                if (customProperty.OriginalName is { } propertyOriginalName)
+                {
+                    yield return (customProperty.Name, propertyOriginalName);
+                }
+            }
+
+            foreach (var customField in enclosingType.CustomCodeView?.Fields ?? [])
+            {
+                if (customField.OriginalName is { } fieldOriginalName)
+                {
+                    yield return (customField.Name, fieldOriginalName);
+                }
+            }
+        }
+
+        private static bool IsPropertyPrivate(MethodSignatureModifiers modifiers, TypeSignatureModifiers enclosingTypeModifiers)
+        {
+            return (modifiers.HasFlag(MethodSignatureModifiers.Private) && !modifiers.HasFlag(MethodSignatureModifiers.Protected))
+                   || enclosingTypeModifiers.HasFlag(TypeSignatureModifiers.Private);
+        }
+
+        [MemberNotNull(nameof(_parameter))]
+        private void InitializeParameter(FormattableString description)
+        {
+            _parameter = new(() => new ParameterProvider(
+                Name.ToVariableName(),
+                description,
+                Type,
+                property: this));
+        }
+
+        public VariableExpression AsVariableExpression => _variable ??= AsParameter;
+
+        private static bool IsDiscriminatorProperty(InputProperty inputProperty)
+        {
+            return inputProperty is InputModelProperty mp && mp.IsDiscriminator;
+        }
+
+        /// <summary>
+        /// Returns true if the property has a setter.
+        /// </summary>
+        protected virtual bool PropertyHasSetter(CSharpType type, InputProperty inputProperty)
+        {
+            if (IsDiscriminatorProperty(inputProperty))
+            {
+                return true;
+            }
+
+            if (inputProperty.IsReadOnly)
+            {
+                // Writable descendants share storage without exposing a public setter on the base.
+                return !_isRequiredNonNullableConstant
+                    && type.Equals(type.OutputType)
+                    && inputProperty.EnclosingType!.Usage.HasFlag(InputModelTypeUsage.Input)
+                    && !EnclosingType.DeclarationModifiers.HasFlag(TypeSignatureModifiers.ReadOnly)
+                    && CodeModelGenerator.Instance.TypeFactory.HasRelaxedConstructorOverride(inputProperty, includeBaseModels: false);
+            }
+
+            if (_isRequiredNonNullableConstant)
+            {
+                return false;
+            }
+
+            // Output-only properties don't need setters.
+            if (!inputProperty.EnclosingType!.Usage.HasFlag(InputModelTypeUsage.Input))
+            {
+                return false;
+            }
+
+            // At this point, we know that we are dealing with an Input model.
+            // If the property is required and is not on a round-trip model, it doesn't need a setter as it can just be set via
+            // constructor.
+            // Round-trip models need setters so that a model returned from a service method can be modified.
+            var requiredInConstructor = (inputProperty as InputModelProperty)?.IsRequiredInConstructor ?? inputProperty.IsRequired;
+            if (requiredInConstructor && !inputProperty.EnclosingType!.Usage.HasFlag(InputModelTypeUsage.Output)
+                && !CodeModelGenerator.Instance.TypeFactory.HasRelaxedConstructorOverride(inputProperty))
+            {
+                return false;
+            }
+
+            if (EnclosingType.DeclarationModifiers.HasFlag(TypeSignatureModifiers.Struct | TypeSignatureModifiers.ReadOnly))
+            {
+                return false;
+            }
+
+            if (type is { IsCollection: true, IsReadOnlyMemory: false })
+            {
+                return type.IsNullable;
+            }
+
+            return true;
+        }
+
+        private ValueExpression? GetPropertyInitializationValue(CSharpType propertyType, InputProperty inputProperty)
+        {
+            if (!inputProperty.IsRequired)
+            {
+                return null;
+            }
+
+            if (propertyType.IsLiteral)
+            {
+                if (!propertyType.IsNullable)
+                {
+                    return Snippet.Literal(propertyType.Literal);
+                }
+                else
+                {
+                    return Snippet.DefaultOf(propertyType);
+                }
+            }
+
+            return null;
+        }
+
+        private string GetDebuggerDisplay()
+        {
+            return $"Name: {Name}, Type: {Type}";
+        }
+
+        private MemberExpression? _asMember;
+
+        internal void SynchronizePropertyShape()
+        {
+            _asMember?.Update(memberName: Name);
+            AsParameter.SynchronizePropertyShape();
+        }
+
+        public static implicit operator MemberExpression(PropertyProvider property)
+            => property._asMember ??= new MemberExpression(null, property.Name);
+
+        public void Update(
+            FormattableString? description = null,
+            MethodSignatureModifiers? modifiers = null,
+            CSharpType? type = null,
+            string? name = null,
+            PropertyBody? body = null,
+            TypeProvider? enclosingType = null,
+            CSharpType? explicitInterface = null,
+            PropertyWireInformation? wireInfo = null,
+            bool? isRef = null,
+            XmlDocProvider? xmlDocs = null,
+            IEnumerable<AttributeStatement>? attributes = null)
+        {
+            if (description != null)
+            {
+                _customDescription = description;
+                if (_parameter.IsValueCreated)
+                {
+                    AsParameter.Update(description: description);
+                }
+                else
+                {
+                    InitializeParameter(description);
+                }
+            }
+            if (modifiers != null)
+            {
+                Modifiers = modifiers.Value;
+            }
+            if (type != null)
+            {
+                Type = type;
+            }
+            if (name != null)
+            {
+                Name = name;
+            }
+            if (body != null)
+            {
+                Body = body;
+            }
+            if (enclosingType != null)
+            {
+                EnclosingType = enclosingType;
+            }
+            if (explicitInterface != null)
+            {
+                ExplicitInterface = explicitInterface;
+            }
+            if (wireInfo != null)
+            {
+                WireInfo = wireInfo;
+            }
+            if (attributes != null)
+            {
+                Attributes = (attributes as IReadOnlyList<AttributeStatement>) ?? [];
+            }
+            if (isRef is not null)
+            {
+                IsRef = isRef.Value;
+            }
+            if (xmlDocs != null)
+            {
+                XmlDocs = xmlDocs;
+            }
+            else
+            {
+                // rebuild the docs if they are not provided
+                BuildDocs();
+            }
+        }
+    }
+}

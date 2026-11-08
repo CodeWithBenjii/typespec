@@ -1,0 +1,244 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package com.microsoft.typespec.http.client.generator.core.template;
+
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ArrayType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ClassType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ClientMethod;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ClientMethodType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ConvenienceMethod;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.EnumType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.GenericType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.IType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.PrimitiveType;
+import com.microsoft.typespec.http.client.generator.core.model.javamodel.JavaBlock;
+import com.microsoft.typespec.http.client.generator.core.util.TemplateUtil;
+import io.clientcore.core.utils.CoreUtils;
+import java.util.List;
+import java.util.Set;
+
+public class ConvenienceAsyncMethodTemplate extends ConvenienceMethodTemplateBase {
+
+    private static final ConvenienceAsyncMethodTemplate INSTANCE = new ConvenienceAsyncMethodTemplate();
+
+    protected ConvenienceAsyncMethodTemplate() {
+    }
+
+    public static ConvenienceAsyncMethodTemplate getInstance() {
+        return INSTANCE;
+    }
+
+    public void addImports(Set<String> imports, List<ConvenienceMethod> convenienceMethods) {
+        if (!CoreUtils.isNullOrEmpty(convenienceMethods)) {
+            super.addImports(imports, convenienceMethods);
+
+            // async e.g. FluxUtil::toMono
+            imports.add(ClassType.FLUX_UTIL.getFullName());
+
+            // async pageable
+            imports.add(ClassType.PAGED_RESPONSE.getFullName());
+            imports.add(ClassType.PAGED_RESPONSE_BASE.getFullName());
+            imports.add(ClassType.FLUX.getFullName());
+        }
+    }
+
+    @Override
+    protected boolean isMethodIncluded(ClientMethod method) {
+        return isMethodAsync(method) && isMethodVisible(method) && !method.isImplementationOnly();
+    }
+
+    @Override
+    protected boolean isMethodIncluded(ConvenienceMethod method) {
+        return isMethodAsync(method.getProtocolMethod()) && isMethodVisible(method.getProtocolMethod())
+        // for LRO, we actually choose the protocol method of "WithModel"
+            && (method.getProtocolMethod().getType() != ClientMethodType.LongRunningBeginAsync
+                || (method.getProtocolMethod().getImplementationDetails() != null
+                    && method.getProtocolMethod().getImplementationDetails().isImplementationOnly()))
+            && method.getProtocolMethod()
+                .getMethodParameters()
+                .stream()
+                .noneMatch(p -> p.getClientType() == ClassType.CONTEXT);
+    }
+
+    protected void writeInvocationAndConversion(ClientMethod convenienceMethod, ClientMethod protocolMethod,
+        String invocationExpression, JavaBlock methodBlock, Set<GenericType> typeReferenceStaticClasses) {
+
+        ClientMethodType methodType = protocolMethod.getType();
+
+        IType responseBodyType = getConvenienceResponseBodyType(convenienceMethod);
+        IType protocolResponseBodyType = getConvenienceResponseBodyType(protocolMethod);
+        IType rawResponseBodyType = convenienceMethod.getProxyMethod().getRawResponseBodyType();
+
+        if (convenienceMethod.getType() == ClientMethodType.SimpleAsync
+            && responseBodyType.asNullable() == ClassType.VOID
+            && protocolResponseBodyType == ClassType.BINARY_DATA) {
+            methodBlock
+                .methodReturn(String.format("%1$s(%2$s).then()", getMethodName(protocolMethod), invocationExpression));
+            return;
+        }
+
+        if (convenienceMethod.getType() == ClientMethodType.SimpleAsync
+            && isResponseHeadersAsModel(convenienceMethod)) {
+            // The convenience method returns the strongly-typed response-headers model, built from the response
+            // headers of the protocol method (which returns Mono<Response<Void>>).
+            methodBlock.methodReturn(
+                String.format("%1$s(%2$s).map(protocolMethodResponse -> new %3$s(protocolMethodResponse.getHeaders()))",
+                    getMethodName(protocolMethod), invocationExpression, responseBodyType));
+            return;
+        }
+
+        if (methodType == ClientMethodType.PagingAsync) {
+            String expressionMapFromBinaryData = expressionMapFromBinaryData(responseBodyType, rawResponseBodyType,
+                protocolMethod.getProxyMethod().getResponseContentTypes(), typeReferenceStaticClasses);
+            if (expressionMapFromBinaryData == null) {
+                // no need to do the map
+                methodBlock.methodReturn(
+                    String.format("%1$s(%2$s)", getProtocolMethodInvocationName(protocolMethod), invocationExpression));
+            } else {
+                methodBlock.line("PagedFlux<BinaryData> pagedFluxResponse = %1$s(%2$s);",
+                    getProtocolMethodInvocationName(protocolMethod), invocationExpression);
+
+                methodBlock.methodReturn(String.format(
+                    "PagedFlux.create(() -> (continuationTokenParam, pageSizeParam) -> {\n"
+                        + "    Flux<PagedResponse<BinaryData>> flux;\n" + "    if (pageSizeParam == null) {\n"
+                        + "        flux = (continuationTokenParam == null)\n"
+                        + "            ? pagedFluxResponse.byPage().take(1)\n"
+                        + "            : pagedFluxResponse.byPage(continuationTokenParam).take(1);\n" + "    } else {\n"
+                        + "        flux = (continuationTokenParam == null)\n"
+                        + "            ? pagedFluxResponse.byPage(pageSizeParam).take(1)\n"
+                        + "            : pagedFluxResponse.byPage(continuationTokenParam, pageSizeParam).take(1);\n"
+                        + "    }\n"
+                        + "    return flux.map(pagedResponse -> new PagedResponseBase<Void, %1$s>(pagedResponse.getRequest(),\n"
+                        + "        pagedResponse.getStatusCode(),\n" + "        pagedResponse.getHeaders(),\n"
+                        + "        pagedResponse.getValue().stream().map(%2$s).collect(Collectors.toList()),\n"
+                        + "        pagedResponse.getContinuationToken(),\n" + "        null));\n" + "})",
+                    responseBodyType.asNullable(), expressionMapFromBinaryData));
+            }
+        } else if (methodType == ClientMethodType.LongRunningBeginAsync) {
+            String methodName = protocolMethod.getName();
+            methodBlock.methodReturn(String.format("serviceClient.%1$s(%2$s)", methodName, invocationExpression));
+        } else if (convenienceMethod.getType() == ClientMethodType.SimpleAsyncRestResponse) {
+            String methodInvocation = String.format("%1$s(%2$s)", getMethodName(protocolMethod), invocationExpression);
+            if (isResponseHeadersAsModel(convenienceMethod)) {
+                methodBlock.methodReturn(String.format(
+                    "%1$s.map(protocolMethodResponse -> new SimpleResponse<>(protocolMethodResponse, new %2$s(protocolMethodResponse.getHeaders())))",
+                    methodInvocation, responseBodyType));
+                return;
+            }
+
+            GenericType responseBaseType = getResponseBaseType(convenienceMethod.getReturnValue().getType());
+            boolean responseBodyIsVoid = responseBodyType.asNullable() == ClassType.VOID;
+            if (responseBaseType == null
+                && ((responseBodyIsVoid && protocolResponseBodyType.asNullable() == ClassType.VOID)
+                    || responseBodyType == ClassType.BINARY_DATA)) {
+                methodBlock.methodReturn(methodInvocation);
+                return;
+            }
+
+            String convertedValue = responseBodyIsVoid ? "null" : "protocolMethodResponse.getValue()";
+            if (!responseBodyIsVoid
+                && protocolResponseBodyType == ClassType.BINARY_DATA
+                && responseBodyType != ClassType.BINARY_DATA) {
+                convertedValue = expressionConvertFromBinaryData(responseBodyType, rawResponseBodyType, convertedValue,
+                    protocolMethod.getProxyMethod().getResponseContentTypes(), typeReferenceStaticClasses);
+            }
+            if (responseBaseType != null) {
+                IType headerType = responseBaseType.getTypeArguments()[0];
+                methodBlock.methodReturn(String.format(
+                    "%1$s.map(protocolMethodResponse -> new ResponseBase<>(protocolMethodResponse.getRequest(), protocolMethodResponse.getStatusCode(), protocolMethodResponse.getHeaders(), %2$s, new %3$s(protocolMethodResponse.getHeaders())))",
+                    methodInvocation, convertedValue, headerType));
+            } else {
+                methodBlock.methodReturn(String.format(
+                    "%1$s.map(protocolMethodResponse -> new SimpleResponse<>(protocolMethodResponse, %2$s))",
+                    methodInvocation, convertedValue));
+            }
+        } else {
+            String returnTypeConversionExpression = "";
+            if (protocolResponseBodyType == ClassType.BINARY_DATA) {
+                returnTypeConversionExpression = expressionConvertFromBinaryData(responseBodyType, rawResponseBodyType,
+                    protocolMethod.getProxyMethod().getResponseContentTypes(), typeReferenceStaticClasses);
+            }
+
+            methodBlock.methodReturn(String.format("%1$s(%2$s).flatMap(FluxUtil::toMono)%3$s",
+                getMethodName(protocolMethod), invocationExpression, returnTypeConversionExpression));
+        }
+    }
+
+    @Override
+    protected void writeThrowException(ClientMethodType methodType, String exceptionExpression, JavaBlock methodBlock) {
+        if (methodType == ClientMethodType.PagingAsync) {
+            methodBlock.methodReturn(
+                String.format("PagedFlux.create(() -> (ignoredContinuationToken, ignoredPageSize) -> Flux.error(%s))",
+                    exceptionExpression));
+        } else if (methodType == ClientMethodType.LongRunningBeginAsync) {
+            methodBlock.methodReturn(String.format("PollerFlux.error(%s)", exceptionExpression));
+        } else {
+            methodBlock.methodReturn(String.format("Mono.error(%s)", exceptionExpression));
+        }
+    }
+
+    private String expressionConvertFromBinaryData(IType responseBodyType, IType rawType, Set<String> mediaTypes,
+        Set<GenericType> typeReferenceStaticClasses) {
+        String expressionMapFromBinaryData
+            = expressionMapFromBinaryData(responseBodyType, rawType, mediaTypes, typeReferenceStaticClasses);
+        if (expressionMapFromBinaryData != null) {
+            return String.format(".map(%s)", expressionMapFromBinaryData);
+        } else {
+            // no need to do the map
+            return "";
+        }
+    }
+
+    private String expressionMapFromBinaryData(IType responseBodyType, IType rawType, Set<String> mediaTypes,
+        Set<GenericType> typeReferenceStaticClasses) {
+        if (responseBodyType == ClassType.BINARY_DATA) {
+            return null;
+        }
+        SupportedMimeType mimeType = SupportedMimeType.getResponseKnownMimeType(mediaTypes);
+        String serializerArgument = xmlSerializerArgument(mimeType, responseBodyType);
+        switch (mimeType) {
+            case TEXT:
+                if (responseBodyType == ArrayType.BYTE_ARRAY) {
+                    return "protocolMethodData -> protocolMethodData.toBytes()";
+                }
+                String baseHandling = "protocolMethodData.toString()";
+                if (!rawType.isNullable()) {
+                    // Dealing with a primitive type that needs to be converted.
+                    return "protocolMethodData -> " + wrapPrimitiveMimeTypeText(baseHandling, (PrimitiveType) rawType);
+                } else {
+                    return "protocolMethodData -> " + baseHandling;
+                }
+
+            case BINARY:
+                return null;
+
+            default:
+                // JSON, XML etc.
+                if (responseBodyType instanceof EnumType) {
+                    // enum
+                    return String.format(
+                        "protocolMethodData -> %1$s.from%2$s(protocolMethodData.toObject(%2$s.class%3$s))",
+                        responseBodyType, ((EnumType) responseBodyType).getElementType(), serializerArgument);
+                } else if (responseBodyType instanceof GenericType) {
+                    // generic, e.g. list, map
+                    typeReferenceStaticClasses.add((GenericType) responseBodyType);
+                    return String.format("protocolMethodData -> protocolMethodData.toObject(%1$s%2$s)",
+                        TemplateUtil.getTypeReferenceCreation(responseBodyType), serializerArgument);
+                } else if (responseBodyType == ArrayType.BYTE_ARRAY) {
+                    // byte[]
+                    if (rawType == ClassType.BASE_64_URL) {
+                        return "protocolMethodData -> protocolMethodData.toObject(" + ClassType.BASE_64_URL.getName()
+                            + ".class" + serializerArgument + ").decodedBytes()";
+                    } else {
+                        return "protocolMethodData -> protocolMethodData.toObject(byte[].class" + serializerArgument
+                            + ")";
+                    }
+                } else {
+                    // default, treat as class
+                    return "protocolMethodData -> protocolMethodData.toObject(" + responseBodyType.asNullable()
+                        + ".class" + serializerArgument + ")";
+                }
+        }
+    }
+}

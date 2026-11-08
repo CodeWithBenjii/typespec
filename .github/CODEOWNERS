@@ -1,0 +1,45 @@
+# Catch all
+*                                            @markcowl @timotheeguerin @iscai-msft @catalinaperalta @lmazuel
+
+# Those files/folders can be modified by anyone
+.chronus/changes/
+.github/skills/
+cspell.yaml
+
+######################
+# Emiter Shared
+######################
+/eng/emitters/                               @JoshLove-msft @iscai-msft @timotheeguerin @l0lawrence @xirzec @markcowl @catalinaperalta
+/docs/samples/client/                        @lmazuel @JoshLove-msft @iscai-msft @weidongxu-microsoft @haolingdong-msft @XiaofeiCao @tadelesh @msyyc @xirzec @timotheeguerin @qiaozha @MaryGao @l0lawrence
+
+######################
+# CSharp
+######################
+/packages/http-client-csharp/                @m-nash @JoshLove-msft @jorgerangel-msft @jogiles @joseharriaga @alzimmermsft
+/docs/samples/client/csharp                  @JoshLove-msft @jorgerangel-msft @jogiles @joseharriaga @alzimmermsft
+/website/src/content/docs/docs/emitters/clients/http-client-csharp/ @JoshLove-msft @jorgerangel-msft @jogiles @joseharriaga @alzimmermsft
+
+######################
+# Java
+######################
+/packages/http-client-java/                  @weidongxu-microsoft @haolingdong-msft @XiaofeiCao @alzimmermsft @jogiles @JoshLove-msft
+/website/src/content/docs/docs/emitters/clients/http-client-java/ @weidongxu-microsoft @haolingdong-msft @XiaofeiCao @alzimmermsft @jogiles @JoshLove-msft
+/.github/instructions/http-client-java.instructions.md @weidongxu-microsoft @haolingdong-msft @XiaofeiCao @alzimmermsft @jogiles @JoshLove-msft
+
+######################
+# Python
+######################
+/packages/http-client-python/                                                     @iscai-msft @tadelesh @msyyc @timotheeguerin @lmazuel @catalinaperalta @ChenxiJiang333 @l0lawrence @kashifkhan @xirzec @markcowl
+/website/src/content/docs/docs/emitters/clients/http-client-python/               @iscai-msft @tadelesh @msyyc @timotheeguerin @lmazuel @catalinaperalta @ChenxiJiang333 @l0lawrence @kashifkhan @xirzec @markcowl
+
+######################
+# JavaScript
+######################
+/packages/http-client-js/                    @timotheeguerin @qiaozha @MaryGao @xirzec @markcowl @maorleger @iscai-msft @catalinaperalta
+
+######################
+# IDE
+######################
+/packages/typespec-vs/                       @RodgeFu @lirenhe @bterlson @markcowl @timotheeguerin @iscai-msft @catalinaperalta @lmazuel
+/packages/typespec-vscode/                   @RodgeFu @lirenhe @bterlson @markcowl @timotheeguerin @iscai-msft @catalinaperalta @lmazuel
+/packages/compiler/src/server/               @RodgeFu @bterlson @markcowl @timotheeguerin @iscai-msft @catalinaperalta @lmazuel

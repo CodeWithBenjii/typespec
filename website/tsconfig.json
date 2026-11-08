@@ -1,0 +1,12 @@
+{
+  "extends": "astro/tsconfigs/strict",
+  "compilerOptions": {
+    "noImplicitAny": false,
+    "paths": {
+      "@site/*": ["./*"]
+    },
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
+  },
+  "exclude": ["public/1ds-init.js", "dist", "src/assets"]
+}

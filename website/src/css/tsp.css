@@ -1,0 +1,24 @@
+:root,
+:root[data-theme="light"],
+:root[data-theme="dark"] {
+  --header-height: 50px;
+}
+
+.sl-markdown-content code {
+  overflow-wrap: normal;
+}
+
+header.header {
+  padding: 0;
+  padding-inline-end: unset !important;
+}
+
+/* Apply link decorations for inline links, not navigation/tab links */
+p a,
+li > a {
+  text-decoration: underline;
+}
+nav a,
+li:is([role="presentation"]) a {
+  text-decoration: none;
+}

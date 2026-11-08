@@ -1,0 +1,350 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+package com.microsoft.typespec.http.client.generator.core.mapper;
+
+import com.microsoft.typespec.http.client.generator.core.MockUnitJavagen;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.ConvenienceApi;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Language;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Languages;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Operation;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Protocol;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Protocols;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Request;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Response;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.Schema;
+import com.microsoft.typespec.http.client.generator.core.extension.model.codemodel.StringSchema;
+import com.microsoft.typespec.http.client.generator.core.extension.plugin.JavaSettings;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ClassType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ClientMethod;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ClientMethodParameter;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.ClientMethodType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.GenericType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.IType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.MethodParameter;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.PrimitiveType;
+import com.microsoft.typespec.http.client.generator.core.model.clientmodel.Versioning;
+import com.microsoft.typespec.http.client.generator.core.model.javamodel.JavaVisibility;
+import io.clientcore.core.http.models.HttpMethod;
+import io.clientcore.core.utils.IOExceptionCheckedFunction;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+
+@Isolated
+public class ClientMethodMapperTests {
+
+    @AfterEach
+    public void restoreSettings() {
+        new MockUnitJavagen();
+        JavaSettings.clear();
+    }
+
+    @Test
+    public void testFirstOptionalParameterSignatures() {
+        ClientMethodParameter required
+            = new ClientMethodParameter.Builder().name("name").wireType(ClassType.STRING).required(true).build();
+        ClientMethodParameter optional = new ClientMethodParameter.Builder().name("option")
+            .wireType(ClassType.STRING)
+            .versioning(new Versioning.Builder().added(Arrays.asList("v2", "v3")).build())
+            .build();
+
+        Assertions.assertEquals(List.of(List.of(required)),
+            ClientMethodMapper.findOverloadedSignatures(List.of(required, optional)));
+        Assertions.assertEquals(List.of(List.of()), ClientMethodMapper.findOverloadedSignatures(List.of(optional)));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ClientMethodType.class, names = { "SimpleSyncRestResponse", "PagingSync", "LongRunningSync" })
+    public void testRequiredOnlyVersioningOverloadWithContext(ClientMethodType type) {
+        new MockUnitJavagen() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <T> T getValue(String key, IOExceptionCheckedFunction<String, T> converter) {
+                if ("flavor".equals(key)) {
+                    return (T) "azure";
+                }
+                if ("data-plane".equals(key)) {
+                    return (T) Boolean.FALSE;
+                }
+                return super.getValue(key, converter);
+            }
+        };
+        JavaSettings.clear();
+        ClientMethodParameter required = new ClientMethodParameter.Builder().name("name")
+            .wireType(ClassType.STRING)
+            .annotations(List.of())
+            .required(true)
+            .build();
+        ClientMethodParameter optional = new ClientMethodParameter.Builder().name("option")
+            .wireType(ClassType.STRING)
+            .annotations(List.of())
+            .versioning(new Versioning.Builder().added(Arrays.asList("v2")).build())
+            .build();
+        ClientMethod baseMethod = new ClientMethod.Builder().name("operation")
+            .type(type)
+            .parameters(List.of(required, optional))
+            .methodVisibility(JavaVisibility.Public)
+            .build();
+        List<ClientMethod> methods = new ArrayList<>();
+        methods.add(baseMethod.newBuilder().onlyRequiredParameters(true).build());
+        ClientMethodMapper mapper = new ClientMethodMapper();
+        ClientMethod withContext = mapper.addClientMethodWithContext(methods, baseMethod, JavaVisibility.Public, false);
+
+        mapper.createOverloadForVersioning(methods, baseMethod, withContext, JavaVisibility.Public, null, false, true);
+        Assertions.assertEquals(3, methods.size());
+        ClientMethod historical = methods.get(2);
+        Assertions.assertEquals(List.of("name", "context"),
+            historical.getMethodInputParameters().stream().map(MethodParameter::getName).collect(Collectors.toList()));
+        Assertions.assertSame(withContext, historical.getOverloadedClientMethod());
+
+        mapper.createOverloadForVersioning(methods, baseMethod, baseMethod, JavaVisibility.Public, null, false, false);
+        Assertions.assertEquals(3, methods.size(), "Do not duplicate the existing required-only overload");
+    }
+
+    @Test
+    public void testConvenienceResponseReplacement() {
+        Operation operation = operationWithNoDesc();
+        operation.getRequests().get(0).getProtocol().getHttp().setMethod(HttpMethod.GET.name());
+        StringSchema schema = new StringSchema();
+        schema.setType(Schema.AllSchemaTypes.STRING);
+        operation.getResponses().get(0).setSchema(schema);
+        ConvenienceApi convenienceApi = new ConvenienceApi();
+        operation.setConvenienceApi(convenienceApi);
+        Response response = new Response();
+        convenienceApi.setResponse(response);
+
+        Assertions.assertEquals(PrimitiveType.VOID,
+            ClientMethodsReturnDescription.create(operation, false, true).getSyncReturnType());
+        Assertions.assertEquals(ClassType.BINARY_DATA,
+            ClientMethodsReturnDescription.create(operation, true, true).getSyncReturnType());
+
+        response.setBinary(true);
+        Assertions.assertEquals(ClassType.BINARY_DATA,
+            ClientMethodsReturnDescription.create(operation, false, true).getSyncReturnType());
+        Assertions.assertEquals(ClassType.BINARY_DATA,
+            ClientMethodsReturnDescription.create(operation, true, true).getSyncReturnType());
+
+        response.setBinary(false);
+        response.setSchema(schema);
+        Assertions.assertEquals(ClassType.STRING,
+            ClientMethodsReturnDescription.create(operation, false, true).getSyncReturnType());
+
+        convenienceApi.setResponse(null);
+        Assertions.assertEquals(ClassType.STRING,
+            ClientMethodsReturnDescription.create(operation, false, true).getSyncReturnType());
+    }
+
+    @Test
+    public void testOverloadedSignatures() {
+        List<ClientMethodParameter> parameters = new ArrayList<>();
+
+        parameters
+            .add(new ClientMethodParameter.Builder().name("param0").wireType(ClassType.STRING).required(true).build());
+
+        parameters.add(new ClientMethodParameter.Builder().name("param1").wireType(ClassType.STRING).build());
+
+        parameters.add(new ClientMethodParameter.Builder().name("param2")
+            .wireType(ClassType.STRING)
+            .versioning(new Versioning.Builder().added(Arrays.asList("v1", "v2", "v3", "v4", "v5")).build())
+            .build());
+
+        parameters.add(new ClientMethodParameter.Builder().name("param3")
+            .wireType(ClassType.STRING)
+            .versioning(new Versioning.Builder().added(Arrays.asList("v2", "v3", "v4", "v5")).build())
+            .build());
+
+        parameters.add(new ClientMethodParameter.Builder().name("param4")
+            .wireType(ClassType.STRING)
+            .versioning(new Versioning.Builder().added(Arrays.asList("v3", "v4", "v5")).build())
+            .build());
+
+        parameters.add(new ClientMethodParameter.Builder().name("param5")
+            .wireType(ClassType.STRING)
+            .versioning(new Versioning.Builder().added(Arrays.asList("v5")).build())
+            .build());
+
+        List<List<ClientMethodParameter>> signatures = ClientMethodMapper.findOverloadedSignatures(parameters);
+        Assertions.assertEquals(4, signatures.size());
+        // API for required-only would be signature of "param0"
+        // API for no added (aka "v0")
+        Assertions.assertEquals(Arrays.asList("param0", "param1"),
+            signatures.get(0).stream().map(MethodParameter::getName).collect(Collectors.toList()));
+        // API for v1
+        Assertions.assertEquals(Arrays.asList("param0", "param1", "param2"),
+            signatures.get(1).stream().map(MethodParameter::getName).collect(Collectors.toList()));
+        // API for v2
+        Assertions.assertEquals(Arrays.asList("param0", "param1", "param2", "param3"),
+            signatures.get(2).stream().map(MethodParameter::getName).collect(Collectors.toList()));
+        // API for v3
+        Assertions.assertEquals(Arrays.asList("param0", "param1", "param2", "param3", "param4"),
+            signatures.get(3).stream().map(MethodParameter::getName).collect(Collectors.toList()));
+        // API for v4 be same as v3
+        // API for v5 would be same as full parameters
+    }
+
+    @Test
+    public void returnTypeDescTest() {
+        Operation operation;
+        IType returnType;
+        IType baseType;
+        String description;
+        String operationDesc;
+        String responseSchemaDesc;
+        String expectedDescription;
+
+        // description on operation
+        // Mono
+        operationDesc = "desc from operation";
+        responseSchemaDesc = "desc from response schema";
+        operation = operationWithDescOnOperationAndResponseSchema(operationDesc, responseSchemaDesc);
+        expectedDescription = String.format("%s on successful completion of {@link Mono}", operationDesc);
+
+        // Mono<Void>
+        baseType = PrimitiveType.VOID;
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        Assertions.assertEquals(expectedDescription, description);        // Mono<Boolean>
+        baseType = PrimitiveType.BOOLEAN;
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        Assertions.assertEquals(expectedDescription, description);
+        // Response
+        operation = operationWithDescOnOperationAndResponseSchema(operationDesc, responseSchemaDesc);
+        expectedDescription = String.format("%s along with {@link Response}", operationDesc);
+        // Response<Void>
+        baseType = PrimitiveType.VOID;
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        Assertions.assertEquals(expectedDescription, description);        // Response<Boolean>
+        baseType = PrimitiveType.BOOLEAN;
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        Assertions.assertEquals(expectedDescription, description);
+
+        // description on schema
+        // Mono
+        operation = operationWithDescOnResponseSchema(responseSchemaDesc);
+        expectedDescription = String.format("%s on successful completion of {@link Mono}", responseSchemaDesc);
+        // Mono<Void>
+        baseType = PrimitiveType.VOID;
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        // Mono<Boolean>
+        Assertions.assertEquals(expectedDescription, description);
+        baseType = PrimitiveType.BOOLEAN;
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        // Mono<T>
+        Assertions.assertEquals(expectedDescription, description);
+        baseType = GenericType.response(ClassType.STRING);
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        expectedDescription
+            = "desc from response schema along with {@link Response} on successful completion of {@link Mono}";
+        Assertions.assertEquals(expectedDescription, description);
+
+        // Response
+        operation = operationWithDescOnResponseSchema(responseSchemaDesc);
+        expectedDescription = String.format("%s along with {@link Response}", responseSchemaDesc);
+        // Response<Void>
+        baseType = PrimitiveType.VOID;
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        Assertions.assertEquals(expectedDescription, description);
+        // Response<Boolean>
+        baseType = PrimitiveType.BOOLEAN;
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        Assertions.assertEquals(expectedDescription, description);
+        // Response<T>
+        baseType = GenericType.mono(ClassType.STRING);
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        Assertions.assertEquals(expectedDescription, description);
+
+        // no description on either operation or schema
+        // Mono
+        operation = operationWithNoDesc();
+        // Mono<Void>
+        baseType = PrimitiveType.VOID;
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        expectedDescription = "A {@link Mono} that completes when a successful response is received";
+        Assertions.assertEquals(expectedDescription, description);
+        // Mono<Boolean>
+        baseType = PrimitiveType.BOOLEAN;
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        expectedDescription = String.format("%s on successful completion of {@link Mono}", "whether resource exists");
+        Assertions.assertEquals(expectedDescription, description);
+        // Mono<Response>
+        baseType = GenericType.response(ClassType.STRING);
+        returnType = GenericType.mono(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        expectedDescription = "the response body along with {@link Response} on successful completion of {@link Mono}";
+        Assertions.assertEquals(expectedDescription, description);
+
+        // Response
+        operation = operationWithNoDesc();
+        // Response<Void>
+        baseType = PrimitiveType.VOID;
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        expectedDescription = "the {@link Response}";
+        Assertions.assertEquals(expectedDescription, description);
+        // Response<Boolean>
+        baseType = PrimitiveType.BOOLEAN;
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        expectedDescription = String.format("%s along with {@link Response}", "whether resource exists");
+        Assertions.assertEquals(expectedDescription, description);
+        // Response<T>
+        baseType = ClassType.STRING;
+        returnType = GenericType.response(baseType);
+        description = ClientMethodsReturnDescription.returnTypeJavaDoc(operation, returnType, baseType);
+        expectedDescription = "the response body along with {@link Response}";
+        Assertions.assertEquals(expectedDescription, description);
+    }
+
+    private Operation operationWithNoDesc() {
+        return operationWithDescOnOperationAndResponseSchema(null, null);
+    }
+
+    private Operation operationWithDescOnResponseSchema(String responseSchemaDesc) {
+        return operationWithDescOnOperationAndResponseSchema(null, responseSchemaDesc);
+    }
+
+    private Operation operationWithDescOnOperationAndResponseSchema(String operationDesc, String responseSchemaDesc) {
+        Operation operation;
+        operation = new Operation();
+        Languages languages = new Languages();
+        Language defaultLang = new Language();
+        if (operationDesc != null) {
+            defaultLang.setDescription("get " + operationDesc);
+        }
+        languages.setDefault(defaultLang);
+        operation.setLanguage(languages);
+        Response response = new Response();
+        Schema schema = new Schema();
+        schema.setSummary(responseSchemaDesc);
+        response.setSchema(schema);
+        operation.setResponses(new ArrayList<>(Collections.singletonList(response)));
+        Request request = new Request();
+        Protocols protocols = new Protocols();
+        Protocol http = new Protocol();
+        http.setMethod(HttpMethod.HEAD.name());
+        protocols.setHttp(http);
+        request.setProtocol(protocols);
+        operation.setRequests(new ArrayList<>(Collections.singletonList(request)));
+        return operation;
+    }
+}

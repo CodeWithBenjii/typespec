@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "verbatimModuleSyntax": true,
+    "alwaysStrict": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noImplicitThis": true,
+    "sourceMap": true,
+    "declarationMap": true,
+    "strict": true,
+    "declaration": true,
+    "stripInternal": true,
+    "noEmitHelpers": false,
+    "target": "es2024",
+    "types": ["node"],
+    "lib": ["es2024", "DOM"],
+    "experimentalDecorators": true,
+    "newLine": "LF",
+    "skipLibCheck": true
+  }
+}

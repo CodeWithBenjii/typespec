@@ -1,0 +1,58 @@
+{
+  "name": "@typespec/spec-dashboard",
+  "private": true,
+  "version": "0.1.0-alpha.0",
+  "description": "Spector Dashboard website",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "clean": "rimraf ./dist ./temp",
+    "build": "vite build && pnpm build:types",
+    "build:types": "tsc -p tsconfig.declaration.json",
+    "watch": "concurrently --kill-others \"vite build --watch --emptyOutDir false\" \"pnpm build:types --watch\"",
+    "test:skip": "vitest run",
+    "test:ui": "vitest --ui",
+    "test:ci": "vitest run --coverage --reporter=junit --reporter=default",
+    "lint": "oxlint . --deny-warnings",
+    "lint:fix": "oxlint . --fix"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./style.css": "./dist/style.css"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/microsoft/typespec.git"
+  },
+  "author": "Microsoft",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/microsoft/typespec/issues"
+  },
+  "homepage": "https://github.com/microsoft/typespec#readme",
+  "dependencies": {
+    "@fluentui/react-components": "catalog:",
+    "@fluentui/react-icons": "catalog:",
+    "@typespec/spec-coverage-sdk": "workspace:^",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-markdown": "catalog:"
+  },
+  "devDependencies": {
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "concurrently": "catalog:",
+    "rimraf": "catalog:",
+    "rollup-plugin-visualizer": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plugin-checker": "catalog:"
+  }
+}

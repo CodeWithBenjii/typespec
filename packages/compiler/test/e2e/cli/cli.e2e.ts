@@ -1,0 +1,382 @@
+import type { ChildProcess, SpawnOptions } from "child_process";
+import { spawn } from "child_process";
+import { access, readFile, rm } from "fs/promises";
+import * as http from "http";
+import type { AddressInfo } from "net";
+import { beforeEach, describe, expect, it } from "vitest";
+import { resolvePath } from "../../../src/index.js";
+import { findTestPackageRoot } from "../../../src/testing/test-utils.js";
+
+const pkgRoot = await findTestPackageRoot(import.meta.url);
+const scenarioRoot = resolvePath(pkgRoot, "test/e2e/cli/scenarios");
+
+function getScenarioDir(name: string) {
+  return resolvePath(scenarioRoot, name);
+}
+interface ExecCliOptions {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+async function execCli(args: string[], { cwd, env }: ExecCliOptions) {
+  const node = process.platform === "win32" ? "node.exe" : "node";
+  return execAsync(node, [resolvePath(pkgRoot, "entrypoints/cli.js"), ...args], {
+    cwd,
+    env: { ...process.env, ...env, NO_COLOR: "1" },
+  });
+}
+async function execCliSuccess(args: string[], options: ExecCliOptions) {
+  const result = await execCli(args, options);
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to execute cli: ${result.stdio}`);
+  }
+
+  return result;
+}
+async function execCliFail(args: string[], options: ExecCliOptions) {
+  const result = await execCli(args, options);
+  if (result.exitCode === 0) {
+    throw new Error(`Cli succeeded but expected failure: ${result.stdio}`);
+  }
+  return result;
+}
+
+export interface ExecResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  stdio: string;
+  proc: ChildProcess;
+}
+export async function execAsync(
+  command: string,
+  args: string[],
+  options: SpawnOptions,
+): Promise<ExecResult> {
+  const child = spawn(command, args, options);
+
+  return new Promise((resolve, reject) => {
+    child.on("error", (error) => {
+      reject(error);
+    });
+    const stdio: Buffer[] = [];
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout?.on("data", (data) => {
+      stdout.push(data);
+      stdio.push(data);
+    });
+    child.stderr?.on("data", (data) => {
+      stderr.push(data);
+      stdio.push(data);
+    });
+
+    child.on("exit", (exitCode) => {
+      resolve({
+        exitCode: exitCode ?? -1,
+        stdout: Buffer.concat(stdout).toString(),
+        stderr: Buffer.concat(stderr).toString(),
+        stdio: Buffer.concat(stdio).toString(),
+        proc: child,
+      });
+    });
+  });
+}
+
+async function cleanOutputDir(scenarioName: string) {
+  const dir = resolvePath(getScenarioDir(scenarioName), "tsp-output");
+  await rm(dir, { recursive: true, force: true });
+}
+
+describe("help", () => {
+  it("shows help", async () => {
+    const { stdout } = await execCliSuccess(["--help"], {
+      cwd: getScenarioDir("simple"),
+    });
+    expect(stdout).toContain("tsp <command>");
+    expect(stdout).toContain("tsp compile <path>       Compile TypeSpec source.");
+    expect(stdout).toContain("tsp format <include...>  Format given list of TypeSpec files.");
+  });
+});
+
+describe("info", () => {
+  it("shows information about the current", async () => {
+    const { stdout } = await execCliSuccess(["info"], {
+      cwd: getScenarioDir("with-config"),
+    });
+    expect(stdout).toContain(`User Config:`);
+    expect(stdout).toContain(`outputDir: "{project-root}/tsp-output/{custom-dir}"`);
+  });
+});
+
+describe("install", () => {
+  it("reports registry failures without an internal compiler error", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(401);
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+
+    try {
+      const result = await execCliFail(["install"], {
+        cwd: getScenarioDir("install"),
+        env: { TYPESPEC_NPM_REGISTRY: `http://127.0.0.1:${port}` },
+      });
+
+      expect(result.stdio).toContain("install-package-manager-error");
+      expect(result.stdio).toContain("failed with status 401");
+      expect(result.stdio).not.toContain("Internal compiler error");
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it("reports package manager download failures without an internal compiler error", async () => {
+    const server = http.createServer((req, res) => {
+      if (req.url === "/npm") {
+        const manifest = {
+          name: "npm",
+          version: "99.99.99",
+          dist: { tarball: `http://${req.headers.host}/npm.tgz` },
+          bin: { npm: "bin/npm-cli.js" },
+        };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            name: "npm",
+            "dist-tags": { latest: manifest.version },
+            versions: { [manifest.version]: manifest },
+          }),
+        );
+      } else {
+        res.writeHead(200);
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const registryUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      const result = await execCliFail(["install"], {
+        cwd: getScenarioDir("install"),
+        env: { TYPESPEC_NPM_REGISTRY: registryUrl },
+      });
+
+      expect(result.stdio).toContain("install-package-manager-error");
+      expect(result.stdio).toContain("Failed to download package manager npm");
+      expect(result.stdio).toContain("Failed to extract package from");
+      expect(result.stdio).not.toContain("Internal compiler error");
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+});
+
+describe("format", () => {
+  it("--check returns non zero exit code for unformatted files", async () => {
+    const { stderr } = await execCliFail(["format", "--check", "."], {
+      cwd: getScenarioDir("unformatted"),
+    });
+    expect(stderr).toContain(`⚠ 1 need format`);
+  });
+});
+
+describe("compile", () => {
+  describe("linter overrides", () => {
+    const cwd = getScenarioDir("linter");
+
+    beforeEach(async () => {
+      await cleanOutputDir("linter");
+    });
+
+    it("reports configured lint diagnostics as errors with --warn-as-error", async () => {
+      const { stdio } = await execCliFail(["compile", ".", "--warn-as-error"], { cwd });
+      expect(stdio).toContain("error @typespec/compiler/unused-using:");
+    });
+
+    it("disables linting without disabling the configured emitter", async () => {
+      const { stdio } = await execCliSuccess(["compile", ".", "--no-linter", "--warn-as-error"], {
+        cwd,
+      });
+      expect(stdio).not.toContain("compiler/unused-");
+      expect(await readFile(resolvePath(cwd, "tsp-output/out.txt"), "utf8")).toBe("Hello, world!");
+    });
+
+    it("does not suppress compiler warnings with --no-linter", async () => {
+      const { stdio } = await execCliFail(["compile", ".", "--no-linter", "--warn-as-error"], {
+        cwd: getScenarioDir("warn"),
+      });
+      expect(stdio).toContain("error deprecated:");
+    });
+
+    it("applies ruleset selection and per-rule overrides from CLI flags", async () => {
+      const { stdio } = await execCliSuccess(
+        [
+          "compile",
+          ".",
+          "--linter-ruleset",
+          "@typespec/compiler/all",
+          "--linter-rule",
+          "compiler/unused-using=false",
+        ],
+        { cwd },
+      );
+      expect(stdio).not.toContain("warning @typespec/compiler/unused-using:");
+      expect(stdio).toContain("warning @typespec/compiler/unused-template-parameter:");
+    });
+
+    it.each(["linter-ruleset", "linter-rule"])("requires a value for --%s", async (flag) => {
+      const { stdio } = await execCliFail(["compile", ".", `--${flag}`], { cwd });
+      expect(stdio).toContain(`Not enough arguments following: ${flag}`);
+      expect(stdio).not.toContain("Internal compiler error");
+    });
+
+    it.each([
+      ["--linter-ruleset", "@typespec/compiler/all"],
+      ["--linter-rule", "compiler/unused-using=true"],
+    ])("rejects --no-linter with %s", async (...override) => {
+      const { stdio } = await execCliFail(["compile", ".", "--no-linter", ...override], { cwd });
+      expect(stdio).toContain("conflicting-linter-flags");
+      expect(stdio).not.toContain("Internal compiler error");
+    });
+  });
+
+  describe("compiling spec with warning", () => {
+    it("logs warning and succeed", async () => {
+      const { stdout } = await execCliSuccess(["compile", ".", "--pretty", "false"], {
+        cwd: getScenarioDir("warn"),
+      });
+
+      // eslint-disable-next-line no-console
+      console.log("Stdout", stdout);
+      expect(stdout).toContain("main.tsp:5:8 - warning deprecated: Deprecated: Deprecated");
+      expect(stdout).toContain("Found 1 warning.");
+    });
+
+    it("logs warning as error(and fail) when using --warn-as-error", async () => {
+      const { stdout } = await execCliFail(
+        ["compile", ".", "--warn-as-error", "--pretty", "false"],
+        {
+          cwd: getScenarioDir("warn"),
+        },
+      );
+      // eslint-disable-next-line no-console
+      console.log("Stdout", stdout);
+      expect(stdout).toContain("main.tsp:5:8 - error deprecated: Deprecated: Deprecated");
+      expect(stdout).toContain("Found 1 error.");
+    });
+  });
+
+  describe("compiling with an emitter", () => {
+    beforeEach(async () => {
+      await cleanOutputDir("with-emitter");
+    });
+
+    it("emits output", async () => {
+      const { stdout } = await execCliSuccess(["compile", ".", "--emit", "./emitter.js"], {
+        cwd: getScenarioDir("with-emitter"),
+      });
+      expect(stdout).toContain("Compilation completed successfully.");
+      const file = await readFile(
+        resolvePath(getScenarioDir("with-emitter"), "tsp-output/out.txt"),
+      );
+      expect(file.toString()).toEqual("Hello, world!");
+    });
+
+    it("doesn't emit output when --noEmit is set", async () => {
+      const { stdout } = await execCliSuccess(
+        ["compile", ".", "--emit", "./emitter.js", "--no-emit"],
+        {
+          cwd: getScenarioDir("with-emitter"),
+        },
+      );
+      expect(stdout).toContain("Compilation completed successfully.");
+      await expect(() =>
+        access(resolvePath(getScenarioDir("with-emitter"), "tsp-output/out.txt")),
+      ).rejects.toEqual(expect.any(Error));
+    });
+  });
+
+  describe("compiling with no emitter", () => {
+    it("logs warnings", async () => {
+      const { stdout } = await execCliSuccess(["compile", "."], {
+        cwd: getScenarioDir("simple"),
+      });
+      expect(stdout).toContain(
+        "No emitter was configured, no output was generated. Use `--emit <emitterName>` to pick emitter or specify it in the TypeSpec config.",
+      );
+    });
+
+    it("doesn't log warning when --noEmit is set", async () => {
+      const { stdout } = await execCliSuccess(["compile", ".", "--no-emit"], {
+        cwd: getScenarioDir("simple"),
+      });
+      expect(stdout).not.toContain(
+        "No emitter was configured, no output was generated. Use `--emit <emitterName>` to pick emitter or specify it in the TypeSpec config.",
+      );
+    });
+  });
+
+  it("can provide emitter options", async () => {
+    const { stdout } = await execCliSuccess(
+      ["compile", ".", "--emit", "./emitter.js", "--option", "test-emitter.text=foo"],
+      {
+        cwd: getScenarioDir("with-emitter"),
+      },
+    );
+    expect(stdout).toContain("Compilation completed successfully.");
+    const file = await readFile(resolvePath(getScenarioDir("with-emitter"), "tsp-output/out.txt"));
+    expect(file.toString()).toEqual("foo");
+  });
+
+  it("set config parameter with --arg", async () => {
+    await cleanOutputDir("with-config");
+
+    const { stdout } = await execCliSuccess(
+      ["compile", ".", "--emit", "./emitter.js", "--arg", "custom-dir=custom-dir-name"],
+      {
+        cwd: getScenarioDir("with-config"),
+      },
+    );
+    expect(stdout).toContain("Compilation completed successfully.");
+    await access(resolvePath(getScenarioDir("with-config"), "tsp-output/custom-dir-name/out.txt"));
+  });
+
+  it("set config parameter with --option", async () => {
+    await cleanOutputDir("with-option");
+    const { stdout } = await execCliSuccess(
+      [
+        "compile",
+        ".",
+        "--emit",
+        "./emitter.js",
+        "--arg",
+        "custom-dir=custom-dir-name",
+        "--arg",
+        "owner=TypeSpec",
+        "--option",
+        "emitter1.name=TypeSpec with options",
+        "--option",
+        "emitter1.by.owners.secondary=Co-owner is defined by this test",
+      ],
+      {
+        cwd: getScenarioDir("with-option"),
+      },
+    );
+    expect(stdout).toContain("Compilation completed successfully.");
+    const file = await readFile(
+      resolvePath(getScenarioDir("with-option"), "tsp-output/custom-dir-name/out.txt"),
+    );
+    expect(file.toString()).toContain(`By Owner: TypeSpec
+TypeSpec with options
+Succeeded: TypeSpec with options by TypeSpec
+Owner: TypeSpec
+Co-owner is defined by this test`);
+  });
+});

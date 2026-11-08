@@ -1,0 +1,34 @@
+let manifest;
+try {
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore
+  manifest = (await import("../manifest.js")).default;
+} catch {
+  // Construct path dynamically so bundlers cannot statically resolve this import.
+  // This fallback is only used when running directly from source during development.
+  const name = ["../dist", "manifest.js"].join("/");
+  manifest = (await import(/* @vite-ignore */ /* webpackIgnore: true */ name)).default;
+}
+
+export const typespecVersion = manifest.version;
+
+/** Compiler build identity, including the published version and originating source revision. */
+export interface TypeSpecManifest {
+  /**
+   * Version of the tsp compiler.
+   */
+  version: string;
+
+  /**
+   * Full commit sha.
+   */
+  commit: string;
+
+  /**
+   * Number of the pull request, if the build was from a pull request.
+   */
+  pr?: number;
+}
+
+/** Build metadata embedded in this compiler distribution. */
+export const MANIFEST: TypeSpecManifest = manifest;

@@ -1,0 +1,116 @@
+import { pathToFileURL } from "url";
+import { expect, it } from "vitest";
+import type { Location } from "vscode-languageserver";
+import { extractCursor, resolveVirtualPath } from "../../src/testing/index.js";
+import { createTestServerHost } from "../../src/testing/test-server-host.js";
+
+function resolveVirtualPathUri(path: string): string {
+  return pathToFileURL(resolveVirtualPath(path)).href;
+}
+
+async function goToDefinitionAtCursor(
+  sourceWithCursor: string,
+  otherFiles: Record<string, string> = {},
+): Promise<Location[]> {
+  const { source, pos } = extractCursor(sourceWithCursor);
+
+  const testHost = await createTestServerHost();
+  for (const [filename, content] of Object.entries(otherFiles)) {
+    testHost.addOrUpdateDocument(filename, content);
+  }
+  const textDocument = testHost.addOrUpdateDocument("main.tsp", source);
+  return await testHost.server.gotoDefinition({
+    textDocument,
+    position: textDocument.positionAt(pos),
+  });
+}
+
+it("go to local import", async () => {
+  const locations = await goToDefinitionAtCursor(
+    `
+    import "./othe┆r.tsp";
+  `,
+    { "other.tsp": "model Other {}" },
+  );
+  expect(locations).toEqual([
+    {
+      range: {
+        end: { character: 0, line: 0 },
+        start: { character: 0, line: 0 },
+      },
+      uri: resolveVirtualPathUri("other.tsp"),
+    },
+  ]);
+});
+
+it("go to directory import", async () => {
+  const locations = await goToDefinitionAtCursor(
+    `
+    import "./┆models";
+  `,
+    {
+      "models/main.tsp": "model MyModel {}",
+    },
+  );
+  expect(locations).toEqual([
+    {
+      range: {
+        end: { character: 0, line: 0 },
+        start: { character: 0, line: 0 },
+      },
+      uri: resolveVirtualPathUri("models/main.tsp"),
+    },
+  ]);
+});
+
+it("go to library import", async () => {
+  const locations = await goToDefinitionAtCursor(
+    `
+    import "┆test-lib";
+  `,
+    {
+      "node_modules/test-lib/package.json": JSON.stringify({
+        name: "test-lib",
+        tspMain: "./main.tsp",
+      }),
+      "node_modules/test-lib/main.tsp": "model Other {}",
+    },
+  );
+  expect(locations).toEqual([
+    {
+      range: {
+        end: { character: 0, line: 0 },
+        start: { character: 0, line: 0 },
+      },
+      uri: resolveVirtualPathUri("node_modules/test-lib/main.tsp"),
+    },
+  ]);
+});
+
+it("go to library import with export condition", async () => {
+  const locations = await goToDefinitionAtCursor(
+    `
+    import "┆test-lib";
+  `,
+    {
+      "node_modules/test-lib/package.json": JSON.stringify({
+        name: "test-lib",
+        exports: {
+          ".": {
+            typespec: "./entrypoint.tsp",
+          },
+        },
+      }),
+      "node_modules/test-lib/entrypoint.tsp": "model Other {}",
+    },
+  );
+  expect(locations).toEqual([
+    {
+      range: {
+        end: { character: 0, line: 0 },
+        start: { character: 0, line: 0 },
+      },
+      uri: resolveVirtualPathUri("node_modules/test-lib/entrypoint.tsp"),
+    },
+  ]);
+});

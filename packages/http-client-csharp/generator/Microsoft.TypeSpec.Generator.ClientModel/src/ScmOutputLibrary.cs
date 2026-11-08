@@ -1,0 +1,140 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.TypeSpec.Generator.ClientModel.Providers;
+using Microsoft.TypeSpec.Generator.Input;
+using Microsoft.TypeSpec.Generator.Primitives;
+using Microsoft.TypeSpec.Generator.Providers;
+
+namespace Microsoft.TypeSpec.Generator.ClientModel
+{
+    public class ScmOutputLibrary : OutputLibrary
+    {
+        private static TypeProvider[] BuildClientTypes()
+        {
+            var inputClients = ScmCodeModelGenerator.Instance.InputLibrary.InputNamespace.RootClients;
+            var types = new HashSet<TypeProvider>();
+
+            foreach (var inputClient in inputClients)
+            {
+                CreateClientProviders(inputClient);
+            }
+
+            foreach (var inputClient in inputClients)
+            {
+                BuildClient(inputClient, types);
+            }
+
+            return [.. types];
+        }
+
+        private static void CreateClientProviders(InputClient inputClient)
+        {
+            foreach (var child in inputClient.Children)
+            {
+                CreateClientProviders(child);
+            }
+
+            ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+        }
+
+        private static void BuildClient(InputClient inputClient, HashSet<TypeProvider> types)
+        {
+            foreach (var child in inputClient.Children)
+            {
+                BuildClient(child, types);
+            }
+
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+            if (client == null)
+            {
+                return;
+            }
+            types.Add(client);
+            types.Add(client.RestClient);
+            var clientOptions = client.ClientOptions;
+            if (clientOptions != null)
+            {
+                types.Add(clientOptions);
+            }
+
+            // Emit the Settings class for any publicly constructible client (root or individually-initialized sub-client).
+            var clientSettings = client.ClientSettings;
+            if (clientSettings != null && client.DeclarationModifiers.HasFlag(TypeSignatureModifiers.Public))
+            {
+                types.Add(clientSettings);
+            }
+
+            // We use the spec view methods so that we include collection definitions even if the user is customizing or suppressing
+            // the methods. They will still be filtered out by the post processor if not needed.
+            foreach (var method in client.SpecView.Methods)
+            {
+                if (method is ScmMethodProvider scmMethod && scmMethod.CollectionDefinition != null)
+                {
+                    types.Add(scmMethod.CollectionDefinition);
+                }
+            }
+        }
+
+        protected override TypeProvider[] BuildTypeProviders()
+        {
+            var baseTypes = base.BuildTypeProviders();
+
+            for (var i = 0; i < baseTypes.Length; i++)
+            {
+                if (baseTypes[i] is OptionalDefinition)
+                {
+                    baseTypes[i] = ScmCodeModelGenerator.Instance.SystemOptionalDefinition;
+                }
+            }
+
+            return [
+                ..baseTypes,
+                ..BuildClientTypes(),
+                ScmCodeModelGenerator.Instance.ModelSerializationExtensionsDefinition,
+                ScmCodeModelGenerator.Instance.SerializationFormatDefinition,
+                ScmCodeModelGenerator.Instance.TypeFormattersDefinition,
+                new ErrorResultDefinition(),
+                new ClientUriBuilderDefinition(),
+                new Utf8JsonBinaryContentDefinition(),
+                .. GetJsonLinesTypes(),
+                new BinaryContentHelperDefinition(),
+                ScmCodeModelGenerator.Instance.ClientPipelineExtensionsDefinition,
+                new CancellationTokenExtensionsDefinition(),
+                ScmCodeModelGenerator.Instance.PipelineRequestHeadersExtensionsDefinition,
+                .. GetMultipartFormDataTypes(),
+                new ModelReaderWriterContextDefinition()
+            ];
+        }
+
+        private static IEnumerable<TypeProvider> GetJsonLinesTypes()
+        {
+            var hasJsonLinesRequestOperation = ScmCodeModelGenerator.Instance.InputLibrary.InputNamespace.Clients
+                .SelectMany(client => client.Methods)
+                .Any(method => method.Parameters.Any(parameter =>
+                    parameter.Type is InputStreamingType
+                    {
+                        StreamKind: InputStreamingType.JsonLinesStreamKind
+                    }));
+
+            if (hasJsonLinesRequestOperation)
+            {
+                yield return new JsonLinesBinaryContentDefinition();
+            }
+        }
+
+        private IEnumerable<TypeProvider> GetMultipartFormDataTypes()
+        {
+            if (ScmCodeModelGenerator.Instance.InputLibrary.HasMultipartFormDataOperation)
+            {
+                var multipart = new MultiPartFormDataBinaryContentDefinition();
+                ScmCodeModelGenerator.Instance.AddTypeToKeep(multipart.Name);
+
+                yield return multipart;
+                yield return new MultipartFormDataHelperDefinition();
+            }
+        }
+    }
+}

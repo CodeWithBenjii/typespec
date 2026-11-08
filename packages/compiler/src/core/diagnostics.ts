@@ -1,0 +1,399 @@
+import { createDiagnostic } from "./messages.js";
+import type { Program } from "./program.js";
+import { createSourceFile } from "./source-file.js";
+import type {
+  CodeFix,
+  Diagnostic,
+  DiagnosticResult,
+  DiagnosticTarget,
+  LogSink,
+  Node,
+  RelatedSourceLocation,
+  SourceLocation,
+  Type,
+  TypeSpecDiagnosticTarget,
+  Value,
+} from "./types.js";
+import { NodeFlags, NoTarget, SymbolFlags, SyntaxKind } from "./types.js";
+
+/** Output callback accepting one line of text, or no text for an empty line. */
+export type WriteLine = (text?: string) => void;
+/** Callback receiving a diagnostic for collection, reporting, or other caller-defined handling. */
+export type DiagnosticHandler = (diagnostic: Diagnostic) => void;
+
+/** Write diagnostics to a log sink, resolving identifier locations and template-instantiation traces. */
+export function logDiagnostics(diagnostics: readonly Diagnostic[], logger: LogSink) {
+  for (const diagnostic of diagnostics) {
+    logger.log({
+      level: diagnostic.severity,
+      message: diagnostic.message,
+      code: diagnostic.code,
+      url: diagnostic.url,
+      sourceLocation: getSourceLocation(diagnostic.target, { locateId: true }),
+      related: getRelatedLocations(diagnostic),
+    });
+  }
+}
+
+/** @internal */
+export function getRelatedLocations(diagnostic: Diagnostic): RelatedSourceLocation[] {
+  return getDiagnosticTemplateInstantitationTrace(diagnostic.target).map((x) => {
+    return {
+      message: "occurred while instantiating template",
+      location: getSourceLocation(x),
+    };
+  });
+}
+
+/**
+ * Find the syntax node for a TypeSpec diagnostic target.
+ *
+ * This function extracts the AST node from various types of diagnostic targets:
+ * - For template instance targets: returns the node of the template declaration
+ * - For symbols: returns the first declaration node (or symbol source for using symbols)
+ * - For AST nodes: returns the node itself
+ * - For entities: returns the most relevant node associated with the entity
+ *
+ * @param target The diagnostic target to extract a node from. Can be a template instance,
+ *               symbol, AST node, or type.
+ * @returns The AST node associated with the target, or undefined if the target
+ *          doesn't have an associated node.
+ */
+export function getNodeForTarget(target: TypeSpecDiagnosticTarget): Node | undefined {
+  if (!("kind" in target) && !("entityKind" in target)) {
+    // TemplateInstanceTarget
+    if (!("declarations" in target)) {
+      return target.node;
+    }
+
+    // symbol
+    if (target.flags & SymbolFlags.Using) {
+      target = target.symbolSource!;
+    }
+
+    return target.declarations[0];
+  } else if ("entityKind" in target) {
+    switch (target.entityKind) {
+      case "Type":
+        return target.node;
+      case "Value":
+        return getValueNode(target) ?? target.type.node;
+      case "MixedParameterConstraint":
+        // Prefer the explicit union expression node when present, otherwise fall back
+        // to a side of the constraint that has a source node. Type is preferred
+        // over valueType to keep location behavior stable for mixed constraints
+        // that include both branches.
+        return target.node ?? target.type?.node ?? target.valueType?.node;
+      case "Indeterminate":
+        return target.type.node;
+      default:
+        return undefined;
+    }
+  } else if ("kind" in target && typeof target.kind === "number") {
+    // node
+    return target as Node;
+  } else {
+    // type
+    return (target as Type).node;
+  }
+}
+
+function getValueNode(value: Value): Node | undefined {
+  // Only compound values and function values carry their own syntax node.
+  // Primitive values (string/number/boolean/null/enum/scalar literal values)
+  // are represented by their resolved value/type and don't retain a direct node.
+  switch (value.valueKind) {
+    case "ObjectValue":
+    case "ArrayValue":
+    case "Function":
+      return value.node;
+    default:
+      return undefined;
+  }
+}
+
+/** Control which part of a diagnostic target is used as its source range. */
+export interface SourceLocationOptions {
+  /**
+   * If trying to resolve the location of a type with an ID, show the location of the ID node instead of the entire type.
+   * For type references, show the reference target without template arguments.
+   * This makes sure that the location range is not too large and hard to read.
+   */
+  locateId?: boolean;
+}
+/** Resolve a diagnostic target's source range, using a synthetic location when no bound source exists. */
+export function getSourceLocation(
+  target: DiagnosticTarget,
+  options?: SourceLocationOptions,
+): SourceLocation;
+/** Return no location for an absent target or the explicit {@link NoTarget} sentinel. */
+export function getSourceLocation(
+  target: typeof NoTarget | undefined,
+  options?: SourceLocationOptions,
+): undefined;
+/** Resolve an optional diagnostic target, returning undefined only when there is no target. */
+export function getSourceLocation(
+  target: DiagnosticTarget | typeof NoTarget | undefined,
+  options?: SourceLocationOptions,
+): SourceLocation | undefined;
+export function getSourceLocation(
+  target: DiagnosticTarget | typeof NoTarget | undefined,
+  options: SourceLocationOptions = {},
+): SourceLocation | undefined {
+  if (target === NoTarget || target === undefined) {
+    return undefined;
+  }
+
+  if ("file" in target) {
+    return target;
+  }
+
+  const node = getNodeForTarget(target);
+  return node ? getSourceLocationOfNode(node, options) : createSyntheticSourceLocation();
+}
+
+/**
+ * @internal
+ */
+export function getDiagnosticTemplateInstantitationTrace(
+  target: DiagnosticTarget | typeof NoTarget | undefined,
+): Node[] {
+  if (typeof target !== "object" || !("templateMapper" in target)) {
+    return [];
+  }
+
+  const result = [];
+  let current = target.templateMapper;
+  while (current) {
+    result.push(current.source.node);
+    current = current.source.mapper;
+  }
+  return result;
+}
+
+function createSyntheticSourceLocation(loc = "<unknown location>") {
+  return {
+    file: createSourceFile("", loc),
+    pos: 0,
+    end: 0,
+    isSynthetic: true,
+  };
+}
+
+function getSourceLocationOfNode(node: Node, options: SourceLocationOptions): SourceLocation {
+  let root = node;
+
+  while (root.parent !== undefined) {
+    root = root.parent;
+  }
+
+  if (root.kind !== SyntaxKind.TypeSpecScript && root.kind !== SyntaxKind.JsSourceFile) {
+    return createSyntheticSourceLocation(
+      node.flags & NodeFlags.Synthetic
+        ? undefined
+        : "<unknown location - cannot obtain source location of unbound node - file bug at https://github.com/microsoft/typespec>",
+    );
+  }
+
+  if (options.locateId) {
+    if (node.kind === SyntaxKind.TypeReference) {
+      node = node.target;
+    } else if ("id" in node && node.id !== undefined) {
+      node = node.id;
+    }
+  }
+
+  return {
+    file: root.file,
+    pos: node.pos,
+    end: node.end,
+  };
+}
+
+/**
+ * Verbose output is enabled by default for runs in mocha explorer in VS Code,
+ * where the output is nicely associated with the individual test, and disabled
+ * by default for command line runs where we don't want to spam the console.
+ *
+ * If the steps taken to produce the message are expensive, pass a callback
+ * instead of producing the message then passing it here only to be dropped
+ * when verbose output is disabled.
+ */
+export function logVerboseTestOutput(
+  messageOrCallback: string | ((log: (message: string) => void) => void),
+) {
+  if (process.env.TYPESPEC_VERBOSE_TEST_OUTPUT) {
+    if (typeof messageOrCallback === "string") {
+      // eslint-disable-next-line no-console
+      console.log(messageOrCallback);
+    } else {
+      // eslint-disable-next-line no-console
+      messageOrCallback(console.log);
+    }
+  }
+}
+
+/**
+ * Use this to report bugs in the compiler, and not errors in the source code
+ * being compiled.
+ *
+ * @param condition Throw if this is not true.
+ *
+ * @param message Error message.
+ *
+ * @param target Optional location in source code that might give a clue about
+ *               what got the compiler off track.
+ */
+export function compilerAssert(
+  condition: any,
+  message: string,
+  target?: DiagnosticTarget,
+): asserts condition {
+  if (condition) {
+    return;
+  }
+
+  if (target) {
+    let location: SourceLocation | undefined;
+    try {
+      location = getSourceLocation(target);
+    } catch (err: any) {}
+
+    if (location) {
+      const pos = location.file.getLineAndCharacterOfPosition(location.pos);
+      const file = location.file.path;
+      const line = pos.line + 1;
+      const col = pos.character + 1;
+      message += `\nOccurred while compiling code in ${file} near line ${line}, column ${col}`;
+    }
+  }
+
+  throw new Error(message);
+}
+
+/**
+ * Assert that the input type has one of the kinds provided
+ */
+export function assertType<TKind extends Type["kind"][]>(
+  typeDescription: string,
+  t: Type,
+  ...kinds: TKind
+): asserts t is Type & { kind: TKind[number] } {
+  if (kinds.indexOf(t.kind) === -1) {
+    throw new Error(`Expected ${typeDescription} to be type ${kinds.join(", ")}`);
+  }
+}
+
+/**
+ * Report a deprecated diagnostic.
+ * @param program TypeSpec Program.
+ * @param message Message describing the deprecation.
+ * @param target Target of the deprecation.
+ * @param reportFunc Optional custom report function.
+ */
+export function reportDeprecated(
+  program: Program,
+  message: string,
+  target: DiagnosticTarget | typeof NoTarget,
+  reportFunc?: (diagnostic: Diagnostic) => void,
+): void {
+  if (program.compilerOptions.ignoreDeprecated !== true) {
+    const report = reportFunc ?? program.reportDiagnostic.bind(program);
+    report(
+      createDiagnostic({
+        code: "deprecated",
+        format: {
+          message,
+        },
+        target,
+      }),
+    );
+  }
+}
+
+/**
+ * Helper object to collect diagnostics from function following the diagnostics accessor pattern(foo() => [T, Diagnostic[]])
+ */
+export interface DiagnosticCollector {
+  /** Collected diagnostics in insertion order; this view grows as results are piped or added. */
+  readonly diagnostics: readonly Diagnostic[];
+
+  /**
+   * Add a diagnostic to the collection
+   * @param diagnostic Diagnostic to add.
+   */
+  add(diagnostic: Diagnostic): void;
+
+  /**
+   * Unwrap the Diagnostic result, add all the diagnostics and return the data.
+   * @param result Accessor diagnostic result
+   */
+  pipe<T>(result: DiagnosticResult<T>): T;
+
+  /**
+   * Wrap the given value in a tuple including the diagnostics following the TypeSpec accessor pattern.
+   * @param value Accessor value to return
+   * @example return diagnostics.wrap(routes);
+   */
+  wrap<T>(value: T): DiagnosticResult<T>;
+
+  /**
+   * Join the given result with the diagnostics in this collector.
+   * @param result - result to join with the diagnostics
+   * @returns - the result with the combined diagnostics
+   */
+  join<T>(result: DiagnosticResult<T>): DiagnosticResult<T>;
+}
+
+/**
+ * Create a new instance of the @see DiagnosticCollector.
+ */
+export function createDiagnosticCollector(): DiagnosticCollector {
+  const diagnostics: Diagnostic[] = [];
+
+  return {
+    diagnostics,
+    add,
+    pipe,
+    wrap,
+    join,
+  };
+
+  function add(diagnostic: Diagnostic) {
+    diagnostics.push(diagnostic);
+  }
+
+  function pipe<T>(result: DiagnosticResult<T>): T {
+    const [value, diags] = result;
+    for (const diag of diags) {
+      diagnostics.push(diag);
+    }
+    return value;
+  }
+
+  function wrap<T>(value: T): DiagnosticResult<T> {
+    return [value, diagnostics];
+  }
+
+  function join<T>(result: DiagnosticResult<T>): DiagnosticResult<T> {
+    const [value, diags] = result;
+    for (const diag of diags) {
+      diagnostics.push(diag);
+    }
+    return [value, diagnostics];
+  }
+}
+
+/**
+ * Ignore the diagnostics emitted by the diagnostic accessor pattern and just return the actual result.
+ * @param result Accessor pattern tuple result including the actual result and the list of diagnostics.
+ * @returns Actual result.
+ */
+export function ignoreDiagnostics<T>(result: DiagnosticResult<T>): T {
+  return result[0];
+}
+
+/** Type-check a code-fix definition and return it unchanged; this does not apply the fix. */
+export function defineCodeFix(fix: CodeFix): CodeFix {
+  return fix;
+}

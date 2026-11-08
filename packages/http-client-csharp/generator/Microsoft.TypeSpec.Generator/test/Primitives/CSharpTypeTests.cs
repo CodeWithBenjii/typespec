@@ -1,0 +1,791 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Linq;
+using System.Text;
+using Microsoft.TypeSpec.Generator.Primitives;
+using NUnit.Framework;
+
+namespace Microsoft.TypeSpec.Generator.Tests.Primitives
+{
+    internal class CSharpTypeTests
+    {
+        public CSharpTypeTests()
+        {
+            MockHelpers.LoadMockGenerator();
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(IList<>))]
+        [TestCase(typeof(IList<int>))]
+        [TestCase(typeof(IDictionary<,>))]
+        [TestCase(typeof(IDictionary<int, int>))]
+        [TestCase(typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>))]
+        public void TypesAreEqual(Type type)
+        {
+            var cst1 = new CSharpType(type);
+            var cst2 = new CSharpType(type);
+            Assert.IsTrue(cst1.Equals(cst2));
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(IList<>))]
+        [TestCase(typeof(IList<int>))]
+        [TestCase(typeof(IDictionary<,>))]
+        [TestCase(typeof(IDictionary<int, int>))]
+        [TestCase(typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>))]
+        public void FullyQualifiedNamePopulatedForFrameworkTypes(Type type)
+        {
+            var expectedName = type.IsGenericType ? type.Name.Substring(0, type.Name.IndexOf('`')) : type.Name;
+            Assert.AreEqual($"{type.Namespace}.{expectedName}", new CSharpType(type).FullyQualifiedName);
+        }
+
+        [Test]
+        public void FullyQualifiedNamePopulatedForTypeProviders()
+        {
+            var provider = new TestTypeProvider();
+            Assert.AreEqual("Test.TestName", provider.Type.FullyQualifiedName);
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(string))]
+        [TestCase(typeof(int[]))]
+        [TestCase(typeof(string[]))]
+        [TestCase(typeof(IDictionary<int, string>))]
+        [TestCase(typeof(int?))]
+        public void NonFrameworkTypeEqualsEquivalentFrameworkType(Type type)
+        {
+            var cSharpType = new CSharpType(
+                type.Name,
+                type.Namespace!,
+                type.IsValueType,
+                Nullable.GetUnderlyingType(type) != null,
+                null,
+                type.GetGenericArguments().Select(t => new CSharpType(t)).ToList(),
+                true,
+                type.IsValueType);
+            Assert.IsTrue(cSharpType.Equals(type));
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(IList<>))]
+        [TestCase(typeof(IList<int>))]
+        [TestCase(typeof(IDictionary<,>))]
+        [TestCase(typeof(IDictionary<int, int>))]
+        [TestCase(typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>))]
+        public void EqualToFrameworkType(Type type)
+        {
+            var cst = new CSharpType(type);
+            Assert.IsTrue(cst.Equals(type));
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(IList<>))]
+        [TestCase(typeof(IList<int>))]
+        [TestCase(typeof(IDictionary<,>))]
+        [TestCase(typeof(IDictionary<int, int>))]
+        [TestCase(typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>))]
+        public void HashCodesAreEqual(Type type)
+        {
+            var cst1 = new CSharpType(type);
+            var cst2 = new CSharpType(type);
+            Assert.AreEqual(cst1.GetHashCode(), cst2.GetHashCode());
+        }
+
+        [Test]
+        public void TypesWithDifferentDeclaringTypesAreNotEqual()
+        {
+            var declaringType1 = new CSharpType(
+                "type1",
+                "namespace1",
+                false,
+                false,
+                null,
+                [],
+                true,
+                false);
+            var declaringType2 = new CSharpType(
+                "type2",
+                "namespace1",
+                false,
+                false,
+                null,
+                [],
+                true,
+                false);
+
+            var nested1 = new CSharpType(
+                "nested",
+                "ns",
+                false,
+                false,
+                declaringType1,
+                [],
+                true,
+                false);
+            var nested2 = new CSharpType(
+                "nested",
+                "ns",
+                false,
+                false,
+                declaringType2,
+                [],
+                true,
+                false);
+
+            Assert.IsFalse(nested1.Equals(nested2));
+        }
+
+        [Test]
+        public void FullyQualifiedName()
+        {
+            var declaringType1 = new CSharpType(
+                "type1",
+                "namespace1",
+                false,
+                false,
+                null,
+                [],
+                true,
+                false);
+            var declaringType2 = new CSharpType(
+                "type2",
+                "namespace2",
+                false,
+                false,
+                null,
+                [],
+                true,
+                false);
+
+            var nested1Name = declaringType1.FullyQualifiedName;
+            Assert.AreEqual($"namespace1.{declaringType1.Name}", nested1Name);
+
+            var nested2Name = declaringType2.FullyQualifiedName;
+            Assert.AreEqual($"namespace2.{declaringType2.Name}", nested2Name);
+        }
+
+        [Test]
+        public void FullyQualifiedName_NestedTypes()
+        {
+            var declaringType1 = new CSharpType(
+                "type1",
+                "namespace1",
+                false,
+                false,
+                null,
+                [],
+                true,
+                false);
+            var declaringType2 = new CSharpType(
+                "type2",
+                "namespace2",
+                false,
+                false,
+                null,
+                [],
+                true,
+                false);
+
+            var nested1 = new CSharpType(
+                "nested",
+                declaringType1.Namespace,
+                false,
+                false,
+                declaringType1,
+                [],
+                true,
+                false);
+            var nested2 = new CSharpType(
+                "nested",
+                declaringType2.Namespace,
+                false,
+                false,
+                declaringType2,
+                [],
+                true,
+                false);
+
+            var nested1Name = nested1.FullyQualifiedName;
+            Assert.AreEqual($"{nested1.Namespace}.{declaringType1.Name}.{nested1.Name}", nested1Name);
+
+            var nested2Name = nested2.FullyQualifiedName;
+            Assert.AreEqual($"{nested2.Namespace}.{declaringType2.Name}.{nested2.Name}", nested2Name);
+        }
+
+        [TestCase(typeof(IList<>), new[] { typeof(int) })]
+        [TestCase(typeof(IList<>), new[] { typeof(TestDerivedType) })]
+        [TestCase(typeof(IList<>), new[] { typeof(TestBaseType) })]
+        [TestCase(typeof(IReadOnlyList<>), new[] { typeof(string) })]
+        [TestCase(typeof(IDictionary<,>), new[] { typeof(string), typeof(string) })]
+        [TestCase(typeof(IReadOnlyDictionary<,>), new[] { typeof(string), typeof(int) })]
+        [TestCase(typeof(IDictionary<,>), new[] { typeof(string), typeof(IDictionary<string, int>) })]
+        public void TypesAreEqualForGenericTypes(Type type, Type[] arguments)
+        {
+            var cstArguments = arguments.Select(t => (CSharpType)t);
+            // pass the arguments in as an array
+            var cst1 = new CSharpType(type, cstArguments.ToArray());
+            // pass the arguments in as an `List<CSharpType>`
+            var cst2 = new CSharpType(type, cstArguments.ToList());
+            // pass the arguments in as an `ImmutableArray`
+            var cst3 = new CSharpType(type, cstArguments.ToImmutableArray());
+            // pass the arguments in as an `ImmutableList`
+            var cst4 = new CSharpType(type, cstArguments.ToImmutableList());
+
+            Assert.IsTrue(cst1.Equals(cst2));
+            Assert.IsTrue(cst2.Equals(cst3));
+            Assert.IsTrue(cst3.Equals(cst4));
+
+            Assert.AreEqual(cst1.GetHashCode(), cst2.GetHashCode());
+            Assert.AreEqual(cst2.GetHashCode(), cst3.GetHashCode());
+            Assert.AreEqual(cst3.GetHashCode(), cst4.GetHashCode());
+        }
+
+        [TestCase(typeof(int), typeof(string))]
+        [TestCase(typeof(int), typeof(IList<>))]
+        [TestCase(typeof(IList<>), typeof(int))]
+        [TestCase(typeof(int), typeof(IList<int>))]
+        [TestCase(typeof(IList<int>), typeof(int))]
+        [TestCase(typeof(IList<int>), typeof(IList<>))]
+        [TestCase(typeof(IList<>), typeof(IList<int>))]
+        [TestCase(typeof(IList<int>), typeof(IList<string>))]
+        [TestCase(typeof(IList<int>), typeof(ICollection<int>))]
+        [TestCase(typeof(Tuple<>), typeof(Tuple<,>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(Dictionary<,>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(Dictionary<int, int>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(Dictionary<int, string>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>), typeof(IDictionary<IDictionary<string, int>, IDictionary<string, int>>))]
+        public void TypesAreNotEqual(Type type1, Type type2)
+        {
+            var cst1 = new CSharpType(type1);
+            var cst2 = new CSharpType(type2);
+            Assert.IsFalse(cst1.Equals(cst2));
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(int))]
+        [TestCase(typeof(IList<>))]
+        [TestCase(typeof(IList<int>))]
+        [TestCase(typeof(IList<int?>))]
+        [TestCase(typeof(IList<string>))]
+        [TestCase(typeof(IDictionary<int, string>))]
+        [TestCase(typeof(IDictionary<string, string>))]
+        [TestCase(typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<string, int?>))]
+        [TestCase(typeof(IDictionary<int?, string>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>))]
+        public void TypesAreNotEqualWhenNullabilityIsDifferent(Type type)
+        {
+            var cst = new CSharpType(type);
+            var nullableCst = new CSharpType(type, isNullable: true);
+
+            Assert.IsFalse(cst.Equals(nullableCst));
+            Assert.AreNotEqual(cst.GetHashCode(), nullableCst.GetHashCode());
+        }
+
+        [TestCase(typeof(int), typeof(string))]
+        [TestCase(typeof(int), typeof(IList<>))]
+        [TestCase(typeof(IList<>), typeof(int))]
+        [TestCase(typeof(int), typeof(IList<int>))]
+        [TestCase(typeof(IList<int>), typeof(int))]
+        [TestCase(typeof(IList<int>), typeof(IList<>))]
+        [TestCase(typeof(IList<>), typeof(IList<int>))]
+        [TestCase(typeof(IList<int>), typeof(IList<string>))]
+        [TestCase(typeof(IList<int>), typeof(ICollection<int>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(Dictionary<int, string>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>), typeof(IDictionary<IDictionary<string, int>, IDictionary<string, int>>))]
+        public void NotEqualToFrameworkType(Type type1, Type type2)
+        {
+            var cst = new CSharpType(type1);
+            Assert.IsFalse(cst.Equals(type2));
+        }
+
+        [TestCase(typeof(int), typeof(string))]
+        [TestCase(typeof(int), typeof(IList<>))]
+        [TestCase(typeof(IList<>), typeof(int))]
+        [TestCase(typeof(int), typeof(IList<int>))]
+        [TestCase(typeof(IList<int>), typeof(int))]
+        [TestCase(typeof(IList<int>), typeof(IList<>))]
+        [TestCase(typeof(IList<>), typeof(IList<int>))]
+        [TestCase(typeof(IList<int>), typeof(IList<string>))]
+        [TestCase(typeof(IList<int>), typeof(ICollection<int>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(Dictionary<int, string>))]
+        [TestCase(typeof(IDictionary<int, string>), typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>), typeof(IDictionary<IDictionary<string, int>, IDictionary<string, int>>))]
+        public void HashCodesAreNotEqual(Type type1, Type type2)
+        {
+            var cst1 = new CSharpType(type1);
+            var cst2 = new CSharpType(type2);
+            Assert.AreNotEqual(cst1.GetHashCode(), cst2.GetHashCode());
+        }
+
+        [TestCase(typeof(IDictionary<int, string>), typeof(IDictionary<,>), false)]
+        [TestCase(typeof(IDictionary<int, IList<string>>), typeof(IDictionary<,>), false)]
+        [TestCase(typeof(KeyValuePair<int, string>), typeof(KeyValuePair<,>), false)]
+        [TestCase(typeof(KeyValuePair<int, string>), typeof(KeyValuePair<,>), true)]
+        public void GetGenericTypeDefinition(Type input, Type expected, bool isNullable)
+        {
+            var actual = new CSharpType(input, isNullable).GetGenericTypeDefinition();
+            Assert.AreEqual(new CSharpType(expected, isNullable), actual);
+            CollectionAssert.AreEqual(actual.Arguments, input.GetGenericTypeDefinition().GetGenericArguments().Select(p => new CSharpType(p)));
+        }
+
+        [TestCase]
+        public void GetGenericTypeDefinitionForConstructedType()
+        {
+            var actual = new CSharpType(typeof(List<>), arguments: typeof(string)).GetGenericTypeDefinition();
+            Assert.AreEqual(new CSharpType(typeof(List<>)), actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(ReadOnlyMemory<>), true)]
+        public void IsReadOnlyMemory(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsReadOnlyMemory;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(IEnumerable<>), true)]
+        [TestCase(typeof(IReadOnlyList<>), true)]
+        [TestCase(typeof(IReadOnlyCollection<>), false)]
+        [TestCase(typeof(IList<>), false)]
+        public void IsReadOnlyList(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsReadOnlyList;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(IEnumerable<>), false)]
+        [TestCase(typeof(IReadOnlyList<>), false)]
+        [TestCase(typeof(IReadOnlyCollection<>), false)]
+        [TestCase(typeof(IList<>), true)]
+        [TestCase(typeof(List<>), true)]
+        [TestCase(typeof(ICollection<>), true)]
+        public void IsReadWriteList(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsReadWriteList;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(IDictionary<,>), false)]
+        [TestCase(typeof(ReadOnlyMemory<>), true)]
+        [TestCase(typeof(IEnumerable<>), true)]
+        [TestCase(typeof(IReadOnlyList<>), true)]
+        [TestCase(typeof(IReadOnlyCollection<>), false)]
+        [TestCase(typeof(IList<>), true)]
+        [TestCase(typeof(List<>), true)]
+        [TestCase(typeof(ICollection<>), true)]
+        public void IsList(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsList;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(string[]), true)]
+        [TestCase(typeof(int[]), true)]
+        [TestCase(typeof(ReadOnlyMemory<>), false)]
+        [TestCase(typeof(List<>), false)]
+        public void IsArray(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsArray;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(1)]
+        [TestCase(2)]
+        public void SymbolBackedArrayPreservesStructure(int rank)
+        {
+            var element = new CSharpType("ExternalValue", "Sample", false, false, null, [], true, false);
+            var array = element.MakeArrayType(rank);
+            Assert.That(array.IsArray, Is.True);
+            Assert.That(array.IsFrameworkType, Is.False);
+            Assert.That(array.ArrayRank, Is.EqualTo(rank));
+            Assert.That(array.ElementType, Is.SameAs(element));
+            Assert.That(array.Arguments, Is.Empty);
+            Assert.That(array.ToString(), Is.EqualTo("global::Sample.ExternalValue[" + new string(',', rank - 1) + "]"));
+
+            var nullable = array.WithNullable(true);
+            Assert.That(nullable.IsArray, Is.True);
+            Assert.That(nullable.ArrayRank, Is.EqualTo(rank));
+            Assert.That(nullable.ElementType, Is.SameAs(element));
+            Assert.That(nullable.WithNullable(false).Equals(array), Is.True);
+            Assert.That(nullable.WithNullable(false).GetHashCode(), Is.EqualTo(array.GetHashCode()));
+        }
+
+        [Test]
+        public void SymbolBackedGenericArrayIncludesElementArguments()
+        {
+            var valueType = new CSharpType("ExternalValue", "Sample", false, false, null, [], true, false);
+            var element = new CSharpType(typeof(List<>), valueType);
+            var array = element.MakeArrayType();
+            var same = element.MakeArrayType();
+            var different = new CSharpType(typeof(List<string>)).MakeArrayType();
+            Assert.That(array.Equals(same), Is.True);
+            Assert.That(array.GetHashCode(), Is.EqualTo(same.GetHashCode()));
+            Assert.That(array.Equals(different), Is.False);
+            Assert.That(array.AreNamesEqual(different), Is.False);
+            Assert.That(array.ToString(), Is.EqualTo("global::System.Collections.Generic.List<global::Sample.ExternalValue>[]"));
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(int?))]
+        [TestCase(typeof(int[]))]
+        public void FrameworkArrayRetainsRuntimeType(Type elementType)
+        {
+            var array = new CSharpType(elementType).MakeArrayType();
+            Assert.That(array.IsFrameworkType, Is.True);
+            Assert.That(array.FrameworkType, Is.EqualTo(elementType.MakeArrayType()));
+            Assert.That(array.ElementType.Equals(new CSharpType(elementType)), Is.True);
+        }
+
+        [TestCase(typeof(List<int>[]), "global::System.Collections.Generic.List<int>[]")]
+        [TestCase(typeof(int?[]), "int?[]")]
+        [TestCase(typeof(int?[][]), "int?[][]")]
+        public void ArrayRendersConstructedElementType(Type type, string expected)
+        {
+            Assert.That(new CSharpType(type).ToString(), Is.EqualTo(expected));
+        }
+
+        [TestCase(typeof(int[]), typeof(int?[]), false)]
+        [TestCase(typeof(int?[]), typeof(int[]), false)]
+        [TestCase(typeof(int[][]), typeof(int?[][]), false)]
+        [TestCase(typeof(List<int>[]), typeof(List<int?>[]), false)]
+        [TestCase(typeof(List<int[]>), typeof(List<int?[]>), false)]
+        [TestCase(typeof(int[][,]), typeof(int[,][]), false)]
+        [TestCase(typeof(int?[]), typeof(int?[]), true)]
+        [TestCase(typeof(List<int?>[]), typeof(List<int?>[]), true)]
+        public void ArrayNamesDistinguishNullableValueElements(Type left, Type right, bool expected)
+        {
+            Assert.That(new CSharpType(left).AreNamesEqual(new CSharpType(right)), Is.EqualTo(expected));
+        }
+
+        [TestCase(0)]
+        [TestCase(-1)]
+        public void ArrayRejectsInvalidRank(int rank)
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() => new CSharpType(typeof(int)).MakeArrayType(rank));
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(IDictionary<string, string>), false)]
+        [TestCase(typeof(ReadOnlyMemory<>), false)]
+        [TestCase(typeof(IReadOnlyDictionary<,>), true)]
+        public void IsReadOnlyDictionary(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsReadOnlyDictionary;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(IDictionary<string, string>), true)]
+        [TestCase(typeof(ReadOnlyMemory<>), false)]
+        [TestCase(typeof(IReadOnlyDictionary<,>), false)]
+        public void IsReadWriteDictionary(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsReadWriteDictionary;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(IDictionary<,>), true)]
+        [TestCase(typeof(ReadOnlyMemory<>), false)]
+        [TestCase(typeof(IReadOnlyDictionary<,>), true)]
+        [TestCase(typeof(List<>), false)]
+        public void IsDictionary(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsDictionary;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(int), false)]
+        [TestCase(typeof(string[]), false)]
+        [TestCase(typeof(int[]), false)]
+        [TestCase(typeof(IReadOnlyCollection<>), false)]
+        [TestCase(typeof(IDictionary<string, string>), true)]
+        [TestCase(typeof(IReadOnlyDictionary<,>), true)]
+        [TestCase(typeof(ReadOnlyMemory<>), true)]
+        [TestCase(typeof(IEnumerable<>), true)]
+        [TestCase(typeof(IReadOnlyList<>), true)]
+        [TestCase(typeof(IList<>), true)]
+        [TestCase(typeof(List<>), true)]
+        [TestCase(typeof(ICollection<>), true)]
+        public void IsCollectionType(Type type, bool expected)
+        {
+            var actual = new CSharpType(type).IsCollection;
+            Assert.AreEqual(expected, actual);
+        }
+
+        [Test]
+        public void PropertyInitializationType_ReadOnlyMemory()
+        {
+            var arguments = typeof(int);
+            var cSharpType = new CSharpType(typeof(ReadOnlyMemory<>), arguments: arguments);
+            var actual = cSharpType.PropertyInitializationType;
+            var expected = new CSharpType(typeof(ReadOnlyMemory<>), arguments: arguments);
+
+            var areEqual = actual.Equals(expected);
+
+            Assert.IsTrue(areEqual);
+        }
+
+        [TestCase(typeof(IList<>))]
+        [TestCase(typeof(IReadOnlyList<>))]
+        [TestCase(typeof(IEnumerable<>))]
+        public void PropertyInitializationType_List(Type listType)
+        {
+            CSharpType[] arguments = [typeof(int)];
+            var cSharpType = new CSharpType(listType, arguments: arguments);
+            var actual = cSharpType.PropertyInitializationType;
+            var expected = CodeModelGenerator.Instance.TypeFactory.ListInitializationType.MakeGenericType(arguments);
+
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCase(typeof(IDictionary<,>))]
+        [TestCase(typeof(IReadOnlyDictionary<,>))]
+        public void PropertyInitializationType_Dictionary(Type dictionaryType)
+        {
+            CSharpType[] arguments = [typeof(string), typeof(int)];
+            var cSharpType = new CSharpType(dictionaryType, arguments: arguments);
+            var actual = cSharpType.PropertyInitializationType;
+            var expected = CodeModelGenerator.Instance.TypeFactory.DictionaryInitializationType.MakeGenericType(arguments);
+
+            Assert.AreEqual(expected, actual);
+        }
+
+        [Test]
+        public void GetElementType_ReadOnlyMemory()
+        {
+            var arguments = typeof(int);
+            var cSharpType = new CSharpType(typeof(ReadOnlyMemory<>), arguments: arguments);
+            var actual = cSharpType.ElementType;
+            var expected = cSharpType.Arguments[0];
+
+            var areEqual = actual.Equals(expected);
+
+            Assert.IsTrue(areEqual);
+        }
+
+        [Test]
+        public void GetElementType_Dictionary()
+        {
+            var key = typeof(int);
+            var value = typeof(string);
+            var cSharpType = new CSharpType(typeof(IDictionary<,>), arguments: [key, value]);
+            var actual = cSharpType.ElementType;
+            var expected = cSharpType.Arguments[1];
+
+            var areEqual = actual.Equals(expected);
+
+            Assert.IsTrue(areEqual);
+        }
+
+        [TestCase(typeof(int), typeof(string), typeof(float))]
+        public void ValidateUnion(params Type[] types)
+        {
+            var typesInUnion = types.Select(t => (CSharpType)t).ToArray();
+            var type = CSharpType.FromUnion(typesInUnion, false);
+            Assert.AreEqual(types.Length, type.UnionItemTypes.Count);
+            for (int i = 0; i < typesInUnion.Length; i++)
+            {
+                Assert.AreEqual(typesInUnion[i], type.UnionItemTypes[i]);
+            }
+        }
+
+        [TestCase(typeof(int), "int")]
+        [TestCase(typeof(string), "string")]
+        public void TestToString(Type type, string expectedString)
+        {
+            var cSharpType = new CSharpType(type);
+            var actual = cSharpType.ToString();
+            var expected = new StringBuilder()
+                .Append(expectedString)
+                .ToString();
+
+            Assert.AreEqual(expected, actual);
+        }
+
+        [Test]
+        public void CacheFrameworkTypes()
+        {
+            CSharpType cSharpType1 = typeof(int);
+            CSharpType cSharpType2 = typeof(int);
+            Assert.IsTrue(ReferenceEquals(cSharpType1, cSharpType2));
+
+            CSharpType cSharpType3 = typeof(IList<int>);
+            CSharpType cSharpType4 = typeof(IList<int>);
+            Assert.IsTrue(ReferenceEquals(cSharpType3, cSharpType4));
+
+            CSharpType cSharpType5 = typeof(IDictionary<int, string>);
+            CSharpType cSharpType6 = typeof(IDictionary<int, string>);
+            Assert.IsTrue(ReferenceEquals(cSharpType5, cSharpType6));
+
+            CSharpType cSharpType7 = typeof(IList<int>);
+            CSharpType cSharpType8 = typeof(IList<string>);
+            Assert.IsFalse(ReferenceEquals(cSharpType7, cSharpType8));
+        }
+
+        [TestCase(typeof(int))]
+        [TestCase(typeof(IList<>))]
+        [TestCase(typeof(IList<int>))]
+        [TestCase(typeof(IDictionary<,>))]
+        [TestCase(typeof(IDictionary<int, int>))]
+        [TestCase(typeof(IDictionary<string, int>))]
+        [TestCase(typeof(IDictionary<IDictionary<int, string>, IDictionary<string, int>>))]
+        [TestCase(typeof(TestStruct<int>))]
+        [TestCase(typeof(string[]))]
+        [TestCase(typeof(TestEnum))]
+        [TestCase(typeof(TestDerivedType), typeof(TestBaseType))]
+        public void BaseTypesAreCorrect(Type type, Type? expectedBaseType = null)
+        {
+            var csharpType = new CSharpType(type);
+            if (expectedBaseType == null)
+            {
+                Assert.IsNull(csharpType.BaseType);
+            }
+            else
+            {
+                Assert.IsTrue(csharpType.BaseType!.Equals(expectedBaseType));
+            }
+        }
+
+        [TestCaseSource(nameof(ValidateNullableTypesData))]
+        public void ValidateNullableTypes(Type type, IReadOnlyList<CSharpType> expectedArguments, bool expectedIsNullable)
+        {
+            var csharpType = new CSharpType(type);
+
+            CollectionAssert.AreEqual(expectedArguments, csharpType.Arguments);
+            Assert.AreEqual(expectedIsNullable, csharpType.IsNullable);
+        }
+
+        private static object[] ValidateNullableTypesData = [
+            new object[]
+            {
+                typeof(int), Array.Empty<CSharpType>(), false
+            },
+            new object[]
+            {
+                typeof(int?), Array.Empty<CSharpType>(), true
+            },
+            new object[]
+            {
+                typeof(Uri), Array.Empty<CSharpType>(), false
+            },
+            new object[]
+            {
+                typeof(Guid), Array.Empty<CSharpType>(), false
+            },
+            new object[]
+            {
+                typeof(Guid?), Array.Empty<CSharpType>(), true
+            },
+            new object[]
+            {
+                typeof(TestStruct<int>), new CSharpType[] { typeof(int) }, false
+            },
+            new object[]
+            {
+                typeof(TestStruct<int>?), new CSharpType[] { typeof(int) }, true
+            },
+            new object[]
+            {
+                typeof(TestStruct<int?>), new CSharpType[] { typeof(int?) }, false
+            },
+            new object[]
+            {
+                typeof(TestStruct<int?>?), new CSharpType[] { typeof(int?) }, true
+            },
+            new object[]
+            {
+                typeof(TestStruct<TestStruct<int>>), new CSharpType[] { typeof(TestStruct<int>) }, false
+            },
+            new object[]
+            {
+                typeof(TestStruct<TestStruct<int>>?), new CSharpType[] { typeof(TestStruct<int>) }, true
+            },
+            new object[]
+            {
+                typeof(TestStruct<TestStruct<int>?>), new CSharpType[] { typeof(TestStruct<int>?) }, false
+            },
+            new object[]
+            {
+                typeof(TestStruct<TestStruct<int>?>?), new CSharpType[] { typeof(TestStruct<int>?) }, true
+            },
+        ];
+
+        internal struct TestStruct<T> { }
+
+        private enum TestEnum { Value1, Value2 }
+
+        private class TestDerivedType : TestBaseType
+        {
+        }
+        private class TestBaseType
+        {
+        }
+
+        [TestCase("MyNs", "SimpleType", ExpectedResult = "SimpleType")]
+        [TestCase("MyNs", "SimpleType`1", ExpectedResult = "SimpleType`1")]
+        public string ClrMetadataName_SimpleType(string ns, string name)
+        {
+            var type = new CSharpType(name, ns, false, false, null, [], true, false);
+            return type.ClrMetadataName;
+        }
+
+        [Test]
+        public void ClrMetadataName_GenericType_OneTypeArg()
+        {
+            var argType = new CSharpType("T", "MyNs", false, false, null, [], true, false);
+            var type = new CSharpType("GenericType", "MyNs", false, false, null, [argType], true, false);
+            Assert.AreEqual("GenericType`1", type.ClrMetadataName);
+        }
+
+        [Test]
+        public void ClrMetadataName_GenericType_TwoTypeArgs()
+        {
+            var arg1 = new CSharpType("TKey", "MyNs", false, false, null, [], true, false);
+            var arg2 = new CSharpType("TValue", "MyNs", false, false, null, [], true, false);
+            var type = new CSharpType("DictionaryType", "MyNs", false, false, null, [arg1, arg2], true, false);
+            Assert.AreEqual("DictionaryType`2", type.ClrMetadataName);
+        }
+
+        [Test]
+        public void ClrMetadataName_NestedType()
+        {
+            var outerType = new CSharpType("Outer", "MyNs", false, false, null, [], true, false);
+            var innerType = new CSharpType("Inner", "MyNs", false, false, outerType, [], true, false);
+            Assert.AreEqual("Outer+Inner", innerType.ClrMetadataName);
+        }
+
+        [Test]
+        public void ClrMetadataName_GenericNestedType()
+        {
+            var arg = new CSharpType("T", "MyNs", false, false, null, [], true, false);
+            var outerType = new CSharpType("Outer", "MyNs", false, false, null, [arg], true, false);
+            var innerType = new CSharpType("Inner", "MyNs", false, false, outerType, [], true, false);
+            Assert.AreEqual("Outer`1+Inner", innerType.ClrMetadataName);
+        }
+
+        [Test]
+        public void ClrMetadataName_LazilyComputedAndCached()
+        {
+            var type = new CSharpType("MyType", "MyNs", false, false, null, [], true, false);
+            var first = type.ClrMetadataName;
+            var second = type.ClrMetadataName;
+            Assert.AreSame(first, second);
+        }
+    }
+}

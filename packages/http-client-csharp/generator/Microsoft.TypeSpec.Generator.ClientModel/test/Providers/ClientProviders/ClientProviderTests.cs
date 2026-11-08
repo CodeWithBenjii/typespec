@@ -1,0 +1,6622 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// cspell:ignore DBOS IPDBOSIP
+
+using System;
+using System.ClientModel;
+using System.ClientModel.Primitives;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.TypeSpec.Generator.ClientModel.Providers;
+using Microsoft.TypeSpec.Generator.Expressions;
+using Microsoft.TypeSpec.Generator.Input;
+using Microsoft.TypeSpec.Generator.Primitives;
+using Microsoft.TypeSpec.Generator.Providers;
+using Microsoft.TypeSpec.Generator.Statements;
+using Microsoft.TypeSpec.Generator.Tests.Common;
+using NUnit.Framework;
+using static Microsoft.TypeSpec.Generator.Snippets.Snippet;
+
+namespace Microsoft.TypeSpec.Generator.ClientModel.Tests.Providers.ClientProviders
+{
+    public class ClientProviderTests
+    {
+        [Test]
+        public void ClientProviderLookupFollowsIdentityUpdates()
+        {
+            var input = InputFactory.Client("OriginalClient");
+            MockHelpers.LoadMockGenerator(clients: () => [input]);
+            var factory = ScmCodeModelGenerator.Instance.TypeFactory;
+            var client = factory.CreateClient(input)!;
+            var originalIdentity = client.Type.WithNullable(true);
+
+            client.Update(name: "RenamedClient", @namespace: "Renamed");
+
+            Assert.IsFalse(factory.CSharpTypeMap.ContainsKey(originalIdentity));
+            Assert.AreSame(client, factory.CSharpTypeMap[client.Type.WithNullable(true)]);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task ExperimentalPolyfilledCustomDeclarationsCompile(bool sourceAnnotated)
+        {
+            var model = InputFactory.Model("Payload", properties: []);
+            var choice = InputFactory.StringEnum("Choice", [("One", "one")], isExtensible: true);
+            var control = InputFactory.Experimental(InputFactory.Model("Control", properties: []), "CONTROL001");
+            var operation = InputFactory.Operation("Bar");
+            var parent = InputFactory.Client("ParentClient");
+            var child = InputFactory.Client("ChildClient", parent: parent,
+                methods: [InputFactory.BasicServiceMethod("Bar", operation)],
+                initializedBy: InputClientInitializedBy.Parent);
+            if (sourceAnnotated)
+            {
+                InputFactory.Experimental(model, "GENERATED_MODEL");
+                InputFactory.Experimental(choice, "GENERATED_ENUM");
+                InputFactory.Experimental(child, "GENERATED_CLIENT");
+                operation.Update(experimental: new InputExperimentalDetails("GENERATED_METHOD"));
+            }
+            Compilation? customCompilation = null;
+            var mock = await MockHelpers.LoadMockGeneratorAsync(
+                inputModels: () => [model, control], inputEnums: () => [choice], clients: () => [parent, child],
+                compilation: async () => customCompilation = await Helpers.GetCompilationFromDirectoryAsync());
+            // Keep the source-defined polyfill as a symbol instead of resolving it to the host runtime's BCL type.
+            Moq.Mock.Get(mock.Object.TypeFactory)
+                .Setup(factory => factory.CreateFrameworkType(typeof(ExperimentalAttribute).FullName!))
+                .Returns((Type?)null);
+            var generator = ScmCodeModelGenerator.Instance;
+            var modelProvider = generator.TypeFactory.CreateModel(model)!;
+            var enumProvider = generator.TypeFactory.CreateEnum(choice)!;
+            var childProvider = generator.TypeFactory.CreateClient(child)!;
+            var parentProvider = generator.TypeFactory.CreateClient(parent)!;
+            var methodBody = (BlockSyntax)SyntaxFactory.ParseStatement(Helpers.GetExpectedFromFile("MethodBody"));
+            var providers = generator.OutputLibrary.TypeProviders
+                .Where(provider => provider is not Utf8JsonBinaryContentDefinition and not BinaryContentHelperDefinition);
+            var trees = providers.Select(provider => new TypeProviderWriter(provider).Write())
+                .Select(file =>
+                {
+                    var tree = CSharpSyntaxTree.ParseText(file.Content, path: file.Name);
+                    var root = tree.GetRoot();
+                    var partialMethods = root.DescendantNodes().OfType<MethodDeclarationSyntax>()
+                        .Where(method => method.Modifiers.Any(SyntaxKind.PartialKeyword));
+                    // Isolate attribute placement from custom partial implementation bodies.
+                    var updatedRoot = root.ReplaceNodes(partialMethods, (_, method) => method
+                        .WithModifiers(SyntaxFactory.TokenList(method.Modifiers.Where(modifier => !modifier.IsKind(SyntaxKind.AsyncKeyword))))
+                        .WithBody(methodBody));
+                    return tree.WithRootAndOptions(updatedRoot, tree.Options);
+                });
+            var references = AppDomain.CurrentDomain.GetAssemblies()
+                .Where(assembly => !assembly.IsDynamic && !string.IsNullOrEmpty(assembly.Location))
+                .Select(assembly => MetadataReference.CreateFromFile(assembly.Location))
+                .Append(MetadataReference.CreateFromFile(typeof(Microsoft.Extensions.Configuration.IConfigurationSection).Assembly.Location));
+            var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, generalDiagnosticOption: ReportDiagnostic.Error)
+                .WithSpecificDiagnosticOptions(new Dictionary<string, ReportDiagnostic> { ["CS0436"] = ReportDiagnostic.Suppress });
+            var compilation = CSharpCompilation.Create("PolyfilledCustomDeclarations",
+                trees.Concat(customCompilation!.SyntaxTrees.Where(tree => tree.FilePath.EndsWith("CustomTypes.cs", StringComparison.Ordinal))),
+                references, options);
+            Assert.IsEmpty(compilation.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
+                .Select(diagnostic => diagnostic.ToString()));
+            foreach (var provider in new TypeProvider[] { modelProvider, enumProvider, childProvider })
+            {
+                Assert.IsFalse(provider.Attributes.Any(attribute => attribute.Type.FullyQualifiedName == typeof(ExperimentalAttribute).FullName));
+                var custom = provider.CanonicalView.Attributes.Single(attribute => attribute.Type.FullyQualifiedName == typeof(ExperimentalAttribute).FullName);
+                Assert.IsFalse(custom.Type.IsFrameworkType);
+                Assert.IsFalse(custom.Type.IsPublic);
+            }
+            Assert.AreEqual("CONTROL001", compilation.GetTypeByMetadataName("Sample.Models.Control")!.GetAttributes()
+                .Single(attribute => attribute.AttributeClass!.ToDisplayString() == typeof(ExperimentalAttribute).FullName)
+                .ConstructorArguments[0].Value);
+            foreach (var method in compilation.GetTypeByMetadataName("Sample.ChildClient")!.GetMembers()
+                .OfType<IMethodSymbol>().Where(method => method.Name is "Bar" or "BarAsync"))
+            {
+                Assert.AreEqual("CUSTOM_METHOD", method.GetAttributes().Single().ConstructorArguments[0].Value);
+            }
+            foreach (var provider in new TypeProvider[] { parentProvider, generator.TypeFactory.CreateModel(control)! })
+            {
+                var file = new TypeProviderWriter(provider).Write();
+                Assert.AreEqual(Helpers.GetExpectedFromFile(provider.Name), file.Content);
+            }
+        }
+
+        [Test]
+        public void ExperimentalChildParametersAreSuppressedOnParentAccessors()
+        {
+            var mode = InputFactory.Experimental(InputFactory.StringEnum("Mode", [("One", "one")], isExtensible: true), "MODE001");
+            var parent = InputFactory.Client("ParentClient");
+            var child = InputFactory.Client("ChildClient", parent: parent,
+                parameters: [InputFactory.PathParameter("mode", mode, isRequired: true, scope: InputParameterScope.Client)],
+                initializedBy: InputClientInitializedBy.Parent);
+            MockHelpers.LoadMockGenerator(inputEnums: () => [mode], clients: () => [parent, child]);
+            var generator = ScmCodeModelGenerator.Instance;
+            var client = generator.TypeFactory.CreateClient(parent)!;
+            var accessor = client.Methods.Single(m => m.Signature.Name == "GetChildClient");
+            Assert.AreEqual("Mode", accessor.Signature.Parameters.Single().Type.Name);
+            Assert.AreEqual(0, client.DisabledFileWarnings.Count);
+            StringAssert.Contains("#pragma warning disable MODE001", new TypeProviderWriter(client).Write().Content);
+
+            var references = AppDomain.CurrentDomain.GetAssemblies()
+                .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location))
+                .Select(a => MetadataReference.CreateFromFile(a.Location))
+                .Append(MetadataReference.CreateFromFile(typeof(Microsoft.Extensions.Configuration.IConfigurationSection).Assembly.Location));
+            var providers = generator.OutputLibrary.TypeProviders
+                .Where(p => p is not Utf8JsonBinaryContentDefinition and not BinaryContentHelperDefinition);
+            var compilation = CSharpCompilation.Create(
+                "ExperimentalChildParameters",
+                providers.Select(p => CSharpSyntaxTree.ParseText(new TypeProviderWriter(p).Write().Content)),
+                references,
+                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, generalDiagnosticOption: ReportDiagnostic.Error));
+            Assert.IsEmpty(compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).Select(d => d.ToString()));
+        }
+
+        [Test]
+        public async Task ExperimentalCustomClientKeepsExistingAttribute()
+        {
+            var input = InputFactory.Experimental(InputFactory.Client("TestClient"), "GENERATED001");
+            await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [input],
+                compilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(input)!;
+
+            Assert.AreEqual(0, client.Attributes.Count(a => a.Type.Equals(typeof(ExperimentalAttribute))));
+            Assert.AreEqual(Literal("CUSTOM001").ToDisplayString(),
+                client.CanonicalView.Attributes.Single(a => a.Type.Equals(typeof(ExperimentalAttribute))).Arguments[0].ToDisplayString());
+        }
+
+        [TestCase(null, false, InputClientInitializedBy.Parent)]
+        [TestCase("GENERATED001", false, InputClientInitializedBy.Parent)]
+        [TestCase("CUSTOM001", false, InputClientInitializedBy.Parent)]
+        [TestCase(null, true, InputClientInitializedBy.Parent)]
+        [TestCase("GENERATED001", true, InputClientInitializedBy.Parent)]
+        [TestCase(null, false, InputClientInitializedBy.Default)]
+        [TestCase(null, false, InputClientInitializedBy.Individually)]
+        public async Task ExperimentalCustomChildDiagnosticsAreSuppressedOnParentAccessors(
+            string? generatedDiagnosticId,
+            bool hasAccessorParameter,
+            InputClientInitializedBy initializedBy)
+        {
+            var parent = InputFactory.Client("ParentClient");
+            var child = InputFactory.Client("ChildClient", parent: parent,
+                parameters: hasAccessorParameter
+                    ? [InputFactory.PathParameter("id", InputPrimitiveType.String, isRequired: true, scope: InputParameterScope.Client)]
+                    : [],
+                initializedBy: initializedBy);
+            var otherChild = InputFactory.Client("OtherChildClient", parent: parent, initializedBy: initializedBy);
+            var stableChild = InputFactory.Client("StableClient", parent: parent, initializedBy: InputClientInitializedBy.Parent);
+            if (generatedDiagnosticId is not null)
+            {
+                InputFactory.Experimental(child, generatedDiagnosticId);
+                InputFactory.Experimental(otherChild, generatedDiagnosticId);
+            }
+            var customCompilation = await Helpers.GetCompilationFromDirectoryAsync();
+            await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [parent, child, otherChild, stableChild],
+                compilation: () => Task.FromResult(customCompilation));
+            var generator = ScmCodeModelGenerator.Instance;
+            var parentProvider = generator.TypeFactory.CreateClient(parent)!;
+            var childProvider = generator.TypeFactory.CreateClient(child)!;
+            bool hasAccessor = initializedBy != InputClientInitializedBy.Individually;
+            var accessor = parentProvider.Methods.SingleOrDefault(method => method.Signature.Name == "GetChildClient");
+
+            Assert.AreEqual(hasAccessor, accessor is not null);
+            if (hasAccessor)
+            {
+                Assert.AreEqual(hasAccessorParameter ? 1 : 0, accessor!.Signature.Parameters.Count);
+                Assert.IsFalse(accessor.Signature.Attributes.Any(attribute => attribute.Type.Equals(typeof(ExperimentalAttribute))));
+            }
+            Assert.IsFalse(parentProvider.Attributes.Any(attribute => attribute.Type.Equals(typeof(ExperimentalAttribute))));
+            Assert.IsEmpty(childProvider.Attributes.Where(attribute => attribute.Type.Equals(typeof(ExperimentalAttribute))));
+            Assert.AreEqual(Literal("CUSTOM001").ToDisplayString(),
+                childProvider.CanonicalView.Attributes.Single(attribute => attribute.Type.Equals(typeof(ExperimentalAttribute))).Arguments[0].ToDisplayString());
+            Assert.IsFalse(generator.TypeFactory.CreateClient(stableChild)!.DisabledFileWarnings
+                .Any(suppression => suppression.Code.ToDisplayString() == Literal("CUSTOM001").ToDisplayString()));
+
+            var references = AppDomain.CurrentDomain.GetAssemblies()
+                .Where(assembly => !assembly.IsDynamic && !string.IsNullOrEmpty(assembly.Location))
+                .Select(assembly => MetadataReference.CreateFromFile(assembly.Location))
+                .Append(MetadataReference.CreateFromFile(typeof(Microsoft.Extensions.Configuration.IConfigurationSection).Assembly.Location));
+            var providers = generator.OutputLibrary.TypeProviders
+                .Where(provider => provider is not Utf8JsonBinaryContentDefinition and not BinaryContentHelperDefinition);
+            var generatedTrees = providers.Select(provider => new TypeProviderWriter(provider).Write())
+                .Select(file => CSharpSyntaxTree.ParseText(file.Content, path: file.Name));
+            var customTrees = customCompilation.SyntaxTrees
+                .Where(tree => tree.FilePath.EndsWith("CustomClients.cs", StringComparison.Ordinal));
+            var compilation = CSharpCompilation.Create(
+                "ExperimentalCustomizedChildren",
+                generatedTrees.Concat(customTrees),
+                references,
+                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, generalDiagnosticOption: ReportDiagnostic.Error));
+            Assert.IsEmpty(compilation.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error).Select(diagnostic => diagnostic.ToString()));
+            Assert.AreEqual(0, parentProvider.DisabledFileWarnings.Count);
+            var parentCode = new TypeProviderWriter(parentProvider).Write().Content;
+            Assert.AreEqual(hasAccessor, parentCode.Contains("#pragma warning disable CUSTOM001", StringComparison.Ordinal));
+            if (hasAccessor)
+            {
+                Assert.Greater(parentCode.IndexOf("#pragma warning disable CUSTOM001", StringComparison.Ordinal),
+                    parentCode.IndexOf("partial class ParentClient", StringComparison.Ordinal));
+                Assert.AreEqual(parentCode.Split("#pragma warning disable CUSTOM001").Length,
+                    parentCode.Split("#pragma warning restore CUSTOM001").Length);
+            }
+
+            var consumerTree = CSharpSyntaxTree.ParseText(Helpers.GetExpectedFromFile(parameters: "Consumer"));
+            var consumerErrors = compilation.AddSyntaxTrees(consumerTree).GetDiagnostics()
+                .Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error).ToArray();
+            Assert.IsNotEmpty(consumerErrors);
+            Assert.IsTrue(consumerErrors.All(diagnostic => diagnostic.Id == "CUSTOM001" && diagnostic.Location.SourceTree == consumerTree),
+                string.Join(Environment.NewLine, consumerErrors.Select(diagnostic => diagnostic.ToString())));
+        }
+
+        [Test]
+        public void ExperimentalClientAndModelReferences()
+        {
+            var model = InputFactory.Experimental(InputFactory.Model("Payload"), "MODEL001");
+            var operation = InputFactory.Operation("Read", responses: [InputFactory.OperationResponse(bodytype: model)]);
+            var clientInput = InputFactory.Experimental(
+                InputFactory.Client("Experiment", methods: [InputFactory.BasicServiceMethod("Read", operation)]),
+                "CLIENT001", "DEP001");
+            MockHelpers.LoadMockGenerator(inputModels: () => [model], clients: () => [clientInput]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(clientInput)!;
+
+            Assert.AreEqual(Literal("CLIENT001").ToDisplayString(),
+                client.Attributes.Single(a => a.Type.Equals(typeof(ExperimentalAttribute))).Arguments[0].ToDisplayString());
+            foreach (var provider in new TypeProvider[] { client, client.RestClient })
+            {
+                CollectionAssert.AreEqual(
+                    new[] { "DEP001" }.Select(id => Literal(id).ToDisplayString()),
+                    provider.DisabledFileWarnings.Select(s => s.Code.ToDisplayString()));
+            }
+            Assert.IsFalse(client.RestClient.Attributes.Any(a => a.Type.Equals(typeof(ExperimentalAttribute))));
+        }
+
+        [TestCase("Foo", "Foo", ExpectedResult = true)]
+        [TestCase("Foo", "Bar", ExpectedResult = false)]
+        [TestCase("Foo", "_Foo", ExpectedResult = false)]
+        [TestCase("_Foo", "Foo", ExpectedResult = false)]
+        [TestCase("Foo", "Bar.Foo", ExpectedResult = true)]
+        [TestCase("Bar.Foo", "Foo", ExpectedResult = true)]
+        [TestCase("Foo", "Bar._Foo", ExpectedResult = false)]
+        [TestCase("Bar._Foo", "Foo", ExpectedResult = false)]
+        [TestCase("Foo", "/Foo", ExpectedResult = false)]
+        [TestCase("/Foo", "Foo", ExpectedResult = false)]
+        [TestCase(".Foo", ".Foo", ExpectedResult = true)]
+        [TestCase("Foo", ".Foo", ExpectedResult = true)]
+        [TestCase(".Foo", "Foo", ExpectedResult = true)]
+        public bool ValidateIsLastNamespaceSegmentTheSame(string left, string right)
+        {
+            return ClientProvider.IsLastNamespaceSegmentTheSame(left, right);
+        }
+
+        private const string SubClientsCategory = "WithSubClients";
+        private const string KeyAuthCategory = "WithKeyAuth";
+        private const string OAuth2Category = "WithOAuth2";
+        private const string OAuth2CategoryOtherCredType = "WithOAuth2_OtherCredType";
+        private const string OnlyUnsupportedAuthCategory = "WithOnlyUnsupportedAuth";
+        private const string TestClientName = "TestClient";
+        private static readonly InputClient _testClient = InputFactory.Client(TestClientName);
+        private static readonly InputClient _animalClient = InputFactory.Client("animal", doc: "AnimalClient description", parent: _testClient, initializedBy: InputClientInitializedBy.Parent);
+        private static readonly InputClient _dogClient = InputFactory.Client("dog", doc: "DogClient description", parent: _animalClient, initializedBy: InputClientInitializedBy.Parent);
+        private static readonly InputClient _huskyClient = InputFactory.Client("husky", doc: "HuskyClient description", parent: _dogClient, initializedBy: InputClientInitializedBy.Parent);
+        private static readonly InputModelType _spreadModel = InputFactory.Model(
+            "spreadModel",
+            usage: InputModelTypeUsage.Spread,
+            properties:
+            [
+                InputFactory.Property("p1", InputPrimitiveType.String, isRequired: true),
+            ]);
+
+        private bool _containsSubClients;
+        private bool _hasKeyAuth;
+        private bool _hasOAuth2;
+        private bool _hasOAuth2WithOtherCredType;
+        private bool _hasSupportedAuth;
+        private bool _hasOnlyUnsupportedAuth;
+
+        [SetUp]
+        public void SetUp()
+        {
+            // Reset the singleton instance before each test to prevent state leaking
+            var singletonField = typeof(ClientOptionsProvider).GetField("_singletonInstance", BindingFlags.Static | BindingFlags.NonPublic);
+            singletonField?.SetValue(null, null);
+
+            var categories = TestContext.CurrentContext.Test?.Properties["Category"];
+            _containsSubClients = categories?.Contains(SubClientsCategory) ?? false;
+            _hasKeyAuth = categories?.Contains(KeyAuthCategory) ?? false;
+            _hasOAuth2 = categories?.Contains(OAuth2Category) ?? false;
+            _hasOAuth2WithOtherCredType = categories?.Contains(OAuth2CategoryOtherCredType) ?? false;
+            _hasSupportedAuth = _hasKeyAuth || _hasOAuth2 || _hasOAuth2WithOtherCredType;
+            _hasOnlyUnsupportedAuth = categories?.Contains(OnlyUnsupportedAuthCategory) ?? false;
+
+            Func<IReadOnlyList<InputClient>>? clients = _containsSubClients ?
+                () => [_testClient] :
+                null;
+            InputApiKeyAuth? apiKeyAuth = _hasKeyAuth ? new InputApiKeyAuth("mock", null) : null;
+            InputOAuth2Auth? oauth2Auth = (_hasOAuth2 || _hasOAuth2WithOtherCredType)
+                ? new InputOAuth2Auth([new InputOAuth2Flow(["mock"], null, null, null)])
+                : null;
+            Func<InputAuth>? auth = (_hasSupportedAuth || _hasOnlyUnsupportedAuth)
+                ? () => new InputAuth(apiKeyAuth, oauth2Auth)
+                : null;
+
+            MockHelpers.LoadMockGenerator(
+                clients: clients,
+                clientPipelineApi: _hasOAuth2WithOtherCredType ? TestClientPipelineApi.Instance : null,
+                auth: auth);
+        }
+
+        private static IEnumerable<TestCaseData> AcronymClientNames()
+        {
+            (string Input, string Expected)[] names =
+            [
+                ("IpClient", "IPClient"),
+                ("DbClient", "DBClient"),
+                ("OsClient", "OSClient"),
+                ("Ipv4Client", "IPv4Client"),
+                ("IpV4Client", "IPv4Client"),
+                ("Ipv6Client", "IPv6Client"),
+                ("IpV6Client", "IPv6Client"),
+                ("IpDbOsIpClientDb", "IPDBOSIPClientDB"),
+                ("Ipv4IpV4Ipv6IpV6Client", "IPv4IPv4IPv6IPv6Client"),
+                ("IPClientDBOS", "IPClientDBOS"),
+                ("IPv4IPv6Client", "IPv4IPv6Client"),
+                ("IPV4IPV6Client", "IPV4IPV6Client"),
+                ("OsloIpsumOsmosisDbzClient", "OsloIpsumOsmosisDbzClient"),
+                ("Ipv4addressIpv6addressClient", "Ipv4addressIpv6addressClient"),
+                ("Ipv42Ipv62Client", "Ipv42Ipv62Client"),
+                ("IpV42IpV62Client", "IPV42IPV62Client"),
+                ("Ip1Db2Os3Client", "Ip1Db2Os3Client"),
+                ("ip_client", "IPClient"),
+                ("ClientIp", "ClientIP"),
+                ("ClientResponse", "ClientResponse")
+            ];
+            foreach (var (input, expected) in names)
+            {
+                foreach (bool isSubClient in new[] { false, true })
+                {
+                    foreach (bool isExactName in new[] { false, true })
+                    {
+                        yield return new TestCaseData(input, isExactName ? input : expected, isSubClient, isExactName);
+                    }
+                }
+            }
+        }
+
+        [TestCaseSource(nameof(AcronymClientNames))]
+        public void TestBuildName_NormalizesAcronymCasing(
+            string inputName, string expectedName, bool isSubClient, bool isExactName)
+        {
+            var parent = isSubClient ? InputFactory.Client("ParentClient") : null;
+            var input = InputFactory.Client(inputName, clientNamespace: "Sample.IpDbOs",
+                parent: parent, isExactName: isExactName,
+                initializedBy: isSubClient ? InputClientInitializedBy.Parent : InputClientInitializedBy.Individually);
+            MockHelpers.LoadMockGenerator(clients: () => [parent ?? input]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(input)!;
+
+            AssertClientIdentity(client, expectedName, "Sample.IpDbOs");
+            if (parent != null)
+            {
+                AssertSubClientReference(ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(parent)!, client);
+            }
+        }
+
+        [Test]
+        public async Task TestBuildName_PreservesExistingClient(
+            [Values("IpClient", "DbClient", "OsClient", "Ipv4Client", "IpV6Client")] string inputName,
+            [Values] bool lastContract, [Values] bool updateNamespace, [Values] bool isSubClient)
+        {
+            var parent = isSubClient ? InputFactory.Client("ParentClient") : null;
+            var input = InputFactory.Client(inputName,
+                clientNamespace: updateNamespace ? "Sample" : "Sample.Published", parent: parent,
+                initializedBy: isSubClient ? InputClientInitializedBy.Parent : InputClientInitializedBy.Individually);
+            var compilation = await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients");
+            await MockHelpers.LoadMockGeneratorAsync(clients: () => [parent ?? input],
+                compilation: lastContract ? null : () => Task.FromResult(compilation),
+                lastContractCompilation: lastContract ? () => Task.FromResult(compilation) : null);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(input)!;
+            var expectedName = inputName == "OsClient" ? "OSClient" : inputName;
+
+            if (updateNamespace)
+            {
+                Assert.AreNotEqual(inputName, client.Name);
+                client.Update(@namespace: "Sample.Published");
+            }
+
+            Assert.IsNotNull(lastContract ? client.LastContractView : client.CustomCodeView);
+            AssertClientIdentity(client, expectedName, "Sample.Published");
+            if (parent != null)
+            {
+                AssertSubClientReference(ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(parent)!, client);
+            }
+        }
+
+        [TestCase("MappedDbClient", "ExplicitDbClient")]
+        [TestCase("MappedIpClient", "ExplicitIpClient")]
+        public async Task TestBuildName_PreservesCustomClientMapping(string inputName, string expectedName)
+        {
+            var parent = InputFactory.Client("ParentClient");
+            var input = InputFactory.Client(inputName, parent: parent, initializedBy: InputClientInitializedBy.Parent);
+            await MockHelpers.LoadMockGeneratorAsync(clients: () => [parent],
+                compilation: async () => await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients"));
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(input)!;
+
+            Assert.IsNotNull(client.CustomCodeView);
+            AssertClientIdentity(client, expectedName, "Sample.Customized");
+            AssertSubClientReference(ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(parent)!, client);
+        }
+
+        [TestCase("MappedDbClient", "ExplicitDbClient")]
+        [TestCase("MappedIpClient", "ExplicitIpClient")]
+        public async Task TestBuildName_CustomizationPrecedesLastContract(string inputName, string expectedName)
+        {
+            var input = InputFactory.Client(inputName, clientNamespace: "Sample.Published");
+            var compilation = await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients");
+            await MockHelpers.LoadMockGeneratorAsync(clients: () => [input],
+                compilation: () => Task.FromResult(compilation),
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync("Last", method: "AcronymClients"));
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(input)!;
+
+            Assert.IsNotNull(client.CustomCodeView);
+            AssertClientIdentity(client, expectedName, "Sample.Customized");
+        }
+
+        [TestCase("IpClient", true, "IpClient")]
+        [TestCase("OsClient", true, "OsClient")]
+        [TestCase("InternalOsClient", false, "InternalOSClient")]
+        public async Task TestBuildName_OnlyPreservesMatchingPublicContract(string inputName, bool isExactName, string expectedName)
+        {
+            var input = InputFactory.Client(inputName, isExactName: isExactName);
+            await MockHelpers.LoadMockGeneratorAsync(clients: () => [input],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients"));
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(input)!;
+
+            Assert.AreEqual(expectedName, client.Name);
+            Assert.AreEqual("Sample", client.Type.Namespace);
+            Assert.IsNull(client.LastContractView);
+            client.Update(@namespace: "Sample.Published");
+            AssertClientIdentity(client, expectedName, "Sample.Published");
+            Assert.AreEqual(inputName == "IpClient", client.LastContractView != null);
+        }
+
+        [Test]
+        public async Task TestBuildName_PreservesExplicitNameUpdate([Values] bool lastContract)
+        {
+            var input = InputFactory.Client("IpClient");
+            var compilation = await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients");
+            await MockHelpers.LoadMockGeneratorAsync(clients: () => [input],
+                compilation: lastContract ? null : () => Task.FromResult(compilation),
+                lastContractCompilation: lastContract ? () => Task.FromResult(compilation) : null);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(input)!;
+
+            client.Update(name: "ExplicitIpClient", @namespace: "Sample.Published");
+
+            AssertClientIdentity(client, "ExplicitIpClient", "Sample.Published");
+            Assert.IsNull(client.LastContractView);
+            Assert.IsNull(client.CustomCodeView);
+        }
+
+        [Test]
+        public async Task TestBuildName_PreservesExistingClientAfterBuildingProviders([Values] bool lastContract, [Values] bool isSubClient)
+        {
+            var parent = isSubClient ? InputFactory.Client("ParentClient") : null;
+            var input = InputFactory.Client("IpClient", parent: parent,
+                initializedBy: isSubClient ? InputClientInitializedBy.Parent : InputClientInitializedBy.Individually);
+            var child = parent is null ? InputFactory.Client("ChildClient", parent: input) : null;
+            var compilation = await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients");
+            var generator = await MockHelpers.LoadMockGeneratorAsync(clients: () => [parent ?? input],
+                compilation: lastContract ? null : () => Task.FromResult(compilation),
+                lastContractCompilation: lastContract ? () => Task.FromResult(compilation) : null);
+            foreach (var provider in generator.Object.OutputLibrary.TypeProviders)
+            {
+                provider.EnsureBuilt();
+                _ = provider.RelativeFilePath;
+            }
+            var client = generator.Object.TypeFactory.CreateClient(input)!;
+            Assert.AreEqual("IPClient", client.Name);
+
+            client.Update(@namespace: "Sample.Published");
+
+            AssertClientIdentity(client, "IpClient", "Sample.Published");
+            if (parent != null)
+            {
+                AssertSubClientReference(generator.Object.TypeFactory.CreateClient(parent)!, client);
+            }
+            if (child != null)
+            {
+                AssertClientIdentity(generator.Object.TypeFactory.CreateClient(child)!, "ChildClient", "Sample");
+            }
+        }
+
+        [Test]
+        public async Task TestBuildName_PreservesCustomizedDependentNames([Values] bool isSubClient)
+        {
+            var parent = isSubClient ? InputFactory.Client("ParentClient") : null;
+            var input = InputFactory.Client("IpClient", parent: parent,
+                initializedBy: isSubClient ? InputClientInitializedBy.Parent : InputClientInitializedBy.Individually);
+            var generator = await MockHelpers.LoadMockGeneratorAsync(clients: () => [parent ?? input],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients"));
+            var client = generator.Object.TypeFactory.CreateClient(input)!;
+            MethodProvider? accessor = null;
+            if (parent != null)
+            {
+                accessor = generator.Object.TypeFactory.CreateClient(parent)!.Methods.Single();
+                accessor.Signature.Update(name: "GetCustomClient");
+            }
+            else
+            {
+                client.ClientOptions!.Update(name: "CustomOptions");
+                client.ClientSettings!.Update(name: "CustomSettings");
+            }
+
+            client.Update(@namespace: "Sample.Published");
+
+            Assert.AreEqual("IpClient", client.Name);
+            if (accessor != null)
+            {
+                Assert.AreEqual("GetCustomClient", accessor.Signature.Name);
+                Assert.AreSame(client.Type, accessor.Signature.ReturnType);
+            }
+            else
+            {
+                Assert.AreEqual("CustomOptions", client.ClientOptions!.Name);
+                Assert.AreEqual("CustomSettings", client.ClientSettings!.Name);
+            }
+        }
+
+        [TestCase("CustomRestClient", "Sample")]
+        [TestCase("IPClient", "Sample.Customized")]
+        public async Task TestBuildName_PreservesCustomizedRestClientIdentity(string restClientName, string restClientNamespace)
+        {
+            var input = InputFactory.Client("IpClient", clientNamespace: "Sample");
+            var generator = await MockHelpers.LoadMockGeneratorAsync(clients: () => [input]);
+            var client = generator.Object.TypeFactory.CreateClient(input)!;
+            var restClient = client.RestClient;
+            restClient.Update(name: restClientName, @namespace: restClientNamespace);
+
+            client.Update(@namespace: "Sample.Relocated");
+
+            Assert.AreEqual(restClientName, restClient.Name);
+            Assert.AreEqual(restClientNamespace, restClient.Type.Namespace);
+        }
+
+        [Test]
+        public async Task TestBuildName_PreservesDependentConstructorCustomizations(
+            [Values("Options", "Settings", "RestClient")] string dependentKind,
+            [Values] bool lastContract, [Values] bool removeConstructors)
+        {
+            var input = InputFactory.Client("IpClient", initializedBy: InputClientInitializedBy.Individually);
+            var compilation = await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients");
+            var generator = await MockHelpers.LoadMockGeneratorAsync(clients: () => [input],
+                compilation: lastContract ? null : () => Task.FromResult(compilation),
+                lastContractCompilation: lastContract ? () => Task.FromResult(compilation) : null);
+            var client = generator.Object.TypeFactory.CreateClient(input)!;
+            TypeProvider dependent = dependentKind switch
+            {
+                "Options" => client.ClientOptions!,
+                "Settings" => client.ClientSettings!,
+                _ => client.RestClient
+            };
+            dependent.EnsureBuilt();
+            var constructor = dependent.Constructors.FirstOrDefault() ?? new ConstructorProvider(
+                new ConstructorSignature(dependent.Type, null, MethodSignatureModifiers.Public, []),
+                MethodBodyStatement.Empty, dependent);
+            var parameter = new ParameterProvider("custom", $"A custom parameter.", typeof(string));
+            constructor.Signature.Update(description: $"Customized constructor.", modifiers: MethodSignatureModifiers.Internal,
+                parameters: [parameter]);
+            var body = new MethodBodyStatements([MethodBodyStatement.Empty]);
+            var docs = new XmlDocProvider(new XmlDocSummaryStatement([$"Customized documentation."]));
+            constructor.Update(bodyStatements: body, xmlDocs: docs);
+            dependent.Update(constructors: removeConstructors ? [] : [constructor]);
+
+            client.Update(@namespace: "Sample.Published");
+
+            var expectedName = dependentKind == "RestClient" ? "IpClient" : $"IpClient{dependentKind}";
+            Assert.AreEqual(expectedName, dependent.Name);
+            Assert.AreEqual("Sample.Published", dependent.Type.Namespace);
+            if (removeConstructors)
+            {
+                Assert.IsEmpty(dependent.Constructors);
+            }
+            else
+            {
+                Assert.AreSame(constructor, dependent.Constructors.Single());
+                Assert.AreEqual(expectedName, constructor.Signature.Name);
+                Assert.AreSame(dependent.Type, constructor.Signature.Type);
+                Assert.AreSame(parameter, constructor.Signature.Parameters.Single());
+                Assert.AreEqual(MethodSignatureModifiers.Internal, constructor.Signature.Modifiers);
+                Assert.AreEqual("Customized constructor.", constructor.Signature.Description!.ToString());
+                Assert.AreSame(body, constructor.BodyStatements);
+                Assert.AreSame(docs, constructor.XmlDocs);
+            }
+        }
+
+        [Test]
+        public async Task TestBuildName_UpdatesDependentConstructorDocumentation([Values] bool customSummary)
+        {
+            var input = InputFactory.Client("IpClient");
+            var generator = await MockHelpers.LoadMockGeneratorAsync(clients: () => [input],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync(method: "AcronymClients"));
+            var client = generator.Object.TypeFactory.CreateClient(input)!;
+            var options = client.ClientOptions!;
+            var constructors = options.Constructors.ToArray();
+            var summary = new XmlDocSummaryStatement([$"Customized documentation."]);
+            if (customSummary)
+            {
+                foreach (var constructor in constructors)
+                {
+                    constructor.XmlDocs.Update(summary: summary);
+                }
+            }
+
+            client.Update(@namespace: "Sample.Published");
+
+            Assert.AreEqual(constructors, options.Constructors);
+            foreach (var constructor in options.Constructors)
+            {
+                Assert.AreEqual("IpClientOptions", constructor.Signature.Name);
+                Assert.That(constructor.Signature.Description!.ToString(), Does.Contain("IpClientOptions"));
+                if (customSummary)
+                {
+                    Assert.AreSame(summary, constructor.XmlDocs.Summary);
+                }
+                else
+                {
+                    Assert.That(constructor.XmlDocs.Summary!.Lines.Single().ToString(), Does.Contain("IpClientOptions"));
+                }
+            }
+        }
+
+        private static void AssertClientIdentity(ClientProvider client, string expectedName, string expectedNamespace)
+        {
+            Assert.AreEqual(expectedName, client.Name);
+            Assert.AreEqual(expectedNamespace, client.Type.Namespace);
+            Assert.AreEqual($"{expectedName}.cs", Path.GetFileName(client.RelativeFilePath));
+            Assert.IsNotEmpty(client.Constructors);
+            foreach (var constructor in client.Constructors)
+            {
+                Assert.AreEqual(expectedName, constructor.Signature.Name);
+                Assert.AreSame(client.Type, constructor.Signature.Type);
+                if (constructor.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Public))
+                {
+                    Assert.That(constructor.Signature.Description!.ToString(), Does.Contain(expectedName));
+                }
+            }
+            Assert.AreEqual(expectedName, client.RestClient.Name);
+            Assert.AreEqual(expectedNamespace, client.RestClient.Type.Namespace);
+            Assert.AreEqual($"{expectedName}.RestClient.cs", Path.GetFileName(client.RestClient.RelativeFilePath));
+            foreach (var dependent in new TypeProvider?[] { client.ClientOptions, client.ClientSettings })
+            {
+                if (dependent != null)
+                {
+                    var suffix = dependent is ClientOptionsProvider ? "Options" : "Settings";
+                    Assert.AreEqual($"{expectedName}{suffix}", dependent.Name);
+                    Assert.AreEqual(expectedNamespace, dependent.Type.Namespace);
+                    Assert.AreEqual($"{dependent.Name}.cs", Path.GetFileName(dependent.RelativeFilePath));
+                    foreach (var constructor in dependent.Constructors)
+                    {
+                        Assert.AreEqual(dependent.Name, constructor.Signature.Name);
+                        Assert.AreSame(dependent.Type, constructor.Signature.Type);
+                        Assert.That(constructor.Signature.Description!.ToString(), Does.Contain(dependent.Name));
+                    }
+                }
+            }
+            if (client.ClientSettings != null && client.EffectiveClientOptions != null)
+            {
+                Assert.AreEqual(client.EffectiveClientOptions.Type.WithNullable(true),
+                    client.ClientSettings.Properties.Single(p => p.Name == "Options").Type);
+            }
+        }
+
+        private static void AssertSubClientReference(ClientProvider parent, ClientProvider client)
+        {
+            var accessor = parent.Methods.Single(m => m.Signature.ReturnType?.Equals(client.Type) == true);
+            var suffix = client.Name.EndsWith("Client", StringComparison.OrdinalIgnoreCase) ? "" : "Client";
+            Assert.AreEqual($"Get{client.Name}{suffix}", accessor.Signature.Name);
+            Assert.AreSame(client.Type, accessor.Signature.ReturnType);
+            Assert.IsTrue(parent.Fields.Any(f => ReferenceEquals(f.Type, client.Type)));
+        }
+
+        [Test]
+        public void TestNullRootClientWithChildren()
+        {
+            var plugin = MockHelpers.LoadMockGenerator(
+                clients: () => [_testClient],
+                createClientCore: FilterOutClient
+                );
+
+            ClientProvider? FilterOutClient(InputClient client)
+            {
+                if (client == _testClient)
+                {
+                    return null;
+                }
+                return new ClientProvider(client);
+            }
+
+            var clients = plugin.Object.OutputLibrary.TypeProviders.Where(p => p is ClientProvider).ToList();
+            Assert.AreEqual(3, clients.Count);
+        }
+
+        [Test]
+        public void TestBuildProperties()
+        {
+            var client = InputFactory.Client(TestClientName);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // validate the properties
+            var properties = clientProvider.Properties;
+            Assert.IsTrue(properties.Count > 0);
+            // there should be a pipeline property
+            Assert.AreEqual(1, properties.Count);
+
+            var pipelineProperty = properties.First();
+            Assert.AreEqual(typeof(ClientPipeline), pipelineProperty.Type.FrameworkType);
+            Assert.AreEqual("Pipeline", pipelineProperty.Name);
+            Assert.AreEqual(MethodSignatureModifiers.Public, pipelineProperty.Modifiers);
+        }
+
+        [TestCaseSource(nameof(BuildFieldsTestCases))]
+        public void TestBuildFields(List<InputParameter> inputParameters, List<ExpectedFieldProvider> expectedFields)
+        {
+            var client = InputFactory.Client(TestClientName, parameters: [.. inputParameters]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            AssertHasFields(clientProvider, expectedFields);
+        }
+
+        [TestCaseSource(nameof(BuildAuthFieldsTestCases), Category = KeyAuthCategory)]
+        [TestCaseSource(nameof(BuildAuthFieldsTestCases), Category = OAuth2Category)]
+        [TestCaseSource(nameof(BuildAuthFieldsTestCases), Category = OAuth2CategoryOtherCredType)]
+        [TestCaseSource(nameof(BuildAuthFieldsTestCases), Category = $"{KeyAuthCategory},{OAuth2Category}")]
+        [TestCaseSource(nameof(BuildAuthFieldsTestCases), Category = OnlyUnsupportedAuthCategory)]
+        public void TestBuildAuthFields_WithAuth(List<InputParameter> inputParameters)
+        {
+            var client = InputFactory.Client(TestClientName, parameters: [.. inputParameters]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            if (_hasKeyAuth)
+            {
+                // key auth should have the AuthorizationHeader const field; _keyCredential is no longer stored
+                AssertHasFields(clientProvider, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.Const, new CSharpType(typeof(string)), "AuthorizationHeader"),
+                });
+                // _keyCredential field is no longer on the client (auth handled via AuthenticationPolicy parameter)
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name == "_keyCredential"));
+            }
+            if (_hasOAuth2)
+            {
+                // oauth2 auth should have the _flows field; _tokenProvider is no longer stored
+                AssertHasFields(clientProvider, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.Static | FieldModifiers.ReadOnly, new CSharpType(typeof(Dictionary<string, object>[])), "_flows"),
+                });
+                // _tokenProvider field is no longer on the client (auth handled via AuthenticationPolicy parameter)
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name == "_tokenProvider"));
+            }
+
+            if (_hasOAuth2WithOtherCredType)
+            {
+                // if another cred type other than the SCM type is used, then the client should default to the following fields: _scopes (no _tokenCredential)
+                AssertHasFields(clientProvider, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.Static | FieldModifiers.ReadOnly, new CSharpType(typeof(string[])), "AuthorizationScopes"),
+                });
+                // _tokenCredential field is no longer on the client (auth handled via AuthenticationPolicy parameter)
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name == "_tokenCredential"));
+            }
+
+            if (_hasOnlyUnsupportedAuth)
+            {
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name.Contains("credential", StringComparison.OrdinalIgnoreCase)));
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name.Contains("auth", StringComparison.OrdinalIgnoreCase)));
+            }
+        }
+
+
+        [TestCaseSource(nameof(BuildOAuth2FlowsFieldTestCases))]
+        public void TestBuildOAuth2FlowsField(IEnumerable<InputOAuth2Flow> inputFlows)
+        {
+            var oauth2Auth = new InputOAuth2Auth([.. inputFlows]);
+            Func<InputAuth>? inputAuth = () => new InputAuth(null, oauth2Auth);
+            MockHelpers.LoadMockGenerator(auth: inputAuth);
+
+            var client = InputFactory.Client(TestClientName);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // oauth2 auth should have the _flows field; _tokenProvider is no longer stored on the client
+            AssertHasFields(clientProvider, new List<ExpectedFieldProvider>
+            {
+                new(FieldModifiers.Private | FieldModifiers.Static | FieldModifiers.ReadOnly, new CSharpType(typeof(Dictionary<string, object>[])), "_flows"),
+            });
+            Assert.IsFalse(clientProvider.Fields.Any(f => f.Name == "_tokenProvider"), "_tokenProvider should not be present - auth handled via AuthenticationPolicy parameter");
+
+            // validate the field initialization
+            var testName = TestContext.CurrentContext.Test.Name;
+            Match match = Regex.Match(testName, @"\(([^)]*)\)");
+            string? caseName = null;
+            if (!match.Success)
+            {
+                Assert.Fail("Unable to parse test case name.");
+            }
+            caseName = match.Groups[1].Value;
+
+            var expected = Helpers.GetExpectedFromFile($"{caseName}");
+            ValueExpression? initValue = clientProvider.Fields.FirstOrDefault(f => f.Name == "_flows")?.InitializationValue;
+            Assert.IsNotNull(initValue);
+
+            var actual = initValue?.ToDisplayString();
+            Assert.AreEqual(expected, actual);
+        }
+
+        [TestCaseSource(nameof(BuildAuthFieldsTestCases))]
+        public void TestBuildAuthFields_NoAuth(List<InputParameter> inputParameters)
+        {
+            var client = InputFactory.Client(TestClientName, parameters: [.. inputParameters]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // fields here should not have anything related with auth
+            bool authFieldFound = false;
+            foreach (var field in clientProvider.Fields)
+            {
+                if (field.Name.EndsWith("Credential") || field.Name.Contains("Authorization"))
+                {
+                    authFieldFound = true;
+                }
+            }
+
+            Assert.IsFalse(authFieldFound);
+        }
+
+        // validates the fields are built correctly when a client has sub-clients
+        [TestCaseSource(nameof(SubClientFieldsTestCases), Category = SubClientsCategory)]
+        public void TestBuildFields_WithSubClients(InputClient client, List<ExpectedFieldProvider> expectedFields)
+        {
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            AssertHasFields(clientProvider, expectedFields);
+        }
+
+        // validates the credential fields do not exist within sub-clients
+        [TestCaseSource(nameof(SubClientAuthFieldsTestCases), Category = SubClientsCategory)]
+        [TestCaseSource(nameof(SubClientAuthFieldsTestCases), Category = OnlyUnsupportedAuthCategory)]
+        public void TestBuildAuthFields_WithSubClients_NoAuth(InputClient client)
+        {
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // fields here should not have anything related with auth
+            bool authFieldFound = false;
+            foreach (var field in clientProvider.Fields)
+            {
+                if (field.Name.EndsWith("Credential") || field.Name.Contains("Authorization"))
+                {
+                    authFieldFound = true;
+                }
+            }
+
+            Assert.IsFalse(authFieldFound);
+        }
+
+        // validates the credential fields are built correctly when a client has sub-clients
+        [TestCaseSource(nameof(WithSubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{KeyAuthCategory}")]
+        [TestCaseSource(nameof(WithSubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{OAuth2Category}")]
+        [TestCaseSource(nameof(WithSubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{OAuth2CategoryOtherCredType}")]
+        [TestCaseSource(nameof(WithSubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{KeyAuthCategory},{OAuth2Category}")]
+        public void TestBuildAuthFields_WithSubClients_WithAuth(InputClient client)
+        {
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            if (_hasKeyAuth)
+            {
+                // key auth should have AuthorizationHeader const field; _keyCredential is no longer stored
+                AssertHasFields(clientProvider, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.Const, new CSharpType(typeof(string)), "AuthorizationHeader"),
+                });
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name == "_keyCredential"));
+            }
+            if (_hasOAuth2)
+            {
+                // oauth2 auth should have _flows field; _tokenProvider is no longer stored
+                AssertHasFields(clientProvider, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.Static | FieldModifiers.ReadOnly, new CSharpType(typeof(Dictionary<string, object>[])), "_flows"),
+                });
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name == "_tokenProvider"));
+            }
+            if (_hasOAuth2WithOtherCredType)
+            {
+                AssertHasFields(clientProvider, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.Static | FieldModifiers.ReadOnly, new CSharpType(typeof(string[])), "AuthorizationScopes"),
+                });
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name == "_tokenCredential"));
+            }
+        }
+
+        // validates the credential fields do not exist within sub-clients
+        [TestCaseSource(nameof(SubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{KeyAuthCategory}")]
+        [TestCaseSource(nameof(SubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{OAuth2Category}")]
+        [TestCaseSource(nameof(SubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{OAuth2CategoryOtherCredType}")]
+        [TestCaseSource(nameof(SubClientAuthFieldsTestCases), Category = $"{SubClientsCategory},{KeyAuthCategory},{OAuth2Category}")]
+        [TestCaseSource(nameof(SubClientAuthFieldsTestCases), Category = OnlyUnsupportedAuthCategory)]
+        public void TestBuildAuthFields_SubClients_WithAuth(InputClient client)
+        {
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            if (_hasKeyAuth)
+            {
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name.Equals("_keyCredential")));
+            }
+            if (_hasOAuth2)
+            {
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name.Equals("_flows")));
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name.Equals("_tokenCredential")));
+            }
+            if (_hasOAuth2WithOtherCredType)
+            {
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name.Equals("_tokenCredential")));
+                Assert.IsFalse(clientProvider.Fields.Any(f => f.Name.Equals("AuthorizationScopes")));
+            }
+        }
+
+        [TestCaseSource(nameof(BuildConstructorsTestCases))]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = KeyAuthCategory)]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = OAuth2Category)]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = $"{KeyAuthCategory},{OAuth2Category}")]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = OnlyUnsupportedAuthCategory)]
+        public void TestBuildConstructors_PrimaryConstructor(List<InputParameter> inputParameters)
+        {
+            var client = InputFactory.Client(TestClientName, parameters: [.. inputParameters]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            // The implementation constructors are now INTERNAL (taking AuthenticationPolicy? as first param)
+            var implementationConstructors = constructors.Where(
+                c => c.Signature?.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal).ToArray();
+
+            // There is always exactly 1 internal implementation constructor, regardless of auth type count.
+            // All public credential constructors are pass-throughs to this single implementation constructor.
+            int expectedImplCtorCount = 1;
+            Assert.AreEqual(expectedImplCtorCount, implementationConstructors.Length);
+
+            for (int i = 0; i < implementationConstructors.Length; i++)
+            {
+                ValidatePrimaryConstructor(implementationConstructors[i], inputParameters, i);
+            }
+        }
+
+        [TestCaseSource(nameof(BuildConstructorsTestCases))]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = KeyAuthCategory)]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = OAuth2Category)]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = OAuth2CategoryOtherCredType)]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = $"{KeyAuthCategory},{OAuth2Category}")]
+        [TestCaseSource(nameof(BuildConstructorsTestCases), Category = OnlyUnsupportedAuthCategory)]
+        public void TestBuildConstructors_SecondaryConstructor(List<InputParameter> inputParameters)
+        {
+            var client = InputFactory.Client(TestClientName, parameters: [.. inputParameters]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            var implementationConstructors = constructors.Where(
+                c => c.Signature?.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal).ToArray();
+            var secondaryPublicConstructors = constructors.Where(
+                c => c.Signature?.Initializer != null &&
+                     c.Signature?.Modifiers == MethodSignatureModifiers.Public &&
+                     !IsSettingsConstructor(c) &&
+                     !IsPrimaryPassThroughConstructor(c)).ToArray();
+            var primaryPassThroughConstructors = constructors.Where(IsPrimaryPassThroughConstructor).ToArray();
+
+            // Check if endpoint has a default value
+            var endpointParam = inputParameters.FirstOrDefault(p => p is InputEndpointParameter ep && ep.IsEndpoint);
+            bool hasDefaultEndpoint = endpointParam?.DefaultValue != null;
+
+            // Calculate expected secondary constructor count:
+            // - For only unsupported auth: 0
+            // - For each auth type when endpoint has default value and auth is present: 2 (simple + with options)
+            // - For each auth type when endpoint is required or no auth: 1
+            int expectedSecondaryCtorCount;
+            if (_hasOnlyUnsupportedAuth)
+            {
+                expectedSecondaryCtorCount = 0;
+            }
+            else
+            {
+                int authCount = (_hasKeyAuth ? 1 : 0) + (_hasOAuth2 || _hasOAuth2WithOtherCredType ? 1 : 0);
+                if (authCount == 0)
+                {
+                    // No auth case - just 1 secondary constructor
+                    expectedSecondaryCtorCount = 1;
+                }
+                else if (hasDefaultEndpoint)
+                {
+                    // When endpoint has default value and auth is present, we have 2 constructors per auth type:
+                    // - Client(credential)
+                    // - Client(credential, options)
+                    expectedSecondaryCtorCount = authCount * 2;
+                }
+                else
+                {
+                    // When endpoint is required, we have 1 constructor per auth type
+                    expectedSecondaryCtorCount = authCount;
+                }
+            }
+
+            Assert.AreEqual(expectedSecondaryCtorCount, secondaryPublicConstructors.Length);
+            foreach (var secondaryPublicConstructor in secondaryPublicConstructors)
+            {
+                ValidateSecondaryConstructor(primaryPassThroughConstructors, secondaryPublicConstructor, inputParameters);
+            }
+        }
+
+        [TestCase]
+        public void TestBuildConstructors_ForSubClient_NoAuth()
+        {
+            var clientProvider = new ClientProvider(_animalClient);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            Assert.AreEqual(2, constructors.Count);
+            var internalConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+            Assert.IsNotNull(internalConstructor);
+            // in the no auth case, the ctor no longer has the credentail parameter therefore here we expect 2 parameters.
+            var ctorParams = internalConstructor?.Signature?.Parameters;
+            Assert.AreEqual(2, ctorParams?.Count);
+
+            var mockingConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Protected);
+            Assert.IsNotNull(mockingConstructor);
+        }
+
+        [TestCase(Category = KeyAuthCategory)]
+        [TestCase(Category = OAuth2Category)]
+        public void TestBuildConstructors_ForSubClient_KeyAuthOrOAuth2Auth()
+        {
+            var clientProvider = new ClientProvider(_animalClient);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            Assert.AreEqual(2, constructors.Count);
+            var internalConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+            Assert.IsNotNull(internalConstructor);
+            // when there is only one approach of auth, we still have 2 parameters in the ctor because we should not have auth parameter in sub-client
+            var ctorParams = internalConstructor?.Signature?.Parameters;
+            Assert.AreEqual(2, ctorParams?.Count);
+
+            var mockingConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Protected);
+            Assert.IsNotNull(mockingConstructor);
+        }
+
+        [TestCase(Category = $"{KeyAuthCategory},{OAuth2Category}")]
+        public void TestBuildConstructors_ForSubClient_BothAuth()
+        {
+            var clientProvider = new ClientProvider(_animalClient);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            Assert.AreEqual(2, constructors.Count);
+            var internalConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+            Assert.IsNotNull(internalConstructor);
+            // when we have both auths, we still have 2 parameters in the ctor, because we should not have auth parameters in sub-client
+            var ctorParams = internalConstructor?.Signature?.Parameters;
+            Assert.AreEqual(2, ctorParams?.Count);
+
+            var mockingConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Protected);
+            Assert.IsNotNull(mockingConstructor);
+        }
+
+        /// <summary>
+        /// Tests that when a client has a default endpoint and auth, we generate a simplified constructor
+        /// that accepts auth + options (using the default endpoint).
+        /// This is the pattern: Client(tokenProvider, options) with default endpoint.
+        /// </summary>
+        [TestCase(Category = KeyAuthCategory)]
+        [TestCase(Category = OAuth2Category)]
+        public void TestBuildConstructors_SimplifiedWithOptions_WhenDefaultEndpoint()
+        {
+            var inputParameters = new List<InputParameter>
+            {
+                InputFactory.EndpointParameter(
+                    KnownParameters.Endpoint.Name,
+                    InputPrimitiveType.String,
+                    defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                    scope: InputParameterScope.Client,
+                    isEndpoint: true)
+            };
+            var client = InputFactory.Client(TestClientName, parameters: [.. inputParameters]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            // Get secondary constructors (not primary pass-through, not settings constructor)
+            var secondaryPublicConstructors = constructors.Where(
+                c => c.Signature?.Initializer != null &&
+                     c.Signature?.Modifiers == MethodSignatureModifiers.Public &&
+                     !IsSettingsConstructor(c) &&
+                     !IsPrimaryPassThroughConstructor(c)).ToList();
+
+            // We should have 2 secondary constructors per auth type:
+            // 1. Client(credential) - simple with just auth
+            // 2. Client(credential, options) - simplified with auth + options
+            Assert.AreEqual(2, secondaryPublicConstructors.Count);
+
+            // Verify the settings constructor also exists
+            var settingsConstructor = constructors.FirstOrDefault(IsSettingsConstructor);
+            Assert.IsNotNull(settingsConstructor, "Expected a settings constructor");
+
+            // Verify the simple constructor exists (just auth)
+            var simpleConstructor = secondaryPublicConstructors.FirstOrDefault(c => c.Signature.Parameters.Count == 1);
+            Assert.IsNotNull(simpleConstructor, "Expected a simple constructor with just auth parameter");
+            var simpleCtorParamName = simpleConstructor!.Signature.Parameters[0].Name;
+            Assert.IsTrue(simpleCtorParamName == "credential" || simpleCtorParamName == "tokenProvider",
+                $"Expected auth parameter, got {simpleCtorParamName}");
+
+            // Verify the simplified constructor with options exists (auth + options)
+            var simplifiedWithOptionsConstructor = secondaryPublicConstructors.FirstOrDefault(c => c.Signature.Parameters.Count == 2);
+            Assert.IsNotNull(simplifiedWithOptionsConstructor, "Expected a simplified constructor with auth + options parameters");
+
+            var firstParamName = simplifiedWithOptionsConstructor!.Signature.Parameters[0].Name;
+            Assert.IsTrue(firstParamName == "credential" || firstParamName == "tokenProvider",
+                $"Expected first param to be auth parameter, got {firstParamName}");
+
+            var secondParamName = simplifiedWithOptionsConstructor.Signature.Parameters[1].Name;
+            Assert.AreEqual("options", secondParamName, "Expected second param to be 'options'");
+
+            // Verify the initializer correctly passes the options parameter
+            var initializerArgs = simplifiedWithOptionsConstructor.Signature.Initializer?.Arguments;
+            Assert.IsNotNull(initializerArgs);
+            Assert.AreEqual(3, initializerArgs!.Count, "Initializer should have 3 arguments: endpoint, auth, options");
+
+            // The third argument should be the options parameter reference (not a new instance)
+            // When the options parameter is passed through, it will be a ParameterReferenceExpression
+            var optionsArg = initializerArgs[2];
+            // Verify it's not a NewInstanceExpression (which would indicate a default value is being used)
+            Assert.IsFalse(optionsArg is NewInstanceExpression, "Options argument should be the parameter itself, not a new instance");
+        }
+
+        [TestCase(Category = KeyAuthCategory)]
+        [TestCase(Category = OAuth2Category)]
+        public void TestBuildConstructors_SettingsConstructor()
+        {
+            var inputParameters = new List<InputParameter>
+            {
+                InputFactory.EndpointParameter(
+                    KnownParameters.Endpoint.Name,
+                    InputPrimitiveType.String,
+                    defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                    scope: InputParameterScope.Client,
+                    isEndpoint: true)
+            };
+            var client = InputFactory.Client(TestClientName, parameters: [.. inputParameters]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+            var settingsConstructor = constructors.FirstOrDefault(IsSettingsConstructor);
+            Assert.IsNotNull(settingsConstructor, "Expected a settings constructor");
+
+            // Validate it's public
+            Assert.AreEqual(MethodSignatureModifiers.Public, settingsConstructor!.Signature.Modifiers);
+
+            // Validate it has exactly 1 parameter: settings
+            Assert.AreEqual(1, settingsConstructor.Signature.Parameters.Count);
+            Assert.AreEqual("settings", settingsConstructor.Signature.Parameters[0].Name);
+
+            // Validate it's a pass-through (body is empty)
+            Assert.AreEqual(MethodBodyStatement.Empty, settingsConstructor.BodyStatements);
+
+            // Validate it has a this(...) initializer
+            var initializer = settingsConstructor.Signature.Initializer;
+            Assert.IsNotNull(initializer);
+            Assert.IsFalse(initializer!.IsBase, "Settings constructor should use this() initializer, not base()");
+        }
+
+        [Test]
+        public void TestBuildConstructors_NoSettingsConstructor_WhenNoEndpoint()
+        {
+            // No endpoint parameter — settings constructor should not be generated
+            var client = InputFactory.Client(TestClientName);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+            var settingsConstructor = constructors.FirstOrDefault(IsSettingsConstructor);
+            Assert.IsNull(settingsConstructor, "Settings constructor should not be generated when there is no endpoint");
+        }
+
+        [Test]
+        public void TestBuildConstructors_DeduplicatesParametersBySerializedName()
+        {
+            // Scenario: Client has a parameter with name "indexName" and serializedName "indexName"
+            // An operation has a parameter with name "name" but serializedName "indexName" (renamed via @encodedName)
+            // These should be deduplicated by SerializedName to avoid duplicate fields
+            var clientParameter = InputFactory.PathParameter(
+                "indexName",
+                InputPrimitiveType.String,
+                serializedName: "indexName",
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operationParameterWithRenamedName = InputFactory.PathParameter(
+                "name",
+                InputPrimitiveType.String,
+                serializedName: "indexName",
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var endpointParameter = InputFactory.EndpointParameter(
+                KnownParameters.Endpoint.Name,
+                InputPrimitiveType.String,
+                defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                scope: InputParameterScope.Client,
+                isEndpoint: true);
+
+            var operation = InputFactory.Operation(
+                "TestOperation",
+                parameters: [operationParameterWithRenamedName]);
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("TestMethod", operation)],
+                parameters: [endpointParameter, clientParameter]);
+
+            var clientProvider = new ClientProvider(client);
+            Assert.IsNotNull(clientProvider);
+
+            // Verify the field with the same SerializedName only appears once
+            var fields = clientProvider.Fields;
+            var indexNameFields = fields.Where(f => f.Name == "_indexName" || f.Name == "_name").ToList();
+
+            // Should only have ONE field for the "indexName" serialized name, not two
+            Assert.AreEqual(1, indexNameFields.Count,
+                $"Expected 1 field for serializedName 'indexName', but found {indexNameFields.Count}: {string.Join(", ", indexNameFields.Select(f => f.Name))}");
+
+            // The field should be "_indexName" (from the client parameters, which comes first)
+            Assert.AreEqual("_indexName", indexNameFields[0].Name,
+                "Expected the client parameter field '_indexName' to be used, not the operation parameter field '_name'");
+        }
+
+        [Test]
+        public void TestBuildConstructors_DeduplicatesConstructorParametersBySerializedName()
+        {
+            // Scenario: Create required client-scoped parameters that will become constructor parameters.
+            // We use required non-path/query/header parameters that are client-scoped - these become fields
+            // and their corresponding parameters in the constructor.
+            var clientParameter = InputFactory.QueryParameter(
+                "indexName",
+                InputPrimitiveType.String,
+                serializedName: "indexName",
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operationParameterWithRenamedName = InputFactory.QueryParameter(
+                "name",
+                InputPrimitiveType.String,
+                serializedName: "indexName",
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var endpointParameter = InputFactory.EndpointParameter(
+                KnownParameters.Endpoint.Name,
+                InputPrimitiveType.String,
+                defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                scope: InputParameterScope.Client,
+                isEndpoint: true);
+
+            var operation = InputFactory.Operation(
+                "TestOperation",
+                parameters: [operationParameterWithRenamedName]);
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("TestMethod", operation)],
+                parameters: [endpointParameter, clientParameter]);
+
+            var clientProvider = new ClientProvider(client);
+            Assert.IsNotNull(clientProvider);
+
+            // Verify the underlying parameter deduplication occurred
+            var allClientParameters = clientProvider.GetType()
+                .GetMethod("GetAllClientParameters", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                ?.Invoke(clientProvider, null) as IReadOnlyList<InputParameter>;
+
+            Assert.IsNotNull(allClientParameters, "Could not access GetAllClientParameters method");
+
+            var indexNameParams = allClientParameters!.Where(p =>
+                p.Name == "indexName" || p.Name == "name").ToList();
+
+            // Should only have 1 parameter after deduplication by name
+            Assert.AreEqual(1, indexNameParams.Count,
+                $"Expected 1 parameter after deduplication, but found {indexNameParams.Count}: {string.Join(", ", indexNameParams.Select(p => p.Name))}");
+
+            // Should be the client parameter (first one wins)
+            Assert.AreEqual("indexName", indexNameParams[0].Name,
+                "Expected the client parameter 'indexName' to be preserved after deduplication");
+        }
+
+        // Tests for InitializedBy flag behavior
+
+        [Test]
+        public void TestBuildConstructors_ForSubClient_InitializedByIndividually_HasPublicConstructors()
+        {
+            var endpointParameter = InputFactory.EndpointParameter(
+                KnownParameters.Endpoint.Name,
+                InputPrimitiveType.String,
+                defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                scope: InputParameterScope.Client,
+                isEndpoint: true);
+            var parentClient = InputFactory.Client("ParentClient", parameters: [endpointParameter]);
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                parameters: [endpointParameter],
+                initializedBy: InputClientInitializedBy.Individually);
+
+            MockHelpers.LoadMockGenerator(
+                auth: () => new(new InputApiKeyAuth("mock", null), null),
+                clients: () => [parentClient]);
+
+            var clientProvider = new ClientProvider(subClient);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            // Should have mocking constructor + public constructors
+            var publicConstructors = constructors.Where(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Public).ToList();
+            Assert.IsTrue(publicConstructors.Count > 0, "SubClient with InitializedBy.Individually should have public constructors");
+
+            // Primary public constructor should have auth credential param and chain to internal via this(...)
+            var primaryConstructor = publicConstructors.FirstOrDefault(
+                c => c.Signature?.Parameters.Any(p => p.Name == "options") == true && c.Signature?.Initializer != null);
+            Assert.IsNotNull(primaryConstructor, "SubClient with InitializedBy.Individually should have primary public constructor with initializer");
+
+            // Should have a credential parameter (from the mock api key auth)
+            Assert.IsTrue(primaryConstructor!.Signature.Parameters.Any(p => p.Name == "credential"),
+                "SubClient with InitializedBy.Individually should have credential parameter in public constructor");
+
+            // Should have internal AuthenticationPolicy constructor
+            var internalConstructors = constructors.Where(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Internal).ToList();
+            Assert.IsTrue(internalConstructors.Count > 0, "SubClient with InitializedBy.Individually should have internal constructor");
+            var authPolicyConstructor = internalConstructors.FirstOrDefault(
+                c => c.Signature?.Parameters.Any(p => p.Type.Name == nameof(AuthenticationPolicy)) == true);
+            Assert.IsNotNull(authPolicyConstructor, "SubClient with InitializedBy.Individually should have internal AuthenticationPolicy constructor");
+
+            // Should have a Settings constructor
+            Assert.IsNotNull(clientProvider.ClientSettings, "SubClient with InitializedBy.Individually should have ClientSettings");
+            var settingsConstructor = publicConstructors.FirstOrDefault(
+                c => c.Signature?.Parameters.Count == 1 && c.Signature.Parameters[0].Name == "settings");
+            Assert.IsNotNull(settingsConstructor, "SubClient with InitializedBy.Individually should have Settings constructor");
+
+            var mockingConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Protected);
+            Assert.IsNotNull(mockingConstructor);
+        }
+
+        [Test]
+        public void TestBuildConstructors_ForSubClient_InitializedByParentOnly_HasOnlyInternalConstructor()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                initializedBy: InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                auth: () => new(new InputApiKeyAuth("mock", null), null),
+                clients: () => [parentClient]);
+
+            var clientProvider = new ClientProvider(subClient);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            // Should have mocking constructor + internal constructor only
+            var publicConstructors = constructors.Where(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Public).ToList();
+            Assert.AreEqual(0, publicConstructors.Count, "SubClient with InitializedBy.Parent should not have public constructors");
+
+            var internalConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+            Assert.IsNotNull(internalConstructor, "SubClient with InitializedBy.Parent should have internal constructor");
+
+            var mockingConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Protected);
+            Assert.IsNotNull(mockingConstructor);
+        }
+
+        // Regression test: when the root client takes the endpoint as a hostname string and expands
+        // a server URL template into a Uri, the sub-client must receive that already-resolved Uri from
+        // its parent. The sub-client's internal (parent-initialized) constructor must therefore declare
+        // the endpoint parameter as Uri to match the Uri _endpoint field and the Uri argument the parent
+        // passes, otherwise the generated code fails to compile (CS0029/CS1503).
+        [Test]
+        public void TestBuildConstructors_ForSubClient_StringHostnameEndpoint_UsesUriEndpointParameter()
+        {
+            var endpointParameter = InputFactory.EndpointParameter(
+                KnownParameters.Endpoint.Name,
+                InputPrimitiveType.String,
+                serverUrlTemplate: "https://{endpoint}",
+                scope: InputParameterScope.Client,
+                isEndpoint: true);
+            var parentClient = InputFactory.Client("ParentClient", parameters: [endpointParameter]);
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                parameters: [endpointParameter],
+                initializedBy: InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                auth: () => new(new InputApiKeyAuth("mock", null), null),
+                clients: () => [parentClient]);
+
+            var clientProvider = new ClientProvider(subClient);
+            Assert.IsNotNull(clientProvider);
+
+            // The endpoint field is always Uri.
+            var endpointField = clientProvider.Fields.FirstOrDefault(f => f.Name == "_endpoint");
+            Assert.IsNotNull(endpointField, "Sub-client should have an _endpoint field");
+            Assert.AreEqual(new CSharpType(typeof(Uri)), endpointField!.Type, "_endpoint field should be Uri");
+
+            // The internal constructor used by the parent takes the pipeline as its first parameter.
+            var internalConstructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Internal
+                    && c.Signature.Parameters.Any(p => p.Name == "pipeline"));
+            Assert.IsNotNull(internalConstructor, "Sub-client should have an internal parent-initialization constructor");
+
+            var endpointCtorParam = internalConstructor!.Signature.Parameters
+                .FirstOrDefault(p => p.Name == KnownParameters.Endpoint.Name);
+            Assert.IsNotNull(endpointCtorParam, "Sub-client internal constructor should have an endpoint parameter");
+            Assert.AreEqual(new CSharpType(typeof(Uri)), endpointCtorParam!.Type,
+                "Sub-client internal constructor endpoint parameter should be Uri, not string");
+        }
+
+        [Test]
+        public void TestBuildConstructors_ForSubClient_InitializedByBoth_HasBothConstructors()
+        {
+            var endpointParameter = InputFactory.EndpointParameter(
+                KnownParameters.Endpoint.Name,
+                InputPrimitiveType.String,
+                defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                scope: InputParameterScope.Client,
+                isEndpoint: true);
+            var parentClient = InputFactory.Client("ParentClient", parameters: [endpointParameter]);
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                parameters: [endpointParameter],
+                initializedBy: InputClientInitializedBy.Individually | InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                auth: () => new(new InputApiKeyAuth("mock", null), null),
+                clients: () => [parentClient]);
+
+            var clientProvider = new ClientProvider(subClient);
+
+            Assert.IsNotNull(clientProvider);
+
+            var constructors = clientProvider.Constructors;
+
+            // Should have public constructors
+            var publicConstructors = constructors.Where(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Public).ToList();
+            Assert.IsTrue(publicConstructors.Count > 0, "SubClient with InitializedBy.Individually | Parent should have public constructors");
+
+            // Primary public constructor should have auth credential param and chain to internal via this(...)
+            var primaryConstructor = publicConstructors.FirstOrDefault(
+                c => c.Signature?.Parameters.Any(p => p.Name == "options") == true && c.Signature?.Initializer != null);
+            Assert.IsNotNull(primaryConstructor, "SubClient with InitializedBy.Individually should have primary public constructor with initializer");
+
+            // Should also have internal constructors (sub-client internal + AuthenticationPolicy internal)
+            var internalConstructors = constructors.Where(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Internal).ToList();
+            Assert.IsTrue(internalConstructors.Count > 0, "SubClient with InitializedBy.Individually | Parent should have internal constructor");
+
+            // Should have a Settings constructor
+            Assert.IsNotNull(clientProvider.ClientSettings, "SubClient with InitializedBy.Individually | Parent should have ClientSettings");
+            var settingsConstructor = publicConstructors.FirstOrDefault(
+                c => c.Signature?.Parameters.Count == 1 && c.Signature.Parameters[0].Name == "settings");
+            Assert.IsNotNull(settingsConstructor, "SubClient with InitializedBy.Individually | Parent should have Settings constructor");
+
+            var mockingConstructor = constructors.FirstOrDefault(
+                c => c.Signature?.Modifiers == MethodSignatureModifiers.Protected);
+            Assert.IsNotNull(mockingConstructor);
+        }
+
+        [Test]
+        public void TestBuildMethods_ForParent_InitializedByIndividually_NoSubClientAccessor()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                initializedBy: InputClientInitializedBy.Individually);
+
+            MockHelpers.LoadMockGenerator(
+                clients: () => [parentClient]);
+
+            var parentProvider = new ClientProvider(parentClient);
+
+            Assert.IsNotNull(parentProvider);
+
+            // The parent should NOT have a factory method for the subclient
+            var factoryMethod = parentProvider.Methods.FirstOrDefault(
+                m => m.Signature?.Name == "GetSubClient" || m.Signature?.Name == "GetSubClientClient");
+            Assert.IsNull(factoryMethod, "Parent should not have factory method for subclient with InitializedBy.Individually (without Parent)");
+
+            // The parent should NOT have the caching field for the subclient
+            var cachingField = parentProvider.Fields.FirstOrDefault(f => f.Name == "_cachedSubClient");
+            Assert.IsNull(cachingField, "Parent should not have caching field for subclient with InitializedBy.Individually (without Parent)");
+        }
+
+        [Test]
+        public void TestBuildMethods_ForParent_InitializedByParent_HasSubClientAccessor()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                initializedBy: InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                clients: () => [parentClient]);
+
+            var parentProvider = new ClientProvider(parentClient);
+
+            Assert.IsNotNull(parentProvider);
+
+            // The parent should have a factory method for the subclient
+            var factoryMethod = parentProvider.Methods.FirstOrDefault(
+                m => m.Signature?.Name == "GetSubClient" || m.Signature?.Name == "GetSubClientClient");
+            Assert.IsNotNull(factoryMethod, "Parent should have factory method for subclient with InitializedBy.Parent");
+
+            // The parent should have the caching field for the subclient
+            var cachingField = parentProvider.Fields.FirstOrDefault(f => f.Name == "_cachedSubClient");
+            Assert.IsNotNull(cachingField, "Parent should have caching field for subclient with InitializedBy.Parent");
+        }
+
+        [Test]
+        public void TestBuildMethods_ForParent_InitializedByBoth_HasSubClientAccessor()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                initializedBy: InputClientInitializedBy.Individually | InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                clients: () => [parentClient]);
+
+            var parentProvider = new ClientProvider(parentClient);
+
+            Assert.IsNotNull(parentProvider);
+
+            // The parent should have a factory method for the subclient
+            var factoryMethod = parentProvider.Methods.FirstOrDefault(
+                m => m.Signature?.Name == "GetSubClient" || m.Signature?.Name == "GetSubClientClient");
+            Assert.IsNotNull(factoryMethod, "Parent should have factory method for subclient with InitializedBy.Individually | Parent");
+
+            // The parent should have the caching field for the subclient
+            var cachingField = parentProvider.Fields.FirstOrDefault(f => f.Name == "_cachedSubClient");
+            Assert.IsNotNull(cachingField, "Parent should have caching field for subclient with InitializedBy.Individually | Parent");
+        }
+
+        [Test]
+        public void TestBuildMethods_ForParent_InitializedByBoth_WithSubClientParams_HasParameterizedAccessor()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClientParam = InputFactory.PathParameter("resourceId", InputPrimitiveType.String, scope: InputParameterScope.Client);
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                parameters: [subClientParam],
+                initializedBy: InputClientInitializedBy.Individually | InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                clients: () => [parentClient]);
+
+            var parentProvider = new ClientProvider(parentClient);
+
+            Assert.IsNotNull(parentProvider);
+
+            // The parent should have a factory method for the subclient
+            var factoryMethod = parentProvider.Methods.FirstOrDefault(
+                m => m.Signature?.Name == "GetSubClient" || m.Signature?.Name == "GetSubClientClient");
+            Assert.IsNotNull(factoryMethod, "Parent should have factory method for subclient with parameters");
+
+            // The accessor method should include the subclient's extra parameters
+            Assert.IsNotNull(factoryMethod!.Signature, "Factory method should have a signature");
+            Assert.AreEqual(1, factoryMethod.Signature!.Parameters.Count,
+                "Accessor method should include subclient parameters not present on parent");
+            Assert.AreEqual("resourceId", factoryMethod.Signature.Parameters[0].Name,
+                "Accessor method parameter should be the subclient's extra parameter");
+        }
+
+        [Test]
+        public void TestBuildFields_ForParent_InitializedByBoth_WithSubClientParams_NoCachingField()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClientParam = InputFactory.PathParameter("resourceId", InputPrimitiveType.String, scope: InputParameterScope.Client);
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                parameters: [subClientParam],
+                initializedBy: InputClientInitializedBy.Individually | InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                clients: () => [parentClient]);
+
+            var parentProvider = new ClientProvider(parentClient);
+
+            Assert.IsNotNull(parentProvider);
+
+            // The parent should NOT have a caching field for the subclient when the accessor requires parameters,
+            // since caching is not appropriate when different parameter values produce different client instances.
+            var cachingField = parentProvider.Fields.FirstOrDefault(f => f.Name == "_cachedSubClient");
+            Assert.IsNull(cachingField, "Parent should not have caching field for subclient that has subclient-specific parameters in its accessor");
+        }
+
+        [Test]
+        public void TestBuildMethods_ForParent_InitializedByParentOnly_WithSubClientParams_HasParameterizedAccessor()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClientParam = InputFactory.PathParameter("resourceId", InputPrimitiveType.String, scope: InputParameterScope.Client);
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                parameters: [subClientParam],
+                initializedBy: InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                clients: () => [parentClient]);
+
+            var parentProvider = new ClientProvider(parentClient);
+
+            Assert.IsNotNull(parentProvider);
+
+            // The parent should have a factory method for the subclient
+            var factoryMethod = parentProvider.Methods.FirstOrDefault(
+                m => m.Signature?.Name == "GetSubClient" || m.Signature?.Name == "GetSubClientClient");
+            Assert.IsNotNull(factoryMethod, "Parent should have factory method for subclient with parameters");
+
+            // The accessor method should include the subclient's extra parameters
+            Assert.IsNotNull(factoryMethod!.Signature, "Factory method should have a signature");
+            Assert.AreEqual(1, factoryMethod.Signature!.Parameters.Count,
+                "Accessor method should include subclient parameters not present on parent");
+            Assert.AreEqual("resourceId", factoryMethod.Signature.Parameters[0].Name,
+                "Accessor method parameter should be the subclient's extra parameter");
+        }
+
+        [Test]
+        public void TestBuildFields_ForParent_InitializedByParentOnly_WithSubClientParams_NoCachingField()
+        {
+            var parentClient = InputFactory.Client("ParentClient");
+            var subClientParam = InputFactory.PathParameter("resourceId", InputPrimitiveType.String, scope: InputParameterScope.Client);
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: parentClient,
+                parameters: [subClientParam],
+                initializedBy: InputClientInitializedBy.Parent);
+
+            MockHelpers.LoadMockGenerator(
+                clients: () => [parentClient]);
+
+            var parentProvider = new ClientProvider(parentClient);
+
+            Assert.IsNotNull(parentProvider);
+
+            // The parent should NOT have a caching field for the subclient when the accessor requires parameters,
+            // since caching is not appropriate when different parameter values produce different client instances.
+            var cachingField = parentProvider.Fields.FirstOrDefault(f => f.Name == "_cachedSubClient");
+            Assert.IsNull(cachingField, "Parent should not have caching field for subclient that has subclient-specific parameters in its accessor");
+        }
+
+        private void ValidatePrimaryConstructor(
+            ConstructorProvider primaryPublicConstructor,
+            List<InputParameter> inputParameters,
+            int ctorIndex,
+            [CallerMemberName] string method = "",
+            [CallerFilePath] string filePath = "")
+        {
+            var primaryCtorParams = primaryPublicConstructor?.Signature?.Parameters;
+            // The internal implementation constructor always has 3 parameters: authenticationPolicy, endpoint, options
+            var expectedPrimaryCtorParamCount = 3;
+
+            Assert.AreEqual(expectedPrimaryCtorParamCount, primaryCtorParams?.Count);
+
+            // the first should be authenticationPolicy (AuthenticationPolicy?)
+            var authPolicyParam = primaryCtorParams?[0];
+            Assert.AreEqual("authenticationPolicy", authPolicyParam?.Name);
+            Assert.IsTrue(authPolicyParam?.Type.Equals(new CSharpType(typeof(AuthenticationPolicy), isNullable: true)));
+
+            // the second should be endpoint
+            var endpointParam = primaryCtorParams?[1];
+            Assert.AreEqual(KnownParameters.Endpoint.Name, endpointParam?.Name);
+
+            if (endpointParam?.DefaultValue != null)
+            {
+                var inputEndpointParam = inputParameters
+                    .FirstOrDefault(p => p is InputEndpointParameter endpointParameter && endpointParameter.IsEndpoint);
+                var parsedValue = inputEndpointParam?.DefaultValue?.Value;
+                Assert.AreEqual(Literal(parsedValue), endpointParam?.InitializationValue);
+            }
+
+            // the last parameter should be the options
+            var optionsParam = primaryCtorParams?[^1];
+            Assert.AreEqual("options", optionsParam?.Name);
+
+            // validate the body of the primary ctor
+            var caseName = TestContext.CurrentContext.Test.Properties.Get("caseName");
+            var expected = Helpers.GetExpectedFromFile($"{caseName},{_hasKeyAuth},{_hasOAuth2},{ctorIndex}", method, filePath);
+            var primaryCtorBody = primaryPublicConstructor?.BodyStatements;
+            Assert.IsNotNull(primaryCtorBody);
+            Assert.AreEqual(expected, primaryCtorBody?.ToDisplayString());
+        }
+
+        private void ValidateSecondaryConstructor(
+            IReadOnlyList<ConstructorProvider> primaryConstructors,
+            ConstructorProvider secondaryPublicConstructor,
+            List<InputParameter> inputParameters)
+        {
+            var ctorParams = secondaryPublicConstructor.Signature?.Parameters;
+
+            // secondary ctor should consist of all required parameters + auth parameter (when present)
+            // Additionally, when endpoint has default value and auth is present, there may be
+            // a constructor with auth + options
+            var requiredParams = inputParameters.Where(p => p.IsRequired).ToList();
+            var authParameterCount = _hasSupportedAuth ? 1 : 0;
+
+            // Check if this is the new simplified constructor with options
+            var hasOptionsParam = ctorParams?.Any(p => p.Name == "options") ?? false;
+            var expectedParamCount = requiredParams.Count + authParameterCount + (hasOptionsParam ? 1 : 0);
+            Assert.AreEqual(expectedParamCount, ctorParams?.Count);
+
+            var endpointParam = ctorParams?.FirstOrDefault(p => p.Name == KnownParameters.Endpoint.Name);
+
+            if (requiredParams.Count == 0)
+            {
+                // auth should be the only parameter if endpoint is optional when there is auth
+                if (_hasSupportedAuth)
+                {
+                    var expectedName = ctorParams?[0].Type?.Equals(ClientPipelineProvider.Instance.TokenCredentialType!) == true
+                        ? "tokenProvider"
+                        : "credential";
+                    Assert.AreEqual(expectedName, ctorParams?[0].Name);
+
+                    // If there's an options param, it should be last
+                    if (hasOptionsParam)
+                    {
+                        Assert.AreEqual("options", ctorParams?[^1].Name);
+                    }
+                }
+                else
+                {
+                    // when there is no auth, the ctor should not have parameters
+                    Assert.AreEqual(0, ctorParams?.Count);
+                }
+            }
+            else
+            {
+                // otherwise, it should only consist of the auth parameter
+                Assert.AreEqual(KnownParameters.Endpoint.Name, ctorParams?[0].Name);
+                if (_hasSupportedAuth)
+                {
+                    var expectedName = ctorParams?[1].Type?.Equals(ClientPipelineProvider.Instance.TokenCredentialType!) == true
+                        ? "tokenProvider"
+                        : "credential";
+                    Assert.AreEqual(expectedName, ctorParams?[1].Name);
+                }
+            }
+
+            Assert.AreEqual(MethodBodyStatement.Empty, secondaryPublicConstructor?.BodyStatements);
+
+            // validate the initializer
+            var initializer = secondaryPublicConstructor?.Signature?.Initializer;
+            Assert.NotNull(initializer);
+            Assert.IsTrue(primaryConstructors.Any(pc => pc.Signature.Parameters.Count == initializer?.Arguments.Count));
+        }
+
+        private static bool IsSettingsConstructor(ConstructorProvider c) =>
+            c.Signature?.Initializer != null &&
+            c.Signature?.Modifiers == MethodSignatureModifiers.Public &&
+            c.Signature.Parameters.Any(p => p.Name == "settings");
+
+        /// <summary>
+        /// Identifies the public primary pass-through constructor (calls the internal implementation constructor).
+        /// It is the public constructor that has both an endpoint parameter AND an options parameter.
+        /// Secondary constructors never have both endpoint and options (they have a subset).
+        /// </summary>
+        private static bool IsPrimaryPassThroughConstructor(ConstructorProvider c) =>
+            c.Signature?.Initializer != null &&
+            c.Signature?.Modifiers == MethodSignatureModifiers.Public &&
+            !IsSettingsConstructor(c) &&
+            c.Signature.Parameters.Any(p => p.Name == KnownParameters.Endpoint.Name) &&
+            c.Signature.Parameters.Any(p => p.Name == "options");
+
+        [TestCaseSource(nameof(EndpointParamInitializationValueTestCases))]
+        public void EndpointInitializationValue(InputParameter endpointParameter, ValueExpression? expectedValue)
+        {
+            var client = InputFactory.Client(TestClientName, parameters: [endpointParameter]);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+            // find the endpoint parameter from the primary constructor
+            var primaryConstructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature?.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+            var endpoint = primaryConstructor?.Signature?.Parameters?.FirstOrDefault(p => p.Name == KnownParameters.Endpoint.Name);
+
+            Assert.IsNotNull(endpoint);
+            Assert.AreEqual(expectedValue?.GetType(), endpoint?.InitializationValue?.GetType());
+            if (expectedValue != null)
+            {
+                Assert.IsTrue(endpoint?.InitializationValue is NewInstanceExpression);
+            }
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void TestGetClientOptions(bool isSubClient)
+        {
+            InputClient? parentClient = null;
+            if (isSubClient)
+            {
+                parentClient = InputFactory.Client("parent");
+            }
+
+            var client = InputFactory.Client(TestClientName, parent: parentClient, initializedBy: isSubClient ? InputClientInitializedBy.Parent : InputClientInitializedBy.Individually);
+            var clientProvider = new ClientProvider(client);
+            Assert.IsNotNull(clientProvider);
+
+            if (isSubClient)
+            {
+                Assert.IsNull(clientProvider.ClientOptions);
+            }
+            else
+            {
+                Assert.IsNotNull(clientProvider.ClientOptions);
+            }
+        }
+
+        [TestCaseSource(nameof(SubClientFactoryMethodTestCases), Category = SubClientsCategory)]
+        public void TestSubClientAccessorFactoryMethods(InputClient client, bool hasSubClients)
+        {
+            var clientProvider = new ClientProvider(client);
+            Assert.IsNotNull(clientProvider);
+
+            var methods = clientProvider.Methods;
+            List<MethodProvider> subClientAccessorFactoryMethods = [];
+            foreach (var method in methods)
+            {
+                Assert.IsInstanceOf<ScmMethodProvider>(method);
+                var methodSignature = method.Signature;
+                if (methodSignature != null &&
+                    methodSignature.Name.StartsWith("Get") &&
+                    methodSignature.Modifiers.HasFlag(MethodSignatureModifiers.Public | MethodSignatureModifiers.Virtual))
+                {
+                    subClientAccessorFactoryMethods.Add(method);
+                }
+            }
+
+            if (hasSubClients)
+            {
+                Assert.AreEqual(1, subClientAccessorFactoryMethods.Count);
+                var factoryMethod = subClientAccessorFactoryMethods[0];
+                Assert.AreEqual(0, factoryMethod.Signature?.Parameters.Count);
+
+                // method body should not be empty
+                Assert.AreNotEqual(MethodBodyStatement.Empty, factoryMethod.BodyStatements);
+            }
+            else
+            {
+                Assert.AreEqual(0, subClientAccessorFactoryMethods.Count);
+            }
+        }
+
+        [Test]
+        public void ValidateQueryParamDiff()
+        {
+            MockHelpers.LoadMockGenerator();
+
+            //protocol and convenience methods should have a different type for enum query parameters
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(GetEnumQueryParamClient());
+            Assert.IsNotNull(clientProvider);
+            var methods = clientProvider!.Methods;
+            // all methods should be ScmMethodProvider instances
+            Assert.IsTrue(methods.All(m => m is ScmMethodProvider));
+            //4 methods, sync / async + protocol / convenience
+            Assert.AreEqual(4, methods.Count);
+            //two methods need to have the query parameter as an enum
+            Assert.AreEqual(2, methods.Where(m => m.Signature.Parameters.Any(p => p.Name == "queryParam" && p.Type.Name == "InputEnum")).Count());
+            //two methods need to have the query parameter as an string
+            Assert.AreEqual(2, methods.Where(m => m.Signature.Parameters.Any(p => p.Name == "queryParam" && p.Type.IsFrameworkType && p.Type.FrameworkType == typeof(string))).Count());
+        }
+
+        // Validates that when generateConvenienceMethod is false (i.e. @convenientAPI(false)),
+        [Test]
+        public void ValidateEnumQueryParamWithoutConvenienceMethod()
+        {
+            MockHelpers.LoadMockGenerator();
+
+            var enumType = InputFactory.StringEnum(
+                "InputEnum",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: true);
+            var inputClient = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod(
+                        "test",
+                        InputFactory.Operation(
+                            "Operation",
+                            parameters:
+                            [
+                                InputFactory.QueryParameter(
+                                    "queryParam",
+                                    enumType,
+                                    isRequired: true)
+                            ],
+                            generateConvenienceMethod: false),
+                        parameters:
+                        [
+                            InputFactory.MethodParameter(
+                                "queryParam",
+                                enumType,
+                                isRequired: true,
+                                location: InputRequestLocation.Query)
+                        ])
+                ]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+            Assert.IsNotNull(clientProvider);
+            var methods = clientProvider!.Methods;
+
+            // only protocol methods (sync + async), no convenience methods
+            Assert.AreEqual(2, methods.Count);
+            Assert.IsTrue(methods.All(m => m is ScmMethodProvider));
+
+            Assert.AreEqual(2, methods.Where(m => m.Signature.Parameters.Any(
+                p => p.Name == "queryParam" && p.Type.IsFrameworkType && p.Type.FrameworkType == typeof(string))).Count());
+
+            Assert.AreEqual(0, methods.Where(m => m.Signature.Parameters.Any(
+                p => p.Name == "queryParam" && p.Type.Name == "InputEnum")).Count());
+
+            var enumProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateEnum(enumType);
+            Assert.IsNotNull(enumProvider);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ValidateQueryParamWriterDiff(bool isAsync)
+        {
+            MockHelpers.LoadMockGenerator(
+                createClientCore: (client) => new ValidateQueryParamDiffClientProvider(client, isAsync));
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(GetEnumQueryParamClient());
+            Assert.IsNotNull(clientProvider);
+
+            TypeProviderWriter writer = new(clientProvider!);
+            var codeFile = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(isAsync.ToString()), codeFile.Content);
+        }
+
+        [TestCaseSource(nameof(TestNonBodyRequestParametersInBodyTestCases))]
+        public void TestNonBodyRequestParametersInBodyWriterDiff(InputServiceMethod inputServiceMethod)
+        {
+            var inputClient = InputFactory.Client("testClient", methods: [inputServiceMethod]);
+            MockHelpers.LoadMockGenerator(
+                createClientCore: (client) => new TestNonBodyRequestParametersInBodyDiffClientProvider(inputClient));
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(GetEnumQueryParamClient());
+            Assert.IsNotNull(clientProvider);
+
+            TypeProviderWriter writer = new(clientProvider!);
+            var codeFile = writer.Write();
+            var caseName = TestContext.CurrentContext.Test.Properties.Get("caseName");
+            Assert.AreEqual(Helpers.GetExpectedFromFile($"{caseName}"), codeFile.Content);
+        }
+
+        // This test validates that no public constructors are generated when the client has only unsupported auth
+        [Test]
+        public void ValidateConstructorsWhenUnsupportedAuth()
+        {
+            MockHelpers.LoadMockGenerator(
+                createClientCore: (client) => new UnsupportedAuthClientProvider(client),
+                auth: () => new InputAuth(null, null));
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(InputFactory.Client(TestClientName));
+            Assert.IsNotNull(clientProvider);
+
+            TypeProviderWriter writer = new(clientProvider!);
+            var codeFile = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), codeFile.Content);
+        }
+
+        [Test]
+        public void ValidateMethodSignatureUsesIEnumerable()
+        {
+            MockHelpers.LoadMockGenerator();
+            List<InputMethodParameter> methodParameters = [InputFactory.MethodParameter("arrayParam", InputFactory.Array(InputPrimitiveType.String), isRequired: true, location: InputRequestLocation.Body)];
+            List<InputParameter> parameters = [InputFactory.BodyParameter("arrayParam", InputFactory.Array(InputPrimitiveType.String))];
+            var inputClient = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod(
+                        "Foo",
+                        InputFactory.Operation(
+                            "Foo",
+                            parameters: parameters),
+                        parameters: methodParameters)
+                ]);
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+            Assert.IsNotNull(clientProvider);
+            var convenienceMethod = clientProvider!.Methods.FirstOrDefault(
+                m => m.Signature.Name == "Foo" &&
+                     !m.Signature.Parameters.Any(p => p.Type.Equals(typeof(RequestOptions))));
+            Assert.IsNotNull(convenienceMethod);
+            Assert.AreEqual(new CSharpType(typeof(IEnumerable<string>)), convenienceMethod!.Signature.Parameters[0].Type);
+        }
+
+        [TestCaseSource(nameof(ValidateClientWithSpreadTestCases))]
+        public void ValidateClientWithSpread(InputClient inputClient)
+        {
+            var clientProvider = new ClientProvider(inputClient);
+            var methods = clientProvider.Methods;
+
+            Assert.AreEqual(4, methods.Count);
+
+            var protocolMethods = methods.Where(m => m.Signature.Parameters.Any(p => p.Type.Equals(typeof(BinaryContent)))).ToList();
+            Assert.AreEqual(2, protocolMethods.Count);
+            Assert.AreEqual(2, protocolMethods[0].Signature.Parameters.Count);
+            Assert.AreEqual(2, protocolMethods[1].Signature.Parameters.Count);
+
+            Assert.AreEqual(new CSharpType(typeof(BinaryContent)), protocolMethods[0].Signature.Parameters[0].Type);
+            Assert.AreEqual(new CSharpType(typeof(RequestOptions)), protocolMethods[0].Signature.Parameters[1].Type);
+            Assert.AreEqual(new CSharpType(typeof(BinaryContent)), protocolMethods[1].Signature.Parameters[0].Type);
+            Assert.AreEqual(new CSharpType(typeof(RequestOptions)), protocolMethods[1].Signature.Parameters[1].Type);
+
+            var convenienceMethods = methods.Where(m => m.Signature.Parameters.Any(p => p.Type.Equals(typeof(string)))).ToList();
+            Assert.AreEqual(2, convenienceMethods.Count);
+            Assert.AreEqual(2, convenienceMethods[0].Signature.Parameters.Count);
+
+            Assert.AreEqual(new CSharpType(typeof(string)), convenienceMethods[0].Signature.Parameters[0].Type);
+            Assert.AreEqual("p1", convenienceMethods[0].Signature.Parameters[0].Name);
+        }
+
+        [TestCaseSource(nameof(RequestOptionsParameterInSignatureTestCases))]
+        public void TestRequestOptionsParameterInSignature(InputServiceMethod inputServiceMethod, bool shouldBeOptional, bool hasOptionalParameter)
+        {
+            var client = InputFactory.Client(TestClientName, methods: [inputServiceMethod]);
+            var clientProvider = new ClientProvider(client);
+            var protocolMethods = clientProvider.Methods.Where(m => m.Signature.Parameters.Any(p => p.Type.Name == "RequestOptions")).ToList();
+            var syncMethod = protocolMethods.FirstOrDefault(m => !m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(syncMethod);
+
+            var requestOptionsParameterInSyncMethod = syncMethod!.Signature.Parameters.FirstOrDefault(p => p.Type.Name == "RequestOptions");
+            Assert.IsNotNull(requestOptionsParameterInSyncMethod);
+            Assert.AreEqual(shouldBeOptional, requestOptionsParameterInSyncMethod!.DefaultValue != null);
+
+            var asyncMethod = protocolMethods.FirstOrDefault(m => m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(asyncMethod);
+
+            var requestOptionsParameterInAsyncMethod = asyncMethod!.Signature.Parameters.FirstOrDefault(p => p.Type.Name == "RequestOptions");
+            Assert.IsNotNull(requestOptionsParameterInAsyncMethod);
+            Assert.AreEqual(shouldBeOptional, requestOptionsParameterInAsyncMethod!.DefaultValue != null);
+
+            // request options should always be last parameter
+            Assert.AreEqual("RequestOptions", syncMethod.Signature.Parameters[^1].Type.Name);
+            Assert.AreEqual("RequestOptions", asyncMethod.Signature.Parameters[^1].Type.Name);
+
+            if (shouldBeOptional)
+            {
+                Assert.IsNotNull(requestOptionsParameterInSyncMethod.DefaultValue);
+                Assert.IsNotNull(requestOptionsParameterInAsyncMethod.DefaultValue);
+            }
+
+            if (shouldBeOptional && hasOptionalParameter)
+            {
+                var optionalParameter = syncMethod.Signature.Parameters[^2];
+                // The optional parameter should be required in protocol method
+                Assert.IsNull(optionalParameter.DefaultValue);
+                // It should also be nullable for value types
+                if (optionalParameter.Type.IsValueType)
+                {
+                    Assert.IsTrue(optionalParameter.Type.IsNullable);
+                }
+            }
+        }
+
+        [Test]
+        public void TestApiVersionOfClient()
+        {
+            List<string> apiVersions = ["1.0", "2.0"];
+            var enumValues = apiVersions.Select(a => (a, a));
+            var inputEnum = InputFactory.StringEnum(
+                "ServiceVersion", enumValues, usage: InputModelTypeUsage.ApiVersionEnum);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => apiVersions,
+                inputEnums: () => [inputEnum]);
+            var client = InputFactory.Client(TestClientName,
+                methods: [
+                    InputFactory.BasicServiceMethod(
+                        "test",
+                        InputFactory.Operation(
+                            "OperationWithApiVersion",
+                            parameters: [InputFactory.QueryParameter("apiVersion", InputPrimitiveType.String, isRequired: true, scope: InputParameterScope.Client, isApiVersion: true)]))
+                ]);
+            var clientProvider = new ClientProvider(client);
+            Assert.IsNotNull(clientProvider);
+
+            /* verify that the client has apiVersion field */
+            Assert.IsNotNull(clientProvider.Fields.FirstOrDefault(f => f.Name.Equals("_apiVersion")));
+
+            /* verify that there is no apiVersion parameter in constructor. */
+            var apiVersionParameter = clientProvider.Constructors.Select(c => c.Signature.Parameters.FirstOrDefault(p => p.Name.Equals("apiVersion"))).FirstOrDefault();
+            Assert.IsNull(apiVersionParameter);
+
+            /* verify the apiVersion assignment in constructor body */
+            var primaryConstructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature?.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+            Assert.IsNotNull(primaryConstructor);
+            var bodyStatements = primaryConstructor?.BodyStatements as MethodBodyStatements;
+            Assert.IsNotNull(bodyStatements);
+            Assert.IsTrue(bodyStatements!.Statements.Any(s => s.ToDisplayString().IndexOf("_apiVersion = options.Version;\n") != -1));
+
+            var method = clientProvider.Methods.FirstOrDefault(m => m.Signature.Name.Equals("OperationWithApiVersion"));
+            Assert.IsNotNull(method);
+            /* verify that the method does not have apiVersion parameter */
+            Assert.IsNull(method?.Signature.Parameters.FirstOrDefault(p => p.Name.Equals("apiVersion")));
+        }
+
+        [TestCaseSource(nameof(ValidateApiVersionPathParameterTestCases))]
+        public void TestApiVersionPathParameterOfClient(InputClient inputClient)
+        {
+            List<string> apiVersions = ["value1", "value2"];
+            var enumValues = apiVersions.Select(a => (a, a));
+            var inputEnum = InputFactory.StringEnum("ServiceVersion", enumValues, usage: InputModelTypeUsage.ApiVersionEnum);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => apiVersions,
+                inputEnums: () => [inputEnum]);
+
+            var clientProvider = new ClientProvider(inputClient);
+            Assert.IsNotNull(clientProvider);
+
+            /* verify that the client has apiVersion field */
+            var apiVersionField = clientProvider.Fields.FirstOrDefault(f => f.Name.Equals("_apiVersion"));
+            Assert.IsNotNull(apiVersionField);
+            Assert.AreEqual(new CSharpType(typeof(string)), apiVersionField?.Type);
+
+            /* verify that there is no apiVersion parameter in constructor. */
+            var apiVersionParameter = clientProvider.Constructors.Select(c => c.Signature.Parameters.FirstOrDefault(p => p.Name.Equals("apiVersion"))).FirstOrDefault();
+            Assert.IsNull(apiVersionParameter);
+
+            /* verify the apiVersion assignment in constructor body */
+            var primaryConstructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature?.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+            Assert.IsNotNull(primaryConstructor);
+            var bodyStatements = primaryConstructor?.BodyStatements as MethodBodyStatements;
+            Assert.IsNotNull(bodyStatements);
+            Assert.IsTrue(bodyStatements!.Statements.Any(s => s.ToDisplayString().IndexOf("_apiVersion = options.Version;\n") != -1));
+
+            var method = clientProvider.Methods.FirstOrDefault(m => m.Signature.Name.Equals("TestOperation"));
+            Assert.IsNotNull(method);
+            /* verify that the method does not have apiVersion parameter */
+            Assert.IsNull(method?.Signature.Parameters.FirstOrDefault(p => p.Name.Equals("apiVersion")));
+        }
+
+        [Test]
+        public void ApiVersionFieldIsStoredOnRootClient()
+        {
+            var rootClient = InputFactory.Client(
+                "RootClient");
+            var subClient = InputFactory.Client(
+                "SubClient",
+                parent: rootClient,
+                initializedBy: InputClientInitializedBy.Parent,
+                parameters:
+                [
+                    InputFactory.PathParameter("apiVersion", InputPrimitiveType.String, isRequired: true, scope: InputParameterScope.Client, isApiVersion: true),
+                    InputFactory.PathParameter("someOtherParameter", InputPrimitiveType.Url, isRequired: true, scope: InputParameterScope.Client)
+                ]);
+
+            MockHelpers.LoadMockGenerator(clients: () => [rootClient]);
+
+            var rootClientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(rootClient);
+            Assert.IsNotNull(rootClientProvider);
+            Assert.IsTrue(rootClientProvider!.Fields.Any(f => f.Name.Equals("_apiVersion")));
+            // Other subclient parameters are not hoisted
+            Assert.IsFalse(rootClientProvider.Fields.Any(f => f.Name.Equals("_someOtherParameter")));
+        }
+
+        [TestCase]
+        public void ClientProviderIsAddedToLibrary()
+        {
+            var mockGenerator = MockHelpers.LoadMockGenerator(
+                clients: () => [InputFactory.Client("test", clientNamespace: "test", doc: "test")]);
+
+            Assert.AreEqual(1, mockGenerator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Count());
+        }
+
+        [TestCase]
+        public void NullClientProviderIsNotAddedToLibrary()
+        {
+            var mockGenerator = MockHelpers.LoadMockGenerator(
+                clients: () => [InputFactory.Client("test", clientNamespace: "test", doc: "test")],
+                createClientCore: (client) => null);
+
+            Assert.IsEmpty(mockGenerator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>());
+        }
+
+        [TestCase]
+        public void ClientProviderSummaryIsPopulated()
+        {
+            var mockGenerator = MockHelpers.LoadMockGenerator(
+                clients: () => [InputFactory.Client("test", clientNamespace: "test", doc: "client description")]);
+
+            var client = mockGenerator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().SingleOrDefault();
+            Assert.IsNotNull(client);
+
+            Assert.AreEqual("/// <summary> client description. </summary>\n", client!.XmlDocs.Summary!.ToDisplayString());
+        }
+
+        [Test]
+        public void ClientProviderSummaryIsPopulatedWithDefaultDocs()
+        {
+            var mockGenerator = MockHelpers.LoadMockGenerator(
+                clients: () => [new InputClient("testClient", @namespace: "test", string.Empty, null, null, false, [], [], null, null, null)]);
+
+            var client = mockGenerator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().SingleOrDefault();
+            Assert.IsNotNull(client);
+
+            Assert.AreEqual("/// <summary> The TestClient. </summary>\n", client!.XmlDocs.Summary!.ToDisplayString());
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void AccessibilityOfMethodMatchesInputOperation(bool isPublic)
+        {
+            MockHelpers.LoadMockGenerator();
+            var access = isPublic ? "public" : "internal";
+            var inputClient = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod(
+                        "Foo",
+                        InputFactory.Operation(
+                            "Foo",
+                            access: access),
+                        access: access)
+                ]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+
+            Assert.IsNotNull(clientProvider);
+            var convenienceMethod = clientProvider!.Methods.FirstOrDefault(
+                m => m.Signature.Name == "Foo" &&
+                     !m.Signature.Parameters.Any(p => p.Type.Equals(typeof(RequestOptions))));
+            Assert.IsNotNull(convenienceMethod);
+
+            var protocolMethod = clientProvider.Methods.FirstOrDefault(
+                m => m.Signature.Name == "Foo" &&
+                     m.Signature.Parameters.Any(p => p.Type.Equals(typeof(RequestOptions))));
+            Assert.IsNotNull(protocolMethod);
+
+            if (isPublic)
+            {
+                Assert.IsTrue(convenienceMethod!.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Public));
+                Assert.IsTrue(protocolMethod!.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Public));
+            }
+            else
+            {
+                Assert.IsFalse(convenienceMethod!.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Public));
+                Assert.IsFalse(protocolMethod!.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Public));
+            }
+        }
+
+        [Test]
+        public void XmlDocsAreWritten()
+        {
+            MockHelpers.LoadMockGenerator(includeXmlDocs: true);
+            var client = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod(
+                        "Foo",
+                        InputFactory.Operation(
+                            name: "Foo",
+                            parameters:
+                            [
+                                InputFactory.QueryParameter(
+                                    "queryParam",
+                                    InputPrimitiveType.String,
+                                    isRequired: true,
+                                    scope: InputParameterScope.Client)
+                            ]),
+                        parameters:
+                        [
+                            InputFactory.MethodParameter(
+                                "queryParam",
+                                InputPrimitiveType.String,
+                                isRequired: true,
+                                location: InputRequestLocation.Query,
+                                scope: InputParameterScope.Client)
+                        ])
+                ]);
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            var writer = new TypeProviderWriter(clientProvider!);
+            var file = writer.Write();
+
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void EndpointFieldAssignedFromUriParameter()
+        {
+            MockHelpers.LoadMockGenerator();
+            var client = InputFactory.Client(
+                TestClientName,
+                parameters: [InputFactory.EndpointParameter(
+                    "endpoint",
+                    InputPrimitiveType.Url,
+                    isRequired: true,
+                    scope: InputParameterScope.Client,
+                    isEndpoint: true)]);
+            var clientProvider = new ClientProvider(client);
+            var constructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+
+            StringAssert.Contains("_endpoint = endpoint;", constructor?.BodyStatements?.ToDisplayString());
+        }
+
+        [TestCase("{endpoint}", "endpoint")]
+        [TestCase("https://{hostName}", "hostName")]
+        public void EndpointFieldAssignedFromStringParameter(string serverTemplate, string parameterName)
+        {
+            MockHelpers.LoadMockGenerator();
+            var client = InputFactory.Client(
+                TestClientName,
+                parameters: [InputFactory.EndpointParameter(
+                    parameterName,
+                    InputPrimitiveType.String,
+                    isRequired: true,
+                    scope: InputParameterScope.Client,
+                    serverUrlTemplate: serverTemplate,
+                    isEndpoint: true)]);
+            var clientProvider = new ClientProvider(client);
+            var constructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+
+            StringAssert.Contains($"_endpoint = new global::System.Uri($\"{serverTemplate}\");", constructor?.BodyStatements?.ToDisplayString());
+        }
+
+        [TestCase("{endpoint}", "endpoint")]
+        [TestCase("http://{hostName}", "hostName")]
+        [TestCase("https://{hostName}", "hostName")]
+        public void EndpointAppliedInCreateMethodRequest(string serverTemplate, string parameterName)
+        {
+            MockHelpers.LoadMockGenerator();
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("Foo", InputFactory.Operation("bar", uri: $"{serverTemplate}/foo"))],
+                parameters: [InputFactory.EndpointParameter(
+                    parameterName,
+                    InputPrimitiveType.String,
+                    isRequired: true,
+                    scope: InputParameterScope.Client,
+                    serverUrlTemplate: serverTemplate,
+                    isEndpoint: true)]);
+            var clientProvider = new ClientProvider(client);
+            var createMethod = clientProvider.RestClient.Methods.FirstOrDefault();
+            StringAssert.Contains($"uri.Reset(_endpoint);", createMethod?.BodyStatements?.ToDisplayString());
+        }
+
+        [Test]
+        public void ListMethodsAreRenamedToGet()
+        {
+            MockHelpers.LoadMockGenerator();
+
+            var inputOperation = InputFactory.Operation(
+                "ListCats");
+
+            var inputServiceMethod = InputFactory.BasicServiceMethod("ListCats", inputOperation);
+
+            var inputClient = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+
+            foreach (var method in client!.Methods)
+            {
+                Assert.IsTrue(method.Signature.Name.StartsWith("Get", StringComparison.OrdinalIgnoreCase));
+            }
+
+            foreach (var method in client.RestClient.Methods)
+            {
+                Assert.IsTrue(method.Signature.Name.Equals("CreateGetCatsRequest", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        [Test]
+        public void ListMethodIsRenamedToGetAll()
+        {
+            MockHelpers.LoadMockGenerator();
+
+            var inputOperation = InputFactory.Operation(
+                "List");
+
+            var inputServiceMethod = InputFactory.BasicServiceMethod("List", inputOperation);
+
+            var inputClient = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+
+            foreach (var method in client!.Methods)
+            {
+                Assert.IsTrue(method.Signature.Name.StartsWith("GetAll", StringComparison.OrdinalIgnoreCase));
+            }
+
+            foreach (var method in client.RestClient.Methods)
+            {
+                Assert.IsTrue(method.Signature.Name.Equals("CreateGetAllRequest", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        [TestCase("GetByResourceGroup", "ListByResourceGroup", false, false)]
+        [TestCase("GetByResourceGroup", "ListByResourceGroup", true, false)]
+        [TestCase("GetByResourceGroup", "ListByResourceGroup", false, true)]
+        [TestCase("GetByResourceGroup", "ListByResourceGroup", true, true)]
+        [TestCase("GetByResourceGroupAsync", "ListByResourceGroup", false, false)]
+        [TestCase("GetByResourceGroupAsync", "ListByResourceGroup", true, false)]
+        [TestCase("GetAll", "List", false, false)]
+        [TestCase("GetAll", "List", true, false)]
+        [TestCase("ListAll", "List", false, false)]
+        [TestCase("ListAll", "List", true, false)]
+        public void ListNormalizationPreservesDistinctRequestBuilders(
+            string getName, string listName, bool reverseOrder, bool exactGetName)
+        {
+            const string collectionPath = "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Azure.ResourceManager.Resources/singletonTrackedResources";
+            var resource = InputFactory.Model("Resource");
+            var page = InputFactory.Model("Page", properties:
+            [
+                InputFactory.Property("value", InputFactory.Array(resource)),
+                InputFactory.Property("nextLink", InputPrimitiveType.String)
+            ]);
+            InputParameter[] operationParameters =
+            [
+                InputFactory.PathParameter("subscriptionId", InputPrimitiveType.String, isRequired: true),
+                InputFactory.PathParameter("resourceGroupName", InputPrimitiveType.String, isRequired: true)
+            ];
+            InputMethodParameter[] methodParameters =
+            [
+                InputFactory.MethodParameter("subscriptionId", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Path),
+                InputFactory.MethodParameter("resourceGroupName", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Path)
+            ];
+            var getOperation = InputFactory.Operation(
+                getName, parameters: operationParameters, path: collectionPath + "/default",
+                responses: [InputFactory.OperationResponse([200], resource)], isExactName: exactGetName);
+            var getMethod = InputFactory.BasicServiceMethod(
+                getName, getOperation, parameters: methodParameters,
+                response: InputFactory.ServiceMethodResponse(resource, null), isExactName: exactGetName);
+            var listOperation = InputFactory.Operation(
+                listName, parameters: operationParameters, path: collectionPath,
+                responses: [InputFactory.OperationResponse([200], page)]);
+            var listMethod = InputFactory.PagingServiceMethod(
+                listName, listOperation, parameters: methodParameters,
+                response: InputFactory.ServiceMethodResponse(page, null),
+                pagingMetadata: InputFactory.NextLinkPagingMetadata(["value"], ["nextLink"], InputResponseLocation.Body));
+            var inputClient = InputFactory.Client(
+                "TestClient", methods: reverseOrder ? [listMethod, getMethod] : [getMethod, listMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient], inputModels: () => [resource, page]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+            var listRestName = getName.EndsWith("Async", StringComparison.Ordinal)
+                ? getName[..^"Async".Length]
+                : listName;
+
+            Assert.AreEqual(getName, getMethod.Name);
+            Assert.AreEqual(listName, listMethod.Name);
+            var getRequest = client.RestClient.GetCreateRequestMethod(getOperation);
+            var listRequest = client.RestClient.GetCreateRequestMethod(listOperation);
+            Assert.AreNotSame(getRequest, listRequest);
+            Assert.AreEqual($"Create{getName}Request", getRequest.Signature.Name);
+            Assert.AreEqual($"Create{listRestName}Request", listRequest.Signature.Name);
+            CollectionAssert.AreEqual(
+                getRequest.Signature.Parameters.Select(parameter => parameter.Type),
+                listRequest.Signature.Parameters.Select(parameter => parameter.Type));
+
+            foreach (var provider in new TypeProvider[] { client, client.RestClient })
+            {
+                var syntax = CSharpSyntaxTree.ParseText(new TypeProviderWriter(provider).Write().Content).GetRoot();
+                var signatures = syntax.DescendantNodes().OfType<MethodDeclarationSyntax>()
+                    .Select(method => (
+                        method.Identifier.ValueText,
+                        Parameters: string.Join(",", method.ParameterList.Parameters.Select(parameter => parameter.Type!.ToString()))))
+                    .ToArray();
+                Assert.AreEqual(signatures.Length, signatures.Distinct().Count());
+            }
+
+            foreach (var request in new[] { getRequest, listRequest })
+            {
+                Assert.Contains(request, client.RestClient.Methods.ToArray());
+                var syntax = CSharpSyntaxTree.ParseText(request.BodyStatements!.ToDisplayString()).GetRoot();
+                var path = string.Concat(syntax.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                    .Where(invocation => invocation.Expression is MemberAccessExpressionSyntax member &&
+                        member.Name.Identifier.ValueText == "AppendPath")
+                    .Select(invocation => invocation.ArgumentList.Arguments[0].Expression)
+                    .OfType<LiteralExpressionSyntax>()
+                    .Select(literal => literal.Token.ValueText));
+                var expectedPath = request == getRequest ? getOperation.Path : listOperation.Path;
+                Assert.AreEqual(expectedPath.Replace("{subscriptionId}", "").Replace("{resourceGroupName}", ""), path);
+            }
+
+            foreach (var method in client.GetMethodCollectionByOperation(getOperation).Where(method => method.Kind == ScmMethodKind.Protocol))
+            {
+                var syntax = CSharpSyntaxTree.ParseText(method.BodyStatements!.ToDisplayString()).GetRoot();
+                var requestCalls = syntax.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                    .Where(invocation => invocation.Expression is MemberAccessExpressionSyntax member &&
+                        member.Name.Identifier.ValueText.StartsWith("Create", StringComparison.Ordinal))
+                    .Select(invocation => ((MemberAccessExpressionSyntax)invocation.Expression).Name.Identifier.ValueText);
+                CollectionAssert.AreEqual(new[] { getRequest.Signature.Name }, requestCalls);
+            }
+
+            var collections = ScmCodeModelGenerator.Instance.OutputLibrary.TypeProviders.OfType<CollectionResultDefinition>().ToArray();
+            Assert.AreEqual(4, collections.Length);
+            foreach (var collection in collections)
+            {
+                var syntax = CSharpSyntaxTree.ParseText(new TypeProviderWriter(collection).Write().Content).GetRoot();
+                var requestCalls = syntax.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                    .Where(invocation => invocation.Expression is MemberAccessExpressionSyntax member &&
+                        member.Name.Identifier.ValueText.StartsWith("Create", StringComparison.Ordinal) &&
+                        member.Name.Identifier.ValueText.EndsWith("Request", StringComparison.Ordinal))
+                    .Select(invocation => ((MemberAccessExpressionSyntax)invocation.Expression).Name.Identifier.ValueText)
+                    .ToArray();
+                CollectionAssert.Contains(requestCalls, listRequest.Signature.Name);
+                CollectionAssert.Contains(requestCalls, $"CreateNext{listRestName}Request");
+                CollectionAssert.DoesNotContain(requestCalls, getRequest.Signature.Name);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ListNormalizationRequestBuildersMatchBaseline(bool reverseOrder)
+        {
+            const string collectionPath = "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Azure.ResourceManager.Resources/singletonTrackedResources";
+            var resource = InputFactory.Model("Resource");
+            var page = InputFactory.Model("Page", properties:
+            [
+                InputFactory.Property("value", InputFactory.Array(resource)),
+                InputFactory.Property("nextLink", InputPrimitiveType.String)
+            ]);
+            InputParameter[] operationParameters =
+            [
+                InputFactory.PathParameter("subscriptionId", InputPrimitiveType.String, isRequired: true),
+                InputFactory.PathParameter("resourceGroupName", InputPrimitiveType.String, isRequired: true)
+            ];
+            InputMethodParameter[] methodParameters =
+            [
+                InputFactory.MethodParameter("subscriptionId", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Path),
+                InputFactory.MethodParameter("resourceGroupName", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Path)
+            ];
+            var getOperation = InputFactory.Operation(
+                "GetByResourceGroup", parameters: operationParameters, path: collectionPath + "/default",
+                responses: [InputFactory.OperationResponse([200], resource)]);
+            var getMethod = InputFactory.BasicServiceMethod(
+                "GetByResourceGroup", getOperation, parameters: methodParameters,
+                response: InputFactory.ServiceMethodResponse(resource, null));
+            var listOperation = InputFactory.Operation(
+                "ListByResourceGroup", parameters: operationParameters, path: collectionPath,
+                responses: [InputFactory.OperationResponse([200], page)]);
+            var listMethod = InputFactory.PagingServiceMethod(
+                "ListByResourceGroup", listOperation, parameters: methodParameters,
+                response: InputFactory.ServiceMethodResponse(page, null),
+                pagingMetadata: InputFactory.NextLinkPagingMetadata(["value"], ["nextLink"], InputResponseLocation.Body));
+            var inputClient = InputFactory.Client(
+                "TestClient", methods: reverseOrder ? [listMethod, getMethod] : [getMethod, listMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient], inputModels: () => [resource, page]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            var syntax = CSharpSyntaxTree.ParseText(new TypeProviderWriter(client.RestClient).Write().Content).GetRoot();
+            var requestBuilders = syntax.DescendantNodes().OfType<MethodDeclarationSyntax>()
+                .Where(method => method.Identifier.ValueText.StartsWith("Create", StringComparison.Ordinal) &&
+                    method.Identifier.ValueText.EndsWith("Request", StringComparison.Ordinal))
+                .OrderBy(method => method.Identifier.ValueText, StringComparer.Ordinal)
+                .ToArray();
+            CollectionAssert.AreEqual(
+                new[] { "CreateGetByResourceGroupRequest", "CreateListByResourceGroupRequest", "CreateNextListByResourceGroupRequest" },
+                requestBuilders.Select(method => method.Identifier.ValueText));
+            var generatedCode = string.Join(Environment.NewLine + Environment.NewLine, requestBuilders.Select(method => method.NormalizeWhitespace().ToFullString()))
+                .ReplaceLineEndings("\n");
+            Assert.AreEqual(Helpers.GetExpectedFromFile().TrimEnd(), generatedCode);
+        }
+
+        [Test]
+        public void ListNormalizationProtocolMethodBodyMatchesBaseline()
+        {
+            var resource = InputFactory.Model("Resource");
+            var page = InputFactory.Model("Page", properties:
+            [
+                InputFactory.Property("value", InputFactory.Array(resource)),
+                InputFactory.Property("nextLink", InputPrimitiveType.String)
+            ]);
+            var getOperation = InputFactory.Operation(
+                "GetWidgets",
+                path: "/widgets/default",
+                responses: [InputFactory.OperationResponse([200], resource)]);
+            var getMethod = InputFactory.BasicServiceMethod(
+                "GetWidgets", getOperation,
+                response: InputFactory.ServiceMethodResponse(resource, null));
+            var listOperation = InputFactory.Operation(
+                "ListWidgets",
+                path: "/widgets",
+                responses: [InputFactory.OperationResponse([200], page)]);
+            var listMethod = InputFactory.PagingServiceMethod(
+                "ListWidgets", listOperation,
+                response: InputFactory.ServiceMethodResponse(page, null),
+                pagingMetadata: InputFactory.NextLinkPagingMetadata(["value"], ["nextLink"], InputResponseLocation.Body));
+            var inputClient = InputFactory.Client("TestClient", methods: [getMethod, listMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient], inputModels: () => [resource, page]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            var protocolMethodBodies = client.GetMethodCollectionByOperation(getOperation)
+                .Where(method => method.Kind == ScmMethodKind.Protocol)
+                .Select(method => method.BodyStatements!.ToDisplayString());
+            var generatedCode = string.Join(Environment.NewLine + Environment.NewLine, protocolMethodBodies).ReplaceLineEndings("\n");
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), generatedCode);
+        }
+
+        [Test]
+        public void ListNormalizationIgnoresUnavailableStreamingMethodName()
+        {
+            var streamType = new InputStreamingType(
+                "Stream", "Sample.Stream", InputPrimitiveType.String, ["application/jsonl"], streamKind: "jsonl");
+            var listOperation = InputFactory.Operation(
+                "ListWidgets",
+                responses: [InputFactory.OperationResponse([200], streamType)],
+                bufferResponse: false);
+            var listMethod = InputFactory.BasicServiceMethod(
+                "ListWidgets", listOperation,
+                response: InputFactory.ServiceMethodResponse(streamType, null));
+            var getOperation = InputFactory.Operation(
+                "GetWidgetsAsync",
+                responses: [InputFactory.OperationResponse([200], streamType)],
+                bufferResponse: false);
+            var getMethod = InputFactory.BasicServiceMethod(
+                "GetWidgetsAsync", getOperation,
+                response: InputFactory.ServiceMethodResponse(streamType, null));
+            var inputClient = InputFactory.Client("TestClient", methods: [listMethod, getMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            Assert.AreEqual("GetWidgets", listMethod.Name);
+            CollectionAssert.AreEquivalent(
+                new[] { "GetWidgetsAsync", "GetWidgetsAsync" },
+                client.GetMethodCollectionByOperation(listOperation).Select(method => method.Signature.Name));
+            CollectionAssert.AreEquivalent(
+                new[] { "GetWidgetsAsyncAsync", "GetWidgetsAsyncAsync" },
+                client.GetMethodCollectionByOperation(getOperation).Select(method => method.Signature.Name));
+        }
+
+        [Test]
+        public void ListNormalizationPreservesLowercaseExactPublicName()
+        {
+            var listOperation = InputFactory.Operation("ListWidgets");
+            var listMethod = InputFactory.BasicServiceMethod("ListWidgets", listOperation);
+            var getOperation = InputFactory.Operation("getWidgetsAsync", isExactName: true);
+            var getMethod = InputFactory.BasicServiceMethod("getWidgetsAsync", getOperation, isExactName: true);
+            var inputClient = InputFactory.Client("TestClient", methods: [listMethod, getMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            Assert.AreEqual("GetWidgets", listMethod.Name);
+            Assert.AreEqual("getWidgetsAsync", getMethod.Name);
+            Assert.AreEqual("CreateGetWidgetsRequest", client.RestClient.GetCreateRequestMethod(listOperation).Signature.Name);
+            Assert.AreEqual("CreateGetWidgetsAsyncRequest", client.RestClient.GetCreateRequestMethod(getOperation).Signature.Name);
+            CollectionAssert.AreEquivalent(
+                new[] { "GetWidgets", "GetWidgetsAsync", "GetWidgets", "GetWidgetsAsync" },
+                client.GetMethodCollectionByOperation(listOperation).Select(method => method.Signature.Name));
+            CollectionAssert.AreEquivalent(
+                new[] { "getWidgetsAsync", "getWidgetsAsyncAsync", "getWidgetsAsync", "getWidgetsAsyncAsync" },
+                client.GetMethodCollectionByOperation(getOperation).Select(method => method.Signature.Name));
+        }
+
+        [Test]
+        public void ListUrlNormalizationUsesProjectedPublicNameForExactAsyncPeer()
+        {
+            var listOperation = InputFactory.Operation("ListUrl");
+            var listMethod = InputFactory.BasicServiceMethod("ListUrl", listOperation);
+            var getOperation = InputFactory.Operation("GetUrlAsync", isExactName: true);
+            var getMethod = InputFactory.BasicServiceMethod("GetUrlAsync", getOperation, isExactName: true);
+            var inputClient = InputFactory.Client("TestClient", methods: [listMethod, getMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            Assert.AreEqual("GetUri", listMethod.Name);
+            Assert.AreEqual("GetUrlAsync", getMethod.Name);
+            Assert.AreEqual("CreateGetUrlRequest", client.RestClient.GetCreateRequestMethod(listOperation).Signature.Name);
+            Assert.AreEqual("CreateGetUrlAsyncRequest", client.RestClient.GetCreateRequestMethod(getOperation).Signature.Name);
+            CollectionAssert.Contains(
+                client.GetMethodCollectionByOperation(listOperation).Select(method => method.Signature.Name).ToArray(),
+                "GetUri");
+            CollectionAssert.Contains(
+                client.GetMethodCollectionByOperation(listOperation).Select(method => method.Signature.Name).ToArray(),
+                "GetUriAsync");
+            CollectionAssert.Contains(
+                client.GetMethodCollectionByOperation(getOperation).Select(method => method.Signature.Name).ToArray(),
+                "GetUrlAsync");
+        }
+
+        [TestCase("GetUri")]
+        [TestCase("GetUriAsync")]
+        public void ListUrlNormalizationFallsBackBeforeUrlProjection(string getName)
+        {
+            var listOperation = InputFactory.Operation("ListUrl");
+            var listMethod = InputFactory.BasicServiceMethod("ListUrl", listOperation);
+            var getOperation = InputFactory.Operation(getName);
+            var getMethod = InputFactory.BasicServiceMethod(getName, getOperation);
+            var inputClient = InputFactory.Client("TestClient", methods: [listMethod, getMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            Assert.AreEqual("GetUrl", listMethod.Name);
+            Assert.AreEqual(getName, getMethod.Name);
+            CollectionAssert.AreEquivalent(
+                new[] { "GetUrl", "GetUrlAsync", "GetUrl", "GetUrlAsync" },
+                client.GetMethodCollectionByOperation(listOperation)
+                    .Select(method => method.Signature.Name)
+                    .Where(name => name.StartsWith("Get", StringComparison.Ordinal)));
+        }
+
+        [Test]
+        public void ListNormalizationPreservesNameWhenNextLinkRequestsCollide()
+        {
+            var resource = InputFactory.Model("Resource");
+            var page = InputFactory.Model("Page", properties:
+            [
+                InputFactory.Property("value", InputFactory.Array(resource)),
+                InputFactory.Property("nextLink", InputPrimitiveType.String)
+            ]);
+            InputServiceMethod CreateMethod(string name, InputType idType, out InputOperation operation)
+            {
+                operation = InputFactory.Operation(
+                    name,
+                    parameters:
+                    [
+                        InputFactory.QueryParameter("id", idType, isRequired: true),
+                        InputFactory.QueryParameter("maxPageSize", InputPrimitiveType.Int32, isRequired: false)
+                    ],
+                    responses: [InputFactory.OperationResponse([200], page)]);
+                return InputFactory.PagingServiceMethod(
+                    name,
+                    operation,
+                    parameters:
+                    [
+                        InputFactory.MethodParameter("id", idType, isRequired: true, location: InputRequestLocation.Query),
+                        InputFactory.MethodParameter("maxPageSize", InputPrimitiveType.Int32, isRequired: false, location: InputRequestLocation.Query)
+                    ],
+                    response: InputFactory.ServiceMethodResponse(page, null),
+                    pagingMetadata: new InputPagingServiceMetadata(
+                        ["value"],
+                        new InputNextLink(null, ["nextLink"], InputResponseLocation.Body, null),
+                        null,
+                        ["maxPageSize"]));
+            }
+
+            var getMethod = CreateMethod("GetWidgets", InputPrimitiveType.String, out var getOperation);
+            var listMethod = CreateMethod("ListWidgets", InputPrimitiveType.Int32, out var listOperation);
+            var inputClient = InputFactory.Client("TestClient", methods: [getMethod, listMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient], inputModels: () => [resource, page]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            Assert.AreEqual("GetWidgets", getMethod.Name);
+            Assert.AreEqual("ListWidgets", listMethod.Name);
+            Assert.AreEqual("CreateNextGetWidgetsRequest", client.RestClient.GetCreateNextLinkRequestMethod(getOperation).Signature.Name);
+            Assert.AreEqual("CreateNextListWidgetsRequest", client.RestClient.GetCreateNextLinkRequestMethod(listOperation).Signature.Name);
+
+            var syntax = CSharpSyntaxTree.ParseText(new TypeProviderWriter(client.RestClient).Write().Content).GetRoot();
+            var signatures = syntax.DescendantNodes().OfType<MethodDeclarationSyntax>()
+                .Select(method => (
+                    method.Identifier.ValueText,
+                    Parameters: string.Join(",", method.ParameterList.Parameters.Select(parameter => parameter.Type!.ToString()))))
+                .ToArray();
+            Assert.AreEqual(signatures.Length, signatures.Distinct().Count());
+        }
+
+        [Test]
+        public void ListNormalizationPreservesNameWhenInitialAndNextLinkRequestsCollide()
+        {
+            var resource = InputFactory.Model("Resource");
+            var page = InputFactory.Model("Page", properties:
+            [
+                InputFactory.Property("value", InputFactory.Array(resource)),
+                InputFactory.Property("nextLink", InputPrimitiveType.Url)
+            ]);
+            var listOperation = InputFactory.Operation(
+                "ListWidgets",
+                responses: [InputFactory.OperationResponse([200], page)]);
+            var listMethod = InputFactory.PagingServiceMethod(
+                "ListWidgets",
+                listOperation,
+                response: InputFactory.ServiceMethodResponse(page, null),
+                pagingMetadata: InputFactory.NextLinkPagingMetadata(["value"], ["nextLink"], InputResponseLocation.Body));
+            var nextOperation = InputFactory.Operation(
+                "NextGetWidgets",
+                parameters: [InputFactory.PathParameter("nextPage", InputPrimitiveType.Url, isRequired: true)],
+                responses: [InputFactory.OperationResponse([200], resource)]);
+            var nextMethod = InputFactory.BasicServiceMethod(
+                "NextGetWidgets",
+                nextOperation,
+                parameters: [InputFactory.MethodParameter("nextPage", InputPrimitiveType.Url, isRequired: true, location: InputRequestLocation.Path)],
+                response: InputFactory.ServiceMethodResponse(resource, null));
+            var inputClient = InputFactory.Client("TestClient", methods: [listMethod, nextMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient], inputModels: () => [resource, page]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            Assert.AreEqual("ListWidgets", listMethod.Name);
+            var initialNextRequest = client.RestClient.GetCreateRequestMethod(nextOperation);
+            var listNextLinkRequest = client.RestClient.GetCreateNextLinkRequestMethod(listOperation);
+            Assert.AreEqual("CreateNextGetWidgetsRequest", initialNextRequest.Signature.Name);
+            Assert.AreEqual("CreateNextListWidgetsRequest", listNextLinkRequest.Signature.Name);
+            Assert.AreNotEqual(initialNextRequest.Signature.Name, listNextLinkRequest.Signature.Name);
+            CollectionAssert.AreEqual(
+                initialNextRequest.Signature.Parameters.Select(parameter => parameter.Type),
+                listNextLinkRequest.Signature.Parameters.Select(parameter => parameter.Type));
+        }
+
+        [Test]
+        public void ListNormalizationPreservesNameWhenRequestBuilderNamesCollide()
+        {
+            var resource = InputFactory.Model("Resource");
+            var page = InputFactory.Model("Page", properties: [InputFactory.Property("value", InputFactory.Array(resource))]);
+            var getOperation = InputFactory.Operation(
+                "GetWidgets", parameters: [InputFactory.QueryParameter("id", InputPrimitiveType.String, isRequired: true)],
+                responses: [InputFactory.OperationResponse([200], resource)]);
+            var getMethod = InputFactory.BasicServiceMethod(
+                "GetWidgets", getOperation,
+                parameters: [InputFactory.MethodParameter("id", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Query)],
+                response: InputFactory.ServiceMethodResponse(resource, null));
+            var listOperation = InputFactory.Operation(
+                "ListWidgets",
+                parameters: [InputFactory.QueryParameter("count", InputPrimitiveType.Int32, isRequired: true)],
+                responses: [InputFactory.OperationResponse([200], page)]);
+            var listMethod = InputFactory.PagingServiceMethod(
+                "ListWidgets", listOperation,
+                parameters: [InputFactory.MethodParameter("count", InputPrimitiveType.Int32, isRequired: true, location: InputRequestLocation.Query)],
+                response: InputFactory.ServiceMethodResponse(page, null),
+                pagingMetadata: InputFactory.PagingMetadata(["value"], null, null));
+            var inputClient = InputFactory.Client("TestClient", methods: [getMethod, listMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient], inputModels: () => [resource, page]);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+
+            Assert.AreEqual("ListWidgets", listMethod.Name);
+            Assert.AreEqual("CreateGetWidgetsRequest", client.RestClient.GetCreateRequestMethod(getOperation).Signature.Name);
+            Assert.AreEqual("CreateListWidgetsRequest", client.RestClient.GetCreateRequestMethod(listOperation).Signature.Name);
+        }
+
+        [Test]
+        public void MethodStartingWithListIsNotRenamedIfNotFullWord()
+        {
+            MockHelpers.LoadMockGenerator();
+
+            var inputOperation = InputFactory.Operation(
+                "Listen");
+
+            var inputServiceMethod = InputFactory.BasicServiceMethod("Listen", inputOperation);
+
+            var inputClient = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient);
+
+            foreach (var method in client!.Methods)
+            {
+                Assert.IsTrue(method.Signature.Name.StartsWith("Listen", StringComparison.OrdinalIgnoreCase));
+            }
+
+            foreach (var method in client.RestClient.Methods)
+            {
+                Assert.IsTrue(method.Signature.Name.Equals("CreateListenRequest", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        private static InputClient GetEnumQueryParamClient()
+        {
+            return InputFactory.Client(
+                        TestClientName,
+                        methods:
+                        [
+                            InputFactory.BasicServiceMethod(
+                        "test",
+                        InputFactory.Operation(
+                            "Operation",
+                            parameters:
+                            [
+                                InputFactory.QueryParameter(
+                                    "queryParam",
+                                    InputFactory.StringEnum(
+                                        "InputEnum",
+                                        [
+                                            ("value1", "value1"),
+                                            ("value2", "value2")
+                                        ],
+                                        usage: InputModelTypeUsage.Input,
+                                        isExtensible: true),
+                                    isRequired: true)
+                            ]),
+                    parameters:
+                    [
+                        InputFactory.MethodParameter(
+                            "queryParam",
+                            InputFactory.StringEnum(
+                                "InputEnum",
+                                [
+                                    ("value1", "value1"),
+                                    ("value2", "value2")
+                                ],
+                                usage: InputModelTypeUsage.Input,
+                                isExtensible: true),
+                            isRequired: true,
+                            location: InputRequestLocation.Query)
+                    ])
+                        ]);
+        }
+
+        private class ValidateQueryParamDiffClientProvider : ClientProvider
+        {
+            private readonly bool _isAsync;
+
+            public ValidateQueryParamDiffClientProvider(InputClient client, bool isAsync = false)
+                : base(client)
+            {
+                _isAsync = isAsync;
+            }
+
+            protected override ScmMethodProvider[] BuildMethods()
+            {
+                var method = base.BuildMethods().First(m => m.Signature.Parameters.Any(p =>
+                    p is { Name: "queryParam", Type.Name: "InputEnum" } &&
+                    ((_isAsync && m.Signature.Name.EndsWith("Async")) || (!_isAsync && !m.Signature.Name.EndsWith("Async")))));
+                method.Update(xmlDocProvider: new XmlDocProvider()); // null out the docs
+                return [method];
+            }
+
+            protected override FieldProvider[] BuildFields() => [];
+            protected override ConstructorProvider[] BuildConstructors() => [];
+            protected override PropertyProvider[] BuildProperties() => [];
+        }
+
+        // This custom client provider is used to validate operations where non-body request parameters are declared within a request body model.
+        private class TestNonBodyRequestParametersInBodyDiffClientProvider : ClientProvider
+        {
+            public TestNonBodyRequestParametersInBodyDiffClientProvider(InputClient client) : base(client) { }
+
+            protected override ScmMethodProvider[] BuildMethods()
+            {
+                var method = base.BuildMethods().First(m => m.Signature.Parameters.Any(p =>
+                    p is { Name: "body" } && m.Signature.Name.EndsWith("Async")));
+                method.Update(xmlDocProvider: new XmlDocProvider());
+                return [method];
+            }
+
+            protected override FieldProvider[] BuildFields() => [];
+            protected override ConstructorProvider[] BuildConstructors() => [];
+            protected override PropertyProvider[] BuildProperties() => [];
+        }
+
+        private class UnsupportedAuthClientProvider : ClientProvider
+        {
+            public UnsupportedAuthClientProvider(InputClient client)
+                : base(client) { }
+
+            protected override ScmMethodProvider[] BuildMethods() => [];
+
+            protected override FieldProvider[] BuildFields() => [];
+            protected override PropertyProvider[] BuildProperties() => [];
+        }
+
+        public static IEnumerable<TestCaseData> BuildAuthFieldsTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(new List<InputParameter>
+                {
+                    InputFactory.EndpointParameter(
+                        "optionalParam",
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client),
+
+                    InputFactory.EndpointParameter(
+                        KnownParameters.Endpoint.Name,
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true)
+                });
+                yield return new TestCaseData(new List<InputParameter>
+                {
+                    // have to explicitly set isRequired because we now call CreateParameter in buildFields
+                    InputFactory.EndpointParameter(
+                        "optionalNullableParam",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("someValue"),
+                        scope: InputParameterScope.Client,
+                        isRequired: false),
+                    InputFactory.EndpointParameter(
+                        "requiredParam2",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("someValue"),
+                        scope: InputParameterScope.Client,
+                        isRequired: true),
+                    InputFactory.EndpointParameter(
+                        "requiredParam3",
+                        InputPrimitiveType.Int64,
+                        defaultValue: InputFactory.Constant.Int64(2),
+                        scope: InputParameterScope.Client,
+                        isRequired: true),
+                    InputFactory.EndpointParameter(
+                        KnownParameters.Endpoint.Name,
+                        InputPrimitiveType.String,
+                        defaultValue: null,
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true)
+                });
+            }
+        }
+
+        public static IEnumerable<TestCaseData> BuildOAuth2FlowsFieldTestCases
+        {
+            get
+            {
+                // all flow properties present
+                yield return new TestCaseData(new List<InputOAuth2Flow>
+                {
+                    new(
+                        ["mockScope1", "mockScope2"],
+                        "mockAuthUrl",
+                        "mockTokenUrl",
+                        "mockRefreshUrl"),
+                }).SetArgDisplayNames(["AllFlowProperties"]);
+
+                // multiple flows
+                yield return new TestCaseData(new List<InputOAuth2Flow>
+                {
+                    new(
+                        ["mockScope1", "mockScope2"],
+                        "mockAuthUrl",
+                        null,
+                        null),
+                    new(
+                        ["mockScope3"],
+                        "mockAuthUrl",
+                        null,
+                        null),
+                     new(
+                        [],
+                        null,
+                        null,
+                        "mockRefreshUrl"),
+                }).SetArgDisplayNames(["MultipleFlows"]);
+
+                // no flow
+                yield return new TestCaseData(new List<InputOAuth2Flow>()).SetArgDisplayNames(["NoFlows"]);
+
+                // no scopes
+                yield return new TestCaseData(new List<InputOAuth2Flow>
+                {
+                    new(
+                        [],
+                        "mockAuthUrl",
+                        null,
+                        null),
+                }).SetArgDisplayNames(["NoScopes"]);
+            }
+        }
+
+        public static IEnumerable<TestCaseData> BuildFieldsTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(new List<InputParameter>
+                {
+                    InputFactory.PathParameter(
+                        "optionalParam",
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client),
+                    InputFactory.EndpointParameter(
+                        KnownParameters.Endpoint.Name,
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true)
+                },
+                new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(Uri)), "_endpoint"),
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(string), true), "_optionalParam")
+                }
+                );
+                yield return new TestCaseData(new List<InputParameter>
+                {
+                    // have to explicitly set isRequired because we now call CreateParameter in buildFields
+                    InputFactory.PathParameter(
+                        "optionalNullableParam",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("someValue"),
+                        scope: InputParameterScope.Client,
+                        isRequired: false),
+                    InputFactory.PathParameter(
+                        "requiredParam2",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("someValue"),
+                        scope: InputParameterScope.Client,
+                        isRequired: true),
+                    InputFactory.PathParameter(
+                        "requiredParam3",
+                        InputPrimitiveType.Int64,
+                        defaultValue: InputFactory.Constant.Int64(2),
+                        scope: InputParameterScope.Client,
+                        isRequired: true),
+                    InputFactory.EndpointParameter(
+                        KnownParameters.Endpoint.Name,
+                        InputPrimitiveType.String,
+                        defaultValue: null,
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true)
+                },
+                new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(Uri)), "_endpoint"),
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(string), true), "_optionalNullableParam"),
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(string), false), "_requiredParam2"),
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(long), false), "_requiredParam3")
+                });
+            }
+        }
+
+        public static IEnumerable<TestCaseData> WithSubClientAuthFieldsTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(InputFactory.Client(TestClientName));
+            }
+        }
+
+        public static IEnumerable<TestCaseData> SubClientAuthFieldsTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(_animalClient);
+                yield return new TestCaseData(_dogClient);
+                yield return new TestCaseData(_huskyClient);
+            }
+        }
+
+        public static IEnumerable<TestCaseData> SubClientFieldsTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(_testClient, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(Uri)), "_endpoint"),
+                    new(FieldModifiers.Private, new ExpectedCSharpType("Animal", "Sample", false), "_cachedAnimal"),
+                });
+                yield return new TestCaseData(_animalClient, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(Uri)), "_endpoint"),
+                    new(FieldModifiers.Private, new ExpectedCSharpType("Dog", "Sample", false), "_cachedDog"),
+                });
+                yield return new TestCaseData(_dogClient, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(Uri)), "_endpoint"),
+                    new(FieldModifiers.Private, new ExpectedCSharpType("Husky", "Sample", false), "_cachedHusky"),
+                });
+                yield return new TestCaseData(_huskyClient, new List<ExpectedFieldProvider>
+                {
+                    new(FieldModifiers.Private | FieldModifiers.ReadOnly, new CSharpType(typeof(Uri)), "_endpoint")
+                });
+            }
+        }
+
+        public static IEnumerable<TestCaseData> ValidateClientWithSpreadTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(InputFactory.Client(
+                    TestClientName,
+                    methods:
+                    [
+                        InputFactory.BasicServiceMethod("test",
+                            InputFactory.Operation(
+                            "CreateMessage",
+                            parameters:
+                            [
+                                InputFactory.BodyParameter(
+                                    "spread",
+                                    _spreadModel,
+                                    isRequired: true,
+                                    scope: InputParameterScope.Spread),
+                            ]),
+                            parameters:  [InputFactory.MethodParameter("p1", InputPrimitiveType.String, scope: InputParameterScope.Spread, isRequired: true)])
+                    ]));
+            }
+        }
+
+        public static IEnumerable<TestCaseData> SubClientFactoryMethodTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(_testClient, true);
+                yield return new TestCaseData(_animalClient, true);
+                yield return new TestCaseData(_dogClient, true);
+                yield return new TestCaseData(_huskyClient, false);
+            }
+        }
+
+        public static IEnumerable<TestCaseData> BuildConstructorsTestCases
+        {
+            get
+            {
+                yield return new TestCaseData(new List<InputParameter>
+                {
+                    InputFactory.PathParameter(
+                        "optionalParam",
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client),
+                    InputFactory.EndpointParameter(
+                        KnownParameters.Endpoint.Name,
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("someValue"),
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true)
+                }).SetProperty("caseName", "WithDefault");
+                // scenario where endpoint is required
+                yield return new TestCaseData(new List<InputParameter>
+                {
+                    InputFactory.EndpointParameter(
+                        KnownParameters.Endpoint.Name,
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client,
+                        isRequired: true,
+                        isEndpoint: true),
+                    InputFactory.PathParameter(
+                        "optionalParam",
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client)
+                }).SetProperty("caseName", "WithRequired");
+            }
+        }
+
+        public static IEnumerable<TestCaseData> TestNonBodyRequestParametersInBodyTestCases
+        {
+            get
+            {
+                // header parameter in body
+                yield return new TestCaseData(InputFactory.BasicServiceMethod(
+                    "TestServiceMethod",
+                    InputFactory.Operation(
+                        "TestOperation",
+                        parameters:
+                        [
+                            InputFactory.BodyParameter(
+                                "body",
+                                InputFactory.Model(
+                                    "ModelWithHeader",
+                                    properties:
+                                    [
+                                        InputFactory.Property("foo", InputPrimitiveType.String, isRequired: true, isHttpMetadata: true),
+                                        InputFactory.Property("bar", InputPrimitiveType.Int32, isRequired: true)
+                                    ]),
+                                isRequired: true),
+                            InputFactory.HeaderParameter("foo", InputPrimitiveType.String, isRequired: true),
+                        ]),
+                    parameters:
+                    [
+                        InputFactory.MethodParameter(
+                            "body",
+                            InputFactory.Model(
+                                "ModelWithHeader",
+                                properties:
+                                [
+                                    InputFactory.Property("foo", InputPrimitiveType.String, isRequired: true, isHttpMetadata: true),
+                                    InputFactory.Property("bar", InputPrimitiveType.Int32, isRequired: true)
+                                ]),
+                            location: InputRequestLocation.Body, isRequired: true)]
+                    )).SetProperty("caseName", "WithHeaderInRequestBody");
+
+                // query parameter in body
+                yield return new TestCaseData(InputFactory.BasicServiceMethod(
+                    "TestServiceMethod",
+                    InputFactory.Operation(
+                        "TestOperation",
+                        parameters:
+                        [
+                            InputFactory.BodyParameter(
+                                "body",
+                                InputFactory.Model(
+                                    "ModelWithQuery",
+                                    properties:
+                                    [
+                                        InputFactory.Property("foo", InputPrimitiveType.String, isRequired: true, isHttpMetadata: true),
+                                        InputFactory.Property("bar", InputPrimitiveType.Int32, isRequired: true)
+                                    ]),
+                                isRequired: true),
+                            InputFactory.QueryParameter("foo", InputPrimitiveType.String, isRequired: true),
+                        ]),
+                    parameters:
+                    [
+                        InputFactory.MethodParameter(
+                            "body",
+                            InputFactory.Model(
+                                "ModelWithQuery",
+                                properties:
+                                [
+                                    InputFactory.Property("foo", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                    InputFactory.Property("bar", InputPrimitiveType.Int32, isRequired: true)
+                                ]),
+                            location: InputRequestLocation.Body, isRequired: true)]
+                    )).SetProperty("caseName", "WithQueryInRequestBody");
+
+                // path parameter in body
+                yield return new TestCaseData(InputFactory.BasicServiceMethod(
+                    "TestServiceMethod",
+                    InputFactory.Operation(
+                        "TestOperation",
+                        parameters:
+                        [
+                            InputFactory.BodyParameter(
+                                "body",
+                                InputFactory.Model(
+                                    "ModelWithPathParam",
+                                    properties:
+                                    [
+                                        InputFactory.Property("foo", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                        InputFactory.Property("bar", InputPrimitiveType.Int32, isRequired: true)
+                                    ]),
+                                isRequired: true),
+                            InputFactory.HeaderParameter("foo", InputPrimitiveType.String, isRequired : true),
+                        ]),
+                    parameters:
+                    [
+                        InputFactory.MethodParameter(
+                            "body",
+                            InputFactory.Model(
+                                "ModelWithPathParam",
+                                properties:
+                                [
+                                    InputFactory.Property("foo", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                    InputFactory.Property("bar", InputPrimitiveType.Int32, isRequired: true)
+                                ]),
+                            location: InputRequestLocation.Body, isRequired: true)]
+                    )).SetProperty("caseName", "WithPathInRequestBody");
+
+                // mixed parameters in body
+                yield return new TestCaseData(InputFactory.BasicServiceMethod(
+                    "TestServiceMethod",
+                    InputFactory.Operation(
+                        "TestOperation",
+                        parameters:
+                        [
+                            InputFactory.BodyParameter(
+                                "body",
+                                InputFactory.Model(
+                                    "ModelWithMixedParams",
+                                    properties:
+                                    [
+                                        InputFactory.Property("cat", InputPrimitiveType.String, isRequired: true, isHttpMetadata: true),
+                                        InputFactory.Property("dog", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                        InputFactory.Property("bird", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                        InputFactory.Property("bar", InputPrimitiveType.Int32, isRequired: true)
+                                    ]),
+                                isRequired: true),
+                            InputFactory.PathParameter("cat", InputPrimitiveType.String, isRequired: true),
+                            InputFactory.QueryParameter("dog", InputPrimitiveType.String, isRequired: true),
+                            InputFactory.HeaderParameter("bird", InputPrimitiveType.String, isRequired: true),
+                        ]),
+                    parameters:
+                    [
+                        InputFactory.MethodParameter(
+                            "body",
+                            InputFactory.Model(
+                                "ModelWithPathParam",
+                                properties:
+                                [
+                                    InputFactory.Property("cat", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                    InputFactory.Property("dog", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                    InputFactory.Property("bird", InputPrimitiveType.String, isRequired : true, isHttpMetadata : true),
+                                ]),
+                            location: InputRequestLocation.Body, isRequired: true)]
+                    )).SetProperty("caseName", "WithMixedParametersInRequestBody");
+            }
+        }
+
+        public static IEnumerable<TestCaseData> RequestOptionsParameterInSignatureTestCases
+        {
+            get
+            {
+                // Protocol & convenience methods will have the same parameters, so RequestOptions should be required.
+                yield return new TestCaseData(
+                InputFactory.BasicServiceMethod(
+                    "TestServiceMethod",
+                    InputFactory.Operation(
+                        "TestOperation",
+                        parameters:
+                        [
+                            InputFactory.QueryParameter(
+                                    "p1",
+                                    InputPrimitiveType.String,
+                                    isRequired: true),
+                                InputFactory.QueryParameter(
+                                    "p2",
+                                    InputPrimitiveType.Int64,
+                                    isRequired: true),
+                        ]),
+                    parameters:
+                    [
+                        InputFactory.MethodParameter(
+                                "p1",
+                                InputPrimitiveType.String,
+                                location: InputRequestLocation.Query,
+                                isRequired: true),
+                            InputFactory.MethodParameter(
+                                "p2",
+                                InputPrimitiveType.Int64,
+                                location: InputRequestLocation.Query,
+                                isRequired: true),
+                    ]), false, false);
+
+                // Protocol & convenience methods will have the same parameters.
+                // One of the parameter is optional, so it should be made required in the protocol method.
+                yield return new TestCaseData(
+                     InputFactory.BasicServiceMethod(
+                        "TestServiceMethod2",
+                        InputFactory.Operation(
+                            "TestOperation2",
+                            parameters:
+                            [
+                                InputFactory.QueryParameter(
+                                    "p1",
+                                    InputPrimitiveType.String,
+                                    isRequired: false),
+                                InputFactory.QueryParameter(
+                                    "p2",
+                                    InputPrimitiveType.Int64,
+                                    isRequired: true),
+                            ]),
+                        parameters:
+                        [
+                            InputFactory.MethodParameter(
+                                "p1",
+                                InputPrimitiveType.String,
+                                location: InputRequestLocation.Query,
+                                isRequired: false),
+                            InputFactory.MethodParameter(
+                                "p2",
+                                InputPrimitiveType.Int64,
+                                location: InputRequestLocation.Query,
+                                isRequired: true),
+                        ]), false, true);
+
+                // Protocol & convenience methods will have the same parameters.
+                // One of the parameter is optional value type, so it should be made nullable required in the protocol method, and RequestOptions can be optional.
+                yield return new TestCaseData(
+                     InputFactory.BasicServiceMethod(
+                        "TestServiceMethod3",
+                        InputFactory.Operation(
+                            "TestOperation3",
+                            parameters:
+                            [
+                                InputFactory.QueryParameter(
+                                    "p1",
+                                    InputPrimitiveType.Int32,
+                                    isRequired: false),
+                                InputFactory.QueryParameter(
+                                    "p2",
+                                    InputPrimitiveType.Int64,
+                                    isRequired: true),
+                            ]),
+                         parameters:
+                        [
+                            InputFactory.MethodParameter(
+                                "p1",
+                                InputPrimitiveType.Int32,
+                                location: InputRequestLocation.Query,
+                                isRequired: false),
+                            InputFactory.MethodParameter(
+                                "p2",
+                                InputPrimitiveType.Int64,
+                                location: InputRequestLocation.Query,
+                                isRequired: true),
+                        ]), false, true);
+
+                // convenience method only has a body param, but it is optional, so RequestOptions should be optional in protocol method.
+                yield return new TestCaseData(
+                     InputFactory.BasicServiceMethod(
+                        "TestServiceMethod",
+                        InputFactory.Operation(
+                            "TestOperation",
+                             parameters:
+                             [
+                                 InputFactory.BodyParameter(
+                                     "p1",
+                                     InputPrimitiveType.String),
+                             ]),
+                        parameters:
+                        [
+                            InputFactory.MethodParameter(
+                                "p1",
+                                InputPrimitiveType.String,
+                                location: InputRequestLocation.Body),
+                        ]), true, true);
+
+                // Protocol & convenience methods will have different parameters since there is a model body param, so RequestOptions should be optional.
+                yield return new TestCaseData(
+                    InputFactory.BasicServiceMethod(
+                        "TestServiceMethod",
+                        InputFactory.Operation(
+                            "TestOperation",
+                           parameters:
+                           [
+                                InputFactory.QueryParameter(
+                                    "p1",
+                                    InputPrimitiveType.String,
+                                    isRequired: true),
+                                InputFactory.BodyParameter(
+                                    "p2",
+                                    InputFactory.Model("SampleModel"),
+                                    isRequired: true),
+                           ]),
+                        parameters:
+                        [
+                            InputFactory.MethodParameter(
+                                "p1",
+                                InputPrimitiveType.String,
+                                location: InputRequestLocation.Query,
+                                isRequired: true),
+                            InputFactory.MethodParameter(
+                                "p2",
+                                InputFactory.Model("SampleModel"),
+                                location: InputRequestLocation.Body,
+                                isRequired: true),
+                        ]), true, false);
+
+                // Protocol & convenience methods will have different parameters but since the body parameter is optional,
+                // the body parameter of the protocol method will be made required, and the request options should remain optional.
+                yield return new TestCaseData(
+                    InputFactory.BasicServiceMethod(
+                        "TestServiceMethod",
+                        InputFactory.Operation(
+                            "TestOperation",
+                            parameters:
+                            [
+                                InputFactory.QueryParameter(
+                                    "p1",
+                                    InputPrimitiveType.String,
+                                    isRequired: true),
+                                InputFactory.BodyParameter(
+                                    "p2",
+                                    InputFactory.Model("SampleModel"),
+                                    isRequired: false),
+                            ]),
+                        parameters:
+                        [
+                            InputFactory.MethodParameter(
+                                "p1",
+                                InputPrimitiveType.String,
+                                location: InputRequestLocation.Query,
+                                isRequired: true),
+                            InputFactory.MethodParameter(
+                                "p2",
+                                InputFactory.Model("SampleModel"),
+                                location: InputRequestLocation.Body,
+                                isRequired: false),
+                        ]), true, true);
+
+
+                // Convenience method has no parameters, RequestOptions should be required in protocol method.
+                yield return new TestCaseData(
+                     InputFactory.BasicServiceMethod(
+                        "TestServiceMethod",
+                        InputFactory.Operation(
+                            "TestOperation",
+                            responses: [InputFactory.OperationResponse([201], InputFactory.Model("testModel"))],
+                            parameters: [])),
+                     false, false);
+            }
+        }
+
+        private static IEnumerable<TestCaseData> EndpointParamInitializationValueTestCases
+        {
+            get
+            {
+                // string primitive type
+                yield return new TestCaseData(
+                    InputFactory.EndpointParameter(
+                        "param",
+                        InputPrimitiveType.String,
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true,
+                        defaultValue: InputFactory.Constant.String("mockValue")),
+                    New.Instance(KnownParameters.Endpoint.Type, Literal("mockvalue")));
+            }
+        }
+
+        private static IEnumerable<TestCaseData> ValidateApiVersionPathParameterTestCases
+        {
+            get
+            {
+                InputEndpointParameter endpointParameter = InputFactory.EndpointParameter(
+                    "endpoint",
+                    InputPrimitiveType.String,
+                    isRequired: true,
+                    scope: InputParameterScope.Client,
+                    isEndpoint: true,
+                    isApiVersion: false);
+
+                InputParameter stringApiVersionParameter = InputFactory.PathParameter(
+                    "apiVersion",
+                    InputPrimitiveType.String,
+                    isRequired: true,
+                    scope: InputParameterScope.Client,
+                    isApiVersion: true);
+
+                InputParameter enumApiVersionParameter = InputFactory.PathParameter(
+                    "apiVersion",
+                    InputFactory.StringEnum(
+                        "InputEnum",
+                        [
+                            ("value1", "value1"),
+                            ("value2", "value2")
+                        ],
+                        usage: InputModelTypeUsage.Input,
+                        isExtensible: true),
+                    isRequired: true,
+                    scope: InputParameterScope.Client,
+                    isApiVersion: true);
+
+                yield return new TestCaseData(
+                    InputFactory.Client(
+                        "TestClient",
+                        methods:
+                        [
+                            InputFactory.BasicServiceMethod(
+                                "test",
+                                InputFactory.Operation("TestOperation", uri: "{endpoint}/{apiVersion}"))
+                        ],
+                        parameters: [endpointParameter, stringApiVersionParameter]));
+
+                yield return new TestCaseData(
+                    InputFactory.Client(
+                        "TestClient",
+                         methods:
+                         [
+                            InputFactory.BasicServiceMethod(
+                                "test",
+                                InputFactory.Operation(
+                                    "TestOperation",
+                                    uri: "{endpoint}/{apiVersion}"))
+                         ],
+                         parameters: [endpointParameter, enumApiVersionParameter]));
+            }
+        }
+
+        private record TestClientPipelineApi : ClientPipelineProvider
+        {
+            private static ClientPipelineApi? _instance;
+            internal new static ClientPipelineApi Instance => _instance ??= new TestClientPipelineApi(Empty);
+
+            public TestClientPipelineApi(ValueExpression original) : base(original)
+            {
+            }
+
+            public override CSharpType TokenCredentialType => typeof(FakeTokenCredential);
+
+            public override ClientPipelineApi FromExpression(ValueExpression expression)
+                => new TestClientPipelineApi(expression);
+
+            public override ValueExpression TokenAuthorizationPolicy(ValueExpression credential, ValueExpression scopes)
+                => Original.Invoke("GetFakeTokenAuthorizationPolicy", [credential, scopes]);
+
+            public override ClientPipelineApi ToExpression() => this;
+        }
+
+        internal class FakeTokenCredential { }
+
+        public record ExpectedCSharpType
+        {
+            public string Name { get; }
+
+            public string Namespace { get; }
+
+            public bool IsFrameworkType { get; }
+
+            public Type FrameworkType => _frameworkType ?? throw new InvalidOperationException();
+
+            public bool IsNullable { get; }
+
+            private readonly Type? _frameworkType;
+
+            public ExpectedCSharpType(Type frameworkType, bool isNullable)
+            {
+                _frameworkType = frameworkType;
+                IsFrameworkType = true;
+                IsNullable = isNullable;
+                Name = frameworkType.Name;
+                Namespace = frameworkType.Namespace!;
+            }
+
+            public ExpectedCSharpType(string name, string ns, bool isNullable)
+            {
+                IsFrameworkType = false;
+                IsNullable = isNullable;
+                Name = name;
+                Namespace = ns;
+            }
+
+            public static implicit operator ExpectedCSharpType(CSharpType type)
+            {
+                if (type.IsFrameworkType)
+                {
+                    return new(type.FrameworkType, type.IsNullable);
+                }
+                else
+                {
+                    return new(type.Name, type.Namespace, type.IsNullable);
+                }
+            }
+        }
+
+        public record ExpectedFieldProvider(FieldModifiers Modifiers, ExpectedCSharpType Type, string Name);
+
+        private static void AssertCSharpTypeAreEqual(ExpectedCSharpType expected, CSharpType type)
+        {
+            if (expected.IsFrameworkType)
+            {
+                Assert.IsTrue(type.IsFrameworkType);
+                Assert.AreEqual(expected.FrameworkType, type.FrameworkType);
+            }
+            else
+            {
+                Assert.IsFalse(type.IsFrameworkType);
+                Assert.AreEqual(expected.Name, type.Name);
+                Assert.AreEqual(expected.Namespace, type.Namespace);
+            }
+            Assert.AreEqual(expected.IsNullable, type.IsNullable);
+        }
+
+        private static void AssertFieldAreEqual(ExpectedFieldProvider expected, FieldProvider field)
+        {
+            Assert.AreEqual(expected.Name, field.Name);
+            AssertCSharpTypeAreEqual(expected.Type, field.Type);
+            Assert.AreEqual(expected.Modifiers, field.Modifiers);
+        }
+
+        private static void AssertHasFields(TypeProvider provider, IReadOnlyList<ExpectedFieldProvider> expectedFields)
+        {
+            var fields = provider.Fields;
+
+            // validate the length of the result
+            Assert.GreaterOrEqual(fields.Count, expectedFields.Count);
+
+            // validate each of them
+            var fieldDict = fields.ToDictionary(f => f.Name);
+            for (int i = 0; i < expectedFields.Count; i++)
+            {
+                var expected = expectedFields[i];
+
+                Assert.IsTrue(fieldDict.TryGetValue(expected.Name, out var actual), $"Field {expected.Name} not present");
+                AssertFieldAreEqual(expected, actual!);
+            }
+        }
+
+        // Date parameter names are normalized (requestDate -> requestOn) on both the protocol and the
+        // convenience surface, so the previously published name is restored consistently for both and the
+        // convenience method forwards every argument positionally. When only one surface is normalized, the
+        // date argument is dropped (passed as null) and the remaining arguments are passed by name.
+        [Test]
+        public async Task BackCompatibility_DateParameterNameIsPreservedInConvenienceCall()
+        {
+            var dateType = new InputDateTimeType(
+                DateTimeKnownEncoding.Rfc7231,
+                "utcDateTime",
+                "TypeSpec.utcDateTime",
+                InputPrimitiveType.String);
+            var operation = InputFactory.Operation(
+                "TestMethod",
+                parameters:
+                [
+                    InputFactory.HeaderParameter("requestDate", dateType),
+                    InputFactory.HeaderParameter("ifMatch", InputPrimitiveType.String)
+                ]);
+            var method = InputFactory.BasicServiceMethod(
+                "TestMethod",
+                operation,
+                parameters:
+                [
+                    InputFactory.MethodParameter("requestDate", dateType, location: InputRequestLocation.Header),
+                    InputFactory.MethodParameter("ifMatch", InputPrimitiveType.String, location: InputRequestLocation.Header)
+                ]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            using var writer = new CodeWriter();
+            foreach (var methodName in new[] { "TestMethod", "TestMethodAsync" })
+            {
+                writer.WriteMethod(clientProvider.Methods
+                    .Single(m => m.Signature.Name == methodName && m is ScmMethodProvider { Kind: ScmMethodKind.Protocol }));
+                writer.WriteMethod(clientProvider.Methods
+                    .Single(m => m.Signature.Name == methodName && m is ScmMethodProvider { Kind: ScmMethodKind.Convenience }));
+            }
+
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), writer.ToString(false));
+        }
+
+        [Test]
+        public async Task BackCompatibility_ProtocolMethodParamOrderChanged()
+        {
+            var param1 = InputFactory.BodyParameter("param1", InputPrimitiveType.String, isRequired: true);
+            var param2 = InputFactory.QueryParameter("param2", InputPrimitiveType.Int32, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                "TestMethod",
+                parameters: [param1, param3, param2]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("TestMethod", operation, parameters: methodParameters);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var methods = clientProvider!.Methods;
+            var protocolMethods = methods
+                .Where(m => m.Signature.Name.StartsWith("TestMethod") && m is ScmMethodProvider { Kind: ScmMethodKind.Protocol })
+                .ToList();
+            Assert.AreEqual(2, protocolMethods.Count);
+
+            // Validate both sync and async methods have the reordered parameters matching the previous contract
+            foreach (var testMethod in protocolMethods)
+            {
+                var parameters = testMethod.Signature.Parameters;
+                // Should have 4 parameters: param1, param2, param3, options
+                Assert.AreEqual(4, parameters.Count);
+                Assert.AreEqual("content", parameters[0].Name);
+                Assert.AreEqual("param2", parameters[1].Name);
+                Assert.AreEqual("param3", parameters[2].Name);
+                Assert.AreEqual("options", parameters[3].Name);
+            }
+
+            // validate the convenience method bodies are updated
+            var convenienceMethods = methods
+                .Where(m => m.Signature.Name.StartsWith("TestMethod") && m is ScmMethodProvider { Kind: ScmMethodKind.Convenience })
+                .ToList();
+            Assert.AreEqual(2, convenienceMethods.Count);
+
+            var syncConvenienceMethod = convenienceMethods
+                .FirstOrDefault(m => !m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(syncConvenienceMethod);
+
+            var body = syncConvenienceMethod!.BodyStatements;
+            Assert.IsNotNull(body);
+
+            var result = body!.ToDisplayString();
+            Assert.AreEqual(
+                "global::Sample.Argument.AssertNotNullOrEmpty(param1, nameof(param1));\n\n" +
+                "using global::System.ClientModel.BinaryContent content = global::System.ClientModel.BinaryContent.Create(global::System.BinaryData.FromString(param1));\n" +
+                "return this.TestMethod(content, param2, param3, cancellationToken.ToRequestOptions());\n",
+                result);
+
+            var asyncConvenienceMethod = convenienceMethods
+                .FirstOrDefault(m => m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(asyncConvenienceMethod);
+
+            body = asyncConvenienceMethod!.BodyStatements;
+            Assert.IsNotNull(body);
+
+            result = body!.ToDisplayString();
+            Assert.AreEqual(
+               "global::Sample.Argument.AssertNotNullOrEmpty(param1, nameof(param1));\n\n" +
+               "using global::System.ClientModel.BinaryContent content = global::System.ClientModel.BinaryContent.Create(global::System.BinaryData.FromString(param1));\n" +
+               "return await this.TestMethodAsync(content, param2, param3, cancellationToken.ToRequestOptions()).ConfigureAwait(false);\n",
+               result);
+        }
+
+        // The rest client is a partial of the same type as its ClientProvider. Back-compatibility must be
+        // applied only once (by the ClientProvider); otherwise the base pass would add duplicate overloads to
+        // the RestClientProvider partial (CS0111). Here the convenience delegation target lives in custom
+        // code shared by both partials, and the last contract published the nullable overload.
+        [Test]
+        public async Task BackCompatibility_RestClientProviderDoesNotDuplicateOverloads()
+        {
+            var enumType = InputFactory.StringEnum(
+                "fileFormatType",
+                [("Document", "Document"), ("Glossary", "Glossary")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: true);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [InputFactory.QueryParameter("type", enumType, isRequired: true)],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            var method = InputFactory.BasicServiceMethod(
+                "GetData",
+                operation,
+                parameters: [InputFactory.MethodParameter("type", enumType, isRequired: true, location: InputRequestLocation.Query)]);
+
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                compilation: async () => await Helpers.GetCompilationFromDirectoryAsync(parameters: "Custom"),
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync(parameters: "Last"));
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+            var restClientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<RestClientProvider>().Single();
+
+            clientProvider.ProcessTypeForBackCompatibility();
+            restClientProvider.ProcessTypeForBackCompatibility();
+
+            static int NullableEnumOverloads(TypeProvider provider) => provider.Methods.Count(m =>
+                m.Signature.Name.StartsWith("GetData")
+                && m.Signature.Parameters.Count >= 1
+                && m.Signature.Parameters[0].Type is { IsValueType: true, IsNullable: true });
+
+            // The sync + async nullable back-compat overloads are added on the ClientProvider only.
+            Assert.AreEqual(2, NullableEnumOverloads(clientProvider));
+            Assert.AreEqual(0, NullableEnumOverloads(restClientProvider), "RestClientProvider must not add duplicate back-compat overloads.");
+
+            // Validate the generated output: the hidden nullable overloads appear on the ClientProvider
+            // partial and are absent from the RestClientProvider partial.
+            var clientFile = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider, name => name is "GetData" or "GetDataAsync")).Write();
+            var restClientFile = new TypeProviderWriter(new FilteredMethodsTypeProvider(restClientProvider, name => name is "GetData" or "GetDataAsync")).Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile("Client"), clientFile.Content);
+            Assert.AreEqual(Helpers.GetExpectedFromFile("RestClient"), restClientFile.Content);
+        }
+
+        [Test]
+        public async Task BackCompatibility_ConvenienceMethodParamOrderChanged()
+        {
+            var param1 = InputFactory.BodyParameter("param1", InputPrimitiveType.String, isRequired: true);
+            var param2 = InputFactory.QueryParameter("param2", InputPrimitiveType.Int32, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, param3, param2],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var methods = clientProvider!.Methods;
+            var convenienceMethods = methods
+                .Where(m => m.Signature.Name.StartsWith("GetData") && m is ScmMethodProvider { Kind: ScmMethodKind.Convenience })
+                .ToList();
+            Assert.AreEqual(2, convenienceMethods.Count);
+
+            // Validate both sync and async methods have the reordered parameters matching the previous contract
+            foreach (var testMethod in convenienceMethods)
+            {
+                var parameters = testMethod.Signature.Parameters;
+                Assert.AreEqual(4, parameters.Count);
+                Assert.AreEqual("param1", parameters[0].Name);
+                Assert.AreEqual("param2", parameters[1].Name);
+                Assert.AreEqual("param3", parameters[2].Name);
+                Assert.AreEqual("cancellationToken", parameters[3].Name);
+            }
+
+            var syncConvenienceMethod = convenienceMethods
+                .FirstOrDefault(m => !m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(syncConvenienceMethod);
+
+            var body = syncConvenienceMethod!.BodyStatements;
+            Assert.IsNotNull(body);
+
+            using var syncWriter = new CodeWriter();
+            syncWriter.WriteMethod(syncConvenienceMethod);
+            Assert.AreEqual(Helpers.GetExpectedFromFile("Sync"), syncWriter.ToString(false));
+
+            var asyncConvenienceMethod = convenienceMethods
+                .FirstOrDefault(m => m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(asyncConvenienceMethod);
+
+            body = asyncConvenienceMethod!.BodyStatements;
+            Assert.IsNotNull(body);
+
+            using var asyncWriter = new CodeWriter();
+            asyncWriter.WriteMethod(asyncConvenienceMethod);
+            Assert.AreEqual(Helpers.GetExpectedFromFile("Async"), asyncWriter.ToString(false));
+        }
+
+        [Test]
+        public async Task BackCompatibility_BothMethodsParamOrderChanged()
+        {
+            var param1 = InputFactory.BodyParameter("param1", InputPrimitiveType.String, isRequired: true);
+            var param2 = InputFactory.QueryParameter("param2", InputPrimitiveType.Int32, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                "UpdateResource",
+                parameters: [param1, param3, param2],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("UpdateResource", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var methods = clientProvider.Methods;
+            var protocolMethods = methods
+                .Where(m => m.Signature.Name.StartsWith("UpdateResource") && m is ScmMethodProvider { Kind: ScmMethodKind.Protocol })
+                .ToList();
+            Assert.AreEqual(2, protocolMethods.Count);
+
+            // Validate both sync and async methods have the reordered parameters matching the previous contract
+            foreach (var testMethod in protocolMethods)
+            {
+                var parameters = testMethod.Signature.Parameters;
+                Assert.AreEqual(4, parameters.Count);
+                Assert.AreEqual("content", parameters[0].Name);
+                Assert.AreEqual("param2", parameters[1].Name);
+                Assert.AreEqual("param3", parameters[2].Name);
+                Assert.AreEqual("options", parameters[3].Name);
+            }
+
+            // validate the convenience method bodies are updated
+            var convenienceMethods = methods
+                .Where(m => m.Signature.Name.StartsWith("UpdateResource") && m is ScmMethodProvider { Kind: ScmMethodKind.Convenience })
+                .ToList();
+            Assert.AreEqual(2, convenienceMethods.Count);
+
+            // Validate both sync and async methods have the reordered parameters matching the previous contract
+            foreach (var testMethod in convenienceMethods)
+            {
+                var parameters = testMethod.Signature.Parameters;
+                Assert.AreEqual(4, parameters.Count);
+                Assert.AreEqual("param1", parameters[0].Name);
+                Assert.AreEqual("param2", parameters[1].Name);
+                Assert.AreEqual("param3", parameters[2].Name);
+                Assert.AreEqual("cancellationToken", parameters[3].Name);
+            }
+
+            var syncConvenienceMethod = convenienceMethods
+                .FirstOrDefault(m => !m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(syncConvenienceMethod);
+
+            var body = syncConvenienceMethod!.BodyStatements;
+            Assert.IsNotNull(body);
+
+            using var syncWriter = new CodeWriter();
+            syncWriter.WriteMethod(syncConvenienceMethod);
+            Assert.AreEqual(Helpers.GetExpectedFromFile("Sync"), syncWriter.ToString(false));
+
+            var asyncConvenienceMethod = convenienceMethods
+                .FirstOrDefault(m => m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async));
+            Assert.IsNotNull(asyncConvenienceMethod);
+
+            body = asyncConvenienceMethod!.BodyStatements;
+            Assert.IsNotNull(body);
+
+            using var asyncWriter = new CodeWriter();
+            asyncWriter.WriteMethod(asyncConvenienceMethod);
+            Assert.AreEqual(Helpers.GetExpectedFromFile("Async"), asyncWriter.ToString(false));
+        }
+
+        [Test]
+        public async Task BackCompatibility_ExactMatchWithCompatibleOverload()
+        {
+            // Set up operation parameters - exact match has string param2, overload has int param2
+            var param1 = InputFactory.BodyParameter("param1", InputPrimitiveType.String, isRequired: true);
+            var param2String = InputFactory.QueryParameter("param2", InputPrimitiveType.String, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                "ProcessData",
+                parameters: [param1, param2String, param3]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.String, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: true),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("ProcessData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var methods = clientProvider.Methods;
+            var processDataMethods = methods
+                .Where(m => m.Signature.Name.StartsWith("ProcessData") && m is ScmMethodProvider)
+                .ToList();
+
+            // Should have 4 methods total: 2 protocol (sync/async) and 2 convenience (sync/async)
+            Assert.AreEqual(4, processDataMethods.Count);
+
+            foreach (var testMethod in processDataMethods)
+            {
+                Assert.IsTrue(testMethod is ScmMethodProvider scmMethod && scmMethod.EnclosingType is ClientProvider);
+            }
+
+            var protocolMethods = processDataMethods
+                .Where(m => m is ScmMethodProvider { Kind: ScmMethodKind.Protocol })
+                .ToList();
+            Assert.AreEqual(2, protocolMethods.Count);
+
+            // Validate that the parameters remained unchanged (exact match found, so no reordering)
+            foreach (var testMethod in protocolMethods)
+            {
+                var parameters = testMethod.Signature.Parameters;
+                Assert.AreEqual(4, parameters.Count);
+                // Should remain in the original order: content, param2 (string), param3, options
+                Assert.AreEqual("content", parameters[0].Name);
+                Assert.AreEqual("param2", parameters[1].Name);
+                Assert.AreEqual(typeof(string), parameters[1].Type.FrameworkType);
+                Assert.AreEqual("param3", parameters[2].Name);
+                Assert.AreEqual("options", parameters[3].Name);
+            }
+
+            // Validate convenience methods also remained unchanged
+            var convenienceMethods = processDataMethods
+                .Where(m => m is ScmMethodProvider { Kind: ScmMethodKind.Convenience })
+                .ToList();
+            Assert.AreEqual(2, convenienceMethods.Count);
+
+            foreach (var testMethod in convenienceMethods)
+            {
+                var parameters = testMethod.Signature.Parameters;
+                Assert.AreEqual(4, parameters.Count);
+                // Should remain in the original order: param1, param2 (string), param3, cancellationToken
+                Assert.AreEqual("param1", parameters[0].Name);
+                Assert.AreEqual("param2", parameters[1].Name);
+                Assert.AreEqual(typeof(string), parameters[1].Type.FrameworkType);
+                Assert.AreEqual("param3", parameters[2].Name);
+                Assert.AreEqual("cancellationToken", parameters[3].Name);
+            }
+        }
+
+        [Test]
+        public async Task BackCompatibility_DuplicateMethodSignatureDoesNotThrow()
+        {
+            var bodyParam1 = InputFactory.BodyParameter("param1", InputPrimitiveType.String, isRequired: true);
+            var bodyParam2 = InputFactory.BodyParameter("param1", InputPrimitiveType.Int32, isRequired: true);
+
+            var operation1 = InputFactory.Operation(
+                "TestMethod",
+                parameters: [bodyParam1]);
+            var operation2 = InputFactory.Operation(
+                "TestMethod",
+                parameters: [bodyParam2]);
+
+            List<InputMethodParameter> methodParameters1 =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+            ];
+            List<InputMethodParameter> methodParameters2 =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.Int32, location: InputRequestLocation.Body, isRequired: true),
+            ];
+
+            var method1 = InputFactory.BasicServiceMethod("TestMethod", operation1, parameters: methodParameters1);
+            var method2 = InputFactory.BasicServiceMethod("TestMethod", operation2, parameters: methodParameters2);
+            var client = InputFactory.Client(TestClientName, methods: [method1, method2]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            // This should not throw even when there are duplicate method signatures
+            Assert.DoesNotThrow(() => clientProvider!.ProcessTypeForBackCompatibility());
+        }
+
+        // Last contract has GetData(int param1, string param2, CancellationToken) (and async).
+        // The current TypeSpec adds a new optional non-body (header) parameter `param3`.
+        // Expected: a hidden back-compat overload matching the previous signature is added that
+        // delegates to the new method, passing default for the new parameter.
+        [Test]
+        public async Task BackCompatibility_NewOptionalNonBodyParameterAdded()
+        {
+            var param1 = InputFactory.QueryParameter("param1", InputPrimitiveType.Int32, isRequired: true);
+            var param2 = InputFactory.BodyParameter("param2", InputPrimitiveType.String, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: false);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, param2, param3],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: false),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider!, name => name == "GetData" || name == "GetDataAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public async Task BackCompatibility_CurrentDocumentationSurvivesClientProcessing()
+        {
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters:
+                [
+                    InputFactory.QueryParameter("param1", InputPrimitiveType.Int32, isRequired: true),
+                    InputFactory.BodyParameter("param2", InputPrimitiveType.String, isRequired: true),
+                    InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean)
+                ],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters:
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header)
+            ]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: () => Helpers.GetCompilationFromDirectoryAsync(method: nameof(BackCompatibility_NewOptionalNonBodyParameterAdded)),
+                configuration: """{"disable-xml-docs": false}""");
+            var provider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+            var originalMethods = provider.Methods.ToArray();
+            foreach (var original in originalMethods.Where(m => m.Signature.Name is "GetData" or "GetDataAsync"))
+            {
+                original.XmlDocs.Update(summary: new XmlDocSummaryStatement([$"Current operation."],
+                    new XmlDocStatement("list", [], new XmlDocStatement("item", [$"Current metadata."]))));
+            }
+            var originalDocs = originalMethods.ToDictionary(m => m, RenderDocs);
+
+            provider.ProcessTypeForBackCompatibility();
+
+            var shims = provider.Methods.Except(originalMethods).ToArray();
+            Assert.AreEqual(2, shims.Length);
+            foreach (var shim in shims)
+            {
+                string rendered = RenderDocs(shim);
+                var docs = XElement.Parse("<member>" + string.Join("\n", rendered.Split('\n')
+                    .Where(line => line.StartsWith("///")).Select(line => line[3..])) + "</member>");
+                Assert.IsNotNull(docs.Element("summary")?.Element("list"));
+                StringAssert.Contains("Current operation.", rendered);
+                Assert.AreEqual(new[] { "param1", "param2", "cancellationToken" },
+                    docs.Elements("param").Select(p => (string?)p.Attribute("name")));
+                Assert.IsTrue(docs.Descendants("paramref").All(p => (string?)p.Attribute("name") != "param3"));
+                Assert.AreEqual(1, shim.Suppressions.Count);
+            }
+            foreach (var original in originalMethods)
+            {
+                Assert.AreEqual(originalDocs[original], RenderDocs(original));
+            }
+
+            static string RenderDocs(MethodProvider method)
+            {
+                using var writer = new CodeWriter();
+                using (writer.WriteXmlDocs(method.XmlDocs))
+                {
+                    return writer.ToString(false);
+                }
+            }
+        }
+
+        // The current TypeSpec adds two new optional non-body parameters relative to the last contract.
+        // Expected: a single back-compat overload matching the previous signature is added that
+        // delegates to the new method, passing default for both new parameters.
+        [Test]
+        public async Task BackCompatibility_MultipleNewOptionalNonBodyParametersAdded()
+        {
+            var param1 = InputFactory.QueryParameter("param1", InputPrimitiveType.Int32, isRequired: true);
+            var param2 = InputFactory.BodyParameter("param2", InputPrimitiveType.String, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: false);
+            var param4 = InputFactory.QueryParameter("param4", InputPrimitiveType.String, isRequired: false);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, param2, param3, param4],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: false),
+                InputFactory.MethodParameter("param4", InputPrimitiveType.String, location: InputRequestLocation.Query, isRequired: false),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider!, name => name == "GetData" || name == "GetDataAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        // Last contract has GetData(int param1, ModelType body, CancellationToken) (and async).
+        // The current TypeSpec adds a new optional non-body (header) parameter `param3`.
+        // Expected: a hidden back-compat overload matching the previous signature is added even when
+        // the method has a model-typed request body.
+        [Test]
+        public async Task BackCompatibility_NewOptionalNonBodyParameterAddedWithModelBody()
+        {
+            var bodyModel = InputFactory.Model(
+                "SampleModel",
+                properties: [InputFactory.Property("name", InputPrimitiveType.String, isRequired: true)]);
+
+            var param1 = InputFactory.QueryParameter("param1", InputPrimitiveType.Int32, isRequired: true);
+            var param2 = InputFactory.BodyParameter("body", bodyModel, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: false);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, param2, param3],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("body", bodyModel, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: false),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider!, name => name == "GetData" || name == "GetDataAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        // When the new parameter is a body parameter, the back-compat overload should NOT be added.
+        // See https://github.com/Azure/azure-sdk-for-net/blob/main/doc/DataPlaneCodeGeneration/ServiceDrivenEvolution.md#a-method-gets-a-new-optional-parameter
+        [Test]
+        public async Task BackCompatibility_NewOptionalBodyParameterDoesNotAddBackCompatOverload()
+        {
+            // Last contract had a GetData(int param2, CancellationToken) method (no body parameter).
+            // Current method adds an optional body parameter `param1`.
+            var param1 = InputFactory.BodyParameter("param1", InputPrimitiveType.String, isRequired: false);
+            var param2 = InputFactory.QueryParameter("param2", InputPrimitiveType.Int32, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, param2],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: false),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider!, name => name == "GetData" || name == "GetDataAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        // When the new parameter is required (not optional), the back-compat overload should NOT be added,
+        // even if it is non-body. Adding such an overload would require us to invent a value for a required
+        // parameter, which would be unsafe.
+        [Test]
+        public async Task BackCompatibility_NewRequiredParameterDoesNotAddBackCompatOverload()
+        {
+            var param1 = InputFactory.BodyParameter("param1", InputPrimitiveType.String, isRequired: true);
+            var param2 = InputFactory.QueryParameter("param2", InputPrimitiveType.Int32, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, param2, param3],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: true),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider!, name => name == "GetData" || name == "GetDataAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        // Last contract has GetData(string itemId, int filter, CancellationToken) (and async) where
+        // itemId is a path parameter, filter is a required query, and a required header is present.
+        // The current TypeSpec adds a new optional query parameter `sort`.
+        // Expected: a hidden back-compat overload matching the previous signature is added even when
+        // the operation mixes path, query, and header parameters.
+        [Test]
+        public async Task BackCompatibility_NewOptionalNonBodyParameterAddedWithPathAndHeaderParameters()
+        {
+            var itemId = InputFactory.PathParameter("itemId", InputPrimitiveType.String, isRequired: true);
+            var filter = InputFactory.QueryParameter("filter", InputPrimitiveType.Int32, isRequired: true);
+            var region = InputFactory.HeaderParameter("region", InputPrimitiveType.String, isRequired: true);
+            var sort = InputFactory.QueryParameter("sort", InputPrimitiveType.String, isRequired: false);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                path: "/items/{itemId}",
+                parameters: [itemId, filter, region, sort],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("itemId", InputPrimitiveType.String, location: InputRequestLocation.Path, isRequired: true),
+                InputFactory.MethodParameter("filter", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("region", InputPrimitiveType.String, location: InputRequestLocation.Header, isRequired: true),
+                InputFactory.MethodParameter("sort", InputPrimitiveType.String, location: InputRequestLocation.Query, isRequired: false),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider!, name => name == "GetData" || name == "GetDataAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        // Verifies that a back-compat overload added by ProcessTypeForBackCompatibility is removed
+        // when the user has explicitly suppressed it via [CodeGenSuppress] in custom code. Without
+        // filtering in ProcessTypeForBackCompatibility, the suppressed overload would be re-introduced
+        // after the FilterAllCustomizedMembers pass, leaking into the generated client.
+        [Test]
+        public async Task BackCompatibility_BackCompatOverloadSuppressedByCustomCode()
+        {
+            // Last contract had a GetData(int param1, string param2, CancellationToken) method.
+            // Current method adds an optional non-body parameter `param3`, which would normally
+            // cause a back-compat overload matching the previous signature to be added.
+            var param1 = InputFactory.QueryParameter("param1", InputPrimitiveType.Int32, isRequired: true);
+            var param2 = InputFactory.BodyParameter("param2", InputPrimitiveType.String, isRequired: true);
+            var param3 = InputFactory.HeaderParameter("param3", InputPrimitiveType.Boolean, isRequired: false);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, param2, param3],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("param2", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("param3", InputPrimitiveType.Boolean, location: InputRequestLocation.Header, isRequired: false),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                compilation: async () => await Helpers.GetCompilationFromDirectoryAsync(parameters: "Custom"),
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync(parameters: "Last"));
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+            Assert.IsNotNull(clientProvider.CustomCodeView);
+
+            clientProvider.ProcessTypeForBackCompatibility();
+
+            // The current spec method has param3, the back-compat overload would NOT have param3.
+            // With the fix, the suppressed back-compat overload should not appear in the methods.
+            var getDataOverloads = clientProvider.Methods
+                .Where(m => m.Signature.Name == "GetData" && !m.Signature.Parameters.Any(p => p.Name == "param3"))
+                .ToList();
+            var getDataAsyncOverloads = clientProvider.Methods
+                .Where(m => m.Signature.Name == "GetDataAsync" && !m.Signature.Parameters.Any(p => p.Name == "param3"))
+                .ToList();
+
+            Assert.AreEqual(0, getDataOverloads.Count, "Back-compat overload of GetData should be suppressed by [CodeGenSuppress] in custom code.");
+            Assert.AreEqual(0, getDataAsyncOverloads.Count, "Back-compat overload of GetDataAsync should be suppressed by [CodeGenSuppress] in custom code.");
+
+            // The current methods (with param3) must still be present.
+            Assert.IsTrue(clientProvider.Methods.Any(m => m.Signature.Name == "GetData" && m.Signature.Parameters.Any(p => p.Name == "param3")));
+            Assert.IsTrue(clientProvider.Methods.Any(m => m.Signature.Name == "GetDataAsync" && m.Signature.Parameters.Any(p => p.Name == "param3")));
+        }
+
+        // Last contract has only protocol methods: GetData(int param1, BinaryContent content, RequestOptions options = null).
+        // The current TypeSpec adds a new optional non-body query parameter "$select" whose raw input name
+        // starts with a reserved character.
+        // Expected: a hidden back-compat protocol overload matching the previous signature is added. The
+        // delegating call body must use the C# variable name ("select") for the named-argument label, not
+        // the raw "$select" name (which would produce invalid C#).
+        [Test]
+        public async Task BackCompatibility_NewOptionalParameterWithReservedName()
+        {
+            var param1 = InputFactory.QueryParameter("param1", InputPrimitiveType.Int32, isRequired: true);
+            var content = InputFactory.BodyParameter("content", InputPrimitiveType.String, isRequired: true);
+            var selectParam = InputFactory.QueryParameter("$select", InputPrimitiveType.String, isRequired: false);
+
+            var operation = InputFactory.Operation(
+                "GetData",
+                parameters: [param1, content, selectParam],
+                responses: [InputFactory.OperationResponse([200], bodytype: InputPrimitiveType.String)]);
+
+            List<InputMethodParameter> methodParameters =
+            [
+                InputFactory.MethodParameter("param1", InputPrimitiveType.Int32, location: InputRequestLocation.Query, isRequired: true),
+                InputFactory.MethodParameter("content", InputPrimitiveType.String, location: InputRequestLocation.Body, isRequired: true),
+                InputFactory.MethodParameter("$select", InputPrimitiveType.String, location: InputRequestLocation.Query, isRequired: false),
+            ];
+
+            var method = InputFactory.BasicServiceMethod("GetData", operation, parameters: [.. methodParameters]);
+            var client = InputFactory.Client(TestClientName, methods: [method]);
+
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().FirstOrDefault();
+            Assert.IsNotNull(clientProvider);
+            Assert.IsNotNull(clientProvider!.LastContractView);
+
+            clientProvider!.ProcessTypeForBackCompatibility();
+
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider!, name => name == "GetData" || name == "GetDataAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void ServerTemplateWithBasePathOnly_DoesNotDuplicateBasePath()
+        {
+            // This tests a scenario where the server template includes a base path:
+            // - serverUrlTemplate = "{endpoint}/contentsafety"
+            // - operation.Uri = "{endpoint}/contentsafety" (same as server template, no additional segments)
+            // - operation.Path = "/text:analyze" (actual operation path)
+            // Expected: Should append both the base path from server template and the operation path
+
+            MockHelpers.LoadMockGenerator();
+
+            var serverTemplate = "{endpoint}/contentsafety";
+            var operation = InputFactory.Operation(
+                name: "AnalyzeText",
+                uri: serverTemplate,
+                path: "/text:analyze",
+                httpMethod: "POST");
+
+            var serviceMethod = InputFactory.BasicServiceMethod("AnalyzeText", operation);
+            var client = InputFactory.Client(
+                "ContentSafety",
+                methods: [serviceMethod],
+                parameters: [InputFactory.EndpointParameter("endpoint", InputPrimitiveType.String, serverUrlTemplate: serverTemplate)]);
+            var clientProvider = new ClientProvider(client);
+            var createRequestMethod = clientProvider.RestClient.Methods.FirstOrDefault(m => m.Signature.Name == "CreateAnalyzeTextRequest");
+            Assert.IsNotNull(createRequestMethod);
+
+            var methodBody = createRequestMethod!.BodyStatements!.ToArray();
+            var bodyText = methodBody.Select(s => s.ToDisplayString()).ToArray();
+            var fullText = string.Join("\n", bodyText);
+
+            var contentsafetyCount = System.Text.RegularExpressions.Regex.Matches(fullText, "contentsafety", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Count;
+
+            var analyzeTextCount = System.Text.RegularExpressions.Regex.Matches(fullText, "text:analyze", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Count;
+
+            Assert.AreEqual(1, contentsafetyCount, "Should append /contentsafety path segment from Uri (after endpoint)");
+            Assert.AreEqual(1, analyzeTextCount, "Should append the operation path /text:analyze exactly once");
+        }
+
+        [Test]
+        public void ServerTemplateWithPathParameter_OnlyAppendsSegmentsAfterEndpoint()
+        {
+            // This tests scenarios like:
+            // - serverUrlTemplate = "{endpoint}/{apiVersion}"
+            // - operation.Uri = "{endpoint}/{apiVersion}" (path parameter in Uri)
+            // - operation.Path = "/users/{userId}" (actual operation path with its own parameter)
+            // Expected: Should append apiVersion parameter and then the operation path
+
+            MockHelpers.LoadMockGenerator();
+
+            var serverTemplate = "{endpoint}/{apiVersion}";
+            var apiVersionParam = InputFactory.PathParameter("apiVersion", InputPrimitiveType.String, isRequired: true, serverUrlTemplate: serverTemplate);
+            var userIdParam = InputFactory.PathParameter("userId", InputPrimitiveType.String, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                name: "GetUser",
+                uri: serverTemplate,
+                path: "/users/{userId}",
+                httpMethod: "GET",
+                parameters: [apiVersionParam, userIdParam]);
+
+            var serviceMethod = InputFactory.BasicServiceMethod("GetUser", operation);
+            var client = InputFactory.Client(
+                "UserService",
+                methods: [serviceMethod],
+                parameters: [InputFactory.EndpointParameter("endpoint", InputPrimitiveType.String, serverUrlTemplate: serverTemplate)]);
+            var clientProvider = new ClientProvider(client);
+            var createRequestMethod = clientProvider.RestClient.Methods.FirstOrDefault(m => m.Signature.Name == "CreateGetUserRequest");
+            Assert.IsNotNull(createRequestMethod);
+
+            var methodBody = createRequestMethod!.BodyStatements!.ToArray();
+            var bodyText = methodBody.Select(s => s.ToDisplayString()).ToArray();
+            var fullText = string.Join("\n", bodyText);
+
+            Assert.IsTrue(fullText.Contains("AppendPath(") && fullText.Contains("apiVersion"),
+                "Should append apiVersion path parameter from Uri");
+
+            Assert.IsTrue(fullText.Contains("/users/"),
+                "Should append the operation path /users/");
+            Assert.IsTrue(fullText.Contains("userId"),
+                "Should append userId path parameter from operation path");
+        }
+
+        [Test]
+        public void ServerTemplateWithMultipleSegments_HandlesCorrectly()
+        {
+            // This tests scenarios like:
+            // - serverUrlTemplate = "{endpoint}/v1/services"
+            // - operation.Uri = "{endpoint}/v1/services" (multiple static segments after endpoint)
+            // - operation.Path = "/operations/{operationId}"
+            // Expected: Should append /v1/services and then the operation path
+
+            MockHelpers.LoadMockGenerator();
+
+            var serverTemplate = "{endpoint}/v1/services";
+            var operationIdParam = InputFactory.PathParameter("operationId", InputPrimitiveType.String, isRequired: true);
+
+            var operation = InputFactory.Operation(
+                name: "GetOperation",
+                uri: serverTemplate,
+                path: "/operations/{operationId}",
+                httpMethod: "GET",
+                parameters: [operationIdParam]);
+
+            var serviceMethod = InputFactory.BasicServiceMethod("GetOperation", operation);
+            var client = InputFactory.Client(
+                "OperationService",
+                methods: [serviceMethod],
+                parameters: [InputFactory.EndpointParameter("endpoint", InputPrimitiveType.String, serverUrlTemplate: serverTemplate)]);
+            var clientProvider = new ClientProvider(client);
+            var createRequestMethod = clientProvider.RestClient.Methods.FirstOrDefault(m => m.Signature.Name == "CreateGetOperationRequest");
+            Assert.IsNotNull(createRequestMethod);
+
+            var methodBody = createRequestMethod!.BodyStatements!.ToArray();
+            var bodyText = methodBody.Select(s => s.ToDisplayString()).ToArray();
+            var fullText = string.Join("\n", bodyText);
+
+            // Should append /v1/services from Uri
+            Assert.IsTrue(fullText.Contains("/v1/services"),
+                "Should append server template path segments /v1/services");
+
+            Assert.IsTrue(fullText.Contains("/operations/"),
+                "Should append the operation path /operations/");
+            Assert.IsTrue(fullText.Contains("operationId"),
+                "Should append operationId path parameter");
+        }
+
+        [Test]
+        public void ServerTemplateEqualsEndpoint_OnlyAppendsOperationPath()
+        {
+            // This tests the simplest scenario:
+            // - serverUrlTemplate = "{endpoint}"
+            // - operation.Uri = "{endpoint}" (same as server template)
+            // - operation.Path = "/items"
+            // Expected: Should only append the operation path
+
+            MockHelpers.LoadMockGenerator();
+
+            var serverTemplate = "{endpoint}";
+            var operation = InputFactory.Operation(
+                name: "GetItems",
+                uri: serverTemplate,
+                path: "/items",
+                httpMethod: "GET");
+
+            var serviceMethod = InputFactory.BasicServiceMethod("GetItems", operation);
+            var client = InputFactory.Client(
+                "ItemService",
+                methods: [serviceMethod],
+                parameters: [InputFactory.EndpointParameter("endpoint", InputPrimitiveType.String, serverUrlTemplate: serverTemplate)]);
+            var clientProvider = new ClientProvider(client);
+            var createRequestMethod = clientProvider.RestClient.Methods.FirstOrDefault(m => m.Signature.Name.Contains("GetItems"));
+            Assert.IsNotNull(createRequestMethod);
+
+            var methodBody = createRequestMethod!.BodyStatements!.ToArray();
+            var bodyText = methodBody.Select(s => s.ToDisplayString()).ToArray();
+            var fullText = string.Join("\n", bodyText);
+
+            var appendPathCount = System.Text.RegularExpressions.Regex.Matches(fullText, "AppendPath\\(").Count;
+
+            Assert.GreaterOrEqual(appendPathCount, 1,
+                "Should have at least one AppendPath call for the operation path");
+            Assert.IsTrue(fullText.Contains("/items"),
+                "Should append the operation path /items");
+        }
+
+        [Test]
+        public void MultiServiceClient_GeneratesExpectedClient()
+        {
+            // Setup multiservice client with multiple API version enums
+            List<string> serviceAVersions = ["1.0", "2.0"];
+            List<string> serviceBVersions = ["3.0", "4.0"];
+
+            var serviceAEnumValues = serviceAVersions.Select(a => (a, a));
+            var serviceBEnumValues = serviceBVersions.Select(a => (a, a));
+
+            var serviceAEnum = InputFactory.StringEnum(
+                "ServiceVersionA",
+                serviceAEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceA");
+            var serviceBEnum = InputFactory.StringEnum(
+                "ServiceVersionB",
+                serviceBEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceB");
+
+            InputParameter apiVersionParameter = InputFactory.PathParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            InputParameter subscriptionIdParameter = InputFactory.PathParameter(
+                "subscriptionId",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var client = InputFactory.Client(TestClientName, parameters: [subscriptionIdParameter, apiVersionParameter], isMultiServiceClient: true);
+            var serviceAClient = InputFactory.Client("ServiceA", clientNamespace: "Sample.ServiceA", parent: client, initializedBy: InputClientInitializedBy.Parent, parameters: [apiVersionParameter, subscriptionIdParameter]);
+            var serviceBClient = InputFactory.Client("ServiceB", clientNamespace: "Sample.ServiceB", parent: client, initializedBy: InputClientInitializedBy.Parent, parameters: [apiVersionParameter, subscriptionIdParameter]);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. serviceAVersions, .. serviceBVersions],
+                clients: () => [client, serviceAClient, serviceBClient],
+                inputEnums: () => [serviceAEnum, serviceBEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            var writer = new TypeProviderWriter(clientProvider!);
+            var file = writer.Write();
+
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void MultiServiceClient_WithThreeServices_GeneratesExpectedClient()
+        {
+            // Setup multiservice client with three different services (KeyVault, Storage, Compute)
+            List<string> keyVaultVersions = ["7.4", "7.5"];
+            List<string> storageVersions = ["2023-01-01", "2024-01-01"];
+            List<string> computeVersions = ["2023-07-01", "2024-03-01", "2024-07-01"];
+
+            var keyVaultEnumValues = keyVaultVersions.Select(a => (a, a));
+            var storageEnumValues = storageVersions.Select(a => (a, a));
+            var computeEnumValues = computeVersions.Select(a => (a, a));
+
+            var keyVaultEnum = InputFactory.StringEnum(
+                "KeyVaultVersion",
+                keyVaultEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.KeyVault");
+            var storageEnum = InputFactory.StringEnum(
+                "StorageVersion",
+                storageEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.Storage");
+            var computeEnum = InputFactory.StringEnum(
+                "ComputeVersion",
+                computeEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.Compute");
+
+            InputParameter apiVersionParameter = InputFactory.PathParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            InputParameter subscriptionIdParameter = InputFactory.PathParameter(
+                "subscriptionId",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var client = InputFactory.Client(TestClientName, parameters: [subscriptionIdParameter, apiVersionParameter], isMultiServiceClient: true);
+            var keyVaultClient = InputFactory.Client("KeyVault", clientNamespace: "Sample.KeyVault", parent: client, initializedBy: InputClientInitializedBy.Parent, parameters: [apiVersionParameter, subscriptionIdParameter]);
+            var storageClient = InputFactory.Client("Storage", clientNamespace: "Sample.Storage", parent: client, initializedBy: InputClientInitializedBy.Parent, parameters: [apiVersionParameter, subscriptionIdParameter]);
+            var computeClient = InputFactory.Client("Compute", clientNamespace: "Sample.Compute", parent: client, initializedBy: InputClientInitializedBy.Parent, parameters: [apiVersionParameter, subscriptionIdParameter]);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. keyVaultVersions, .. storageVersions, .. computeVersions],
+                clients: () => [client, keyVaultClient, storageClient, computeClient],
+                inputEnums: () => [keyVaultEnum, storageEnum, computeEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            var writer = new TypeProviderWriter(clientProvider!);
+            var file = writer.Write();
+
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void MultiServiceCombinedClient_GeneratesExpectedClient()
+        {
+            // Setup multiservice client with multiple API version enums and operations
+            List<string> serviceAVersions = ["1.0", "2.0"];
+            List<string> serviceBVersions = ["3.0", "4.0"];
+
+            var serviceAEnumValues = serviceAVersions.Select(a => (a, a));
+            var serviceBEnumValues = serviceBVersions.Select(a => (a, a));
+
+            var serviceAEnum = InputFactory.StringEnum(
+                "ServiceVersionA",
+                serviceAEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceA");
+            var serviceBEnum = InputFactory.StringEnum(
+                "ServiceVersionB",
+                serviceBEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceB");
+
+            InputParameter apiVersionParameter = InputFactory.QueryParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            // Create operations with namespace set to each service
+            var serviceAOperation = InputFactory.Operation(
+                "ServiceAOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceA");
+
+            var serviceBOperation = InputFactory.Operation(
+                "ServiceBOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceB");
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod("ServiceAMethod", serviceAOperation),
+                    InputFactory.BasicServiceMethod("ServiceBMethod", serviceBOperation)
+                ],
+                parameters: [apiVersionParameter],
+                isMultiServiceClient: true);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. serviceAVersions, .. serviceBVersions],
+                clients: () => [client],
+                inputEnums: () => [serviceAEnum, serviceBEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            var writer = new TypeProviderWriter(clientProvider!);
+            var file = writer.Write();
+
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void MultiServiceCombinedClient_WithThreeServices_GeneratesExpectedClient()
+        {
+            // Setup multiservice combined client with three different services (KeyVault, Storage, Compute)
+            List<string> keyVaultVersions = ["7.4", "7.5"];
+            List<string> storageVersions = ["2023-01-01", "2024-01-01"];
+            List<string> computeVersions = ["2023-07-01", "2024-03-01", "2024-07-01"];
+
+            var keyVaultEnumValues = keyVaultVersions.Select(a => (a, a));
+            var storageEnumValues = storageVersions.Select(a => (a, a));
+            var computeEnumValues = computeVersions.Select(a => (a, a));
+
+            var keyVaultEnum = InputFactory.StringEnum(
+                "KeyVaultVersion",
+                keyVaultEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.KeyVault");
+            var storageEnum = InputFactory.StringEnum(
+                "StorageVersion",
+                storageEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.Storage");
+            var computeEnum = InputFactory.StringEnum(
+                "ComputeVersion",
+                computeEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.Compute");
+
+            InputParameter apiVersionParameter = InputFactory.QueryParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            // Create operations with namespace set to each service
+            var keyVaultOperation = InputFactory.Operation(
+                "KeyVaultOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.KeyVault");
+
+            var storageOperation = InputFactory.Operation(
+                "StorageOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.Storage");
+
+            var computeOperation = InputFactory.Operation(
+                "ComputeOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.Compute");
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod("KeyVaultMethod", keyVaultOperation),
+                    InputFactory.BasicServiceMethod("StorageMethod", storageOperation),
+                    InputFactory.BasicServiceMethod("ComputeMethod", computeOperation)
+                ],
+                parameters: [apiVersionParameter],
+                isMultiServiceClient: true);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. keyVaultVersions, .. storageVersions, .. computeVersions],
+                clients: () => [client],
+                inputEnums: () => [keyVaultEnum, storageEnum, computeEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            var writer = new TypeProviderWriter(clientProvider!);
+            var file = writer.Write();
+
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void GetApiVersionFieldForService_SingleService_ReturnsField()
+        {
+            // Setup single service client with one API version
+            List<string> serviceVersions = ["1.0", "2.0"];
+
+            var serviceEnumValues = serviceVersions.Select(a => (a, a));
+            var serviceEnum = InputFactory.StringEnum(
+                "ServiceVersion",
+                serviceEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample");
+
+            InputParameter apiVersionParameter = InputFactory.QueryParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            var operation = InputFactory.Operation(
+                "TestOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample");
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("TestMethod", operation)],
+                parameters: [apiVersionParameter]);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. serviceVersions],
+                clients: () => [client],
+                inputEnums: () => [serviceEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            // Trigger the lazy initialization of Fields which populates _apiVersionFields
+            _ = clientProvider!.Fields;
+
+            // Should return the single API version field regardless of namespace
+            var field = clientProvider!.GetApiVersionFieldForService("Sample");
+            Assert.IsNotNull(field);
+            Assert.AreEqual("_apiVersion", field!.Name);
+
+            // Should also return the field when namespace is null
+            var fieldWithNull = clientProvider.GetApiVersionFieldForService(null);
+            Assert.IsNotNull(fieldWithNull);
+            Assert.AreEqual("_apiVersion", fieldWithNull!.Name);
+        }
+
+        [Test]
+        public void GetApiVersionFieldForService_MultiService_ReturnsMatchingField()
+        {
+            // Setup multiservice client with multiple API version enums
+            List<string> serviceAVersions = ["1.0", "2.0"];
+            List<string> serviceBVersions = ["3.0", "4.0"];
+
+            var serviceAEnumValues = serviceAVersions.Select(a => (a, a));
+            var serviceBEnumValues = serviceBVersions.Select(a => (a, a));
+
+            var serviceAEnum = InputFactory.StringEnum(
+                "ServiceVersionA",
+                serviceAEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceA");
+            var serviceBEnum = InputFactory.StringEnum(
+                "ServiceVersionB",
+                serviceBEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceB");
+
+            InputParameter apiVersionParameter = InputFactory.QueryParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            // Create operations with namespace set to each service
+            var serviceAOperation = InputFactory.Operation(
+                "ServiceAOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceA");
+
+            var serviceBOperation = InputFactory.Operation(
+                "ServiceBOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceB");
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod("ServiceAMethod", serviceAOperation),
+                    InputFactory.BasicServiceMethod("ServiceBMethod", serviceBOperation)
+                ],
+                parameters: [apiVersionParameter],
+                isMultiServiceClient: true);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. serviceAVersions, .. serviceBVersions],
+                clients: () => [client],
+                inputEnums: () => [serviceAEnum, serviceBEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            // Trigger the lazy initialization of Fields which populates _apiVersionFields
+            _ = clientProvider!.Fields;
+
+            // Should return the matching field for ServiceA
+            var fieldA = clientProvider!.GetApiVersionFieldForService("Sample.ServiceA");
+            Assert.IsNotNull(fieldA);
+            Assert.AreEqual("_serviceAApiVersion", fieldA!.Name);
+
+            // Should return the matching field for ServiceB
+            var fieldB = clientProvider.GetApiVersionFieldForService("Sample.ServiceB");
+            Assert.IsNotNull(fieldB);
+            Assert.AreEqual("_serviceBApiVersion", fieldB!.Name);
+        }
+
+        [Test]
+        public void GetApiVersionFieldForService_MultiService_WithNonMatchingNamespace_ReturnsNull()
+        {
+            // Setup multiservice client with multiple API version enums
+            List<string> serviceAVersions = ["1.0", "2.0"];
+            List<string> serviceBVersions = ["3.0", "4.0"];
+
+            var serviceAEnumValues = serviceAVersions.Select(a => (a, a));
+            var serviceBEnumValues = serviceBVersions.Select(a => (a, a));
+
+            var serviceAEnum = InputFactory.StringEnum(
+                "ServiceVersionA",
+                serviceAEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceA");
+            var serviceBEnum = InputFactory.StringEnum(
+                "ServiceVersionB",
+                serviceBEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceB");
+
+            InputParameter apiVersionParameter = InputFactory.QueryParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            // Create operations with namespace set to each service
+            var serviceAOperation = InputFactory.Operation(
+                "ServiceAOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceA");
+
+            var serviceBOperation = InputFactory.Operation(
+                "ServiceBOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceB");
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod("ServiceAMethod", serviceAOperation),
+                    InputFactory.BasicServiceMethod("ServiceBMethod", serviceBOperation)
+                ],
+                parameters: [apiVersionParameter],
+                isMultiServiceClient: true);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. serviceAVersions, .. serviceBVersions],
+                clients: () => [client],
+                inputEnums: () => [serviceAEnum, serviceBEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            // Trigger the lazy initialization of Fields which populates _apiVersionFields
+            _ = clientProvider!.Fields;
+
+            // Should return null for non-matching namespace
+            var field = clientProvider!.GetApiVersionFieldForService("Sample.ServiceC");
+            Assert.IsNull(field);
+        }
+
+        [Test]
+        public void GetApiVersionFieldForService_MultiService_CaseInsensitiveMatch()
+        {
+            // Setup multiservice client with multiple API version enums
+            List<string> serviceAVersions = ["1.0", "2.0"];
+            List<string> serviceBVersions = ["3.0", "4.0"];
+
+            var serviceAEnumValues = serviceAVersions.Select(a => (a, a));
+            var serviceBEnumValues = serviceBVersions.Select(a => (a, a));
+
+            var serviceAEnum = InputFactory.StringEnum(
+                "ServiceVersionA",
+                serviceAEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceA");
+            var serviceBEnum = InputFactory.StringEnum(
+                "ServiceVersionB",
+                serviceBEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Sample.ServiceB");
+
+            InputParameter apiVersionParameter = InputFactory.QueryParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            // Create operations with namespace set to each service
+            var serviceAOperation = InputFactory.Operation(
+                "ServiceAOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceA");
+
+            var serviceBOperation = InputFactory.Operation(
+                "ServiceBOperation",
+                parameters: [apiVersionParameter],
+                ns: "Sample.ServiceB");
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod("ServiceAMethod", serviceAOperation),
+                    InputFactory.BasicServiceMethod("ServiceBMethod", serviceBOperation)
+                ],
+                parameters: [apiVersionParameter],
+                isMultiServiceClient: true);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. serviceAVersions, .. serviceBVersions],
+                clients: () => [client],
+                inputEnums: () => [serviceAEnum, serviceBEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            // Trigger the lazy initialization of Fields which populates _apiVersionFields
+            _ = clientProvider!.Fields;
+
+            // Should match case-insensitively
+            var fieldLowerCase = clientProvider!.GetApiVersionFieldForService("sample.serviceA");
+            Assert.IsNotNull(fieldLowerCase);
+            Assert.AreEqual("_serviceAApiVersion", fieldLowerCase!.Name);
+
+            var fieldUpperCase = clientProvider.GetApiVersionFieldForService("SAMPLE.SERVICEa");
+            Assert.IsNotNull(fieldUpperCase);
+            Assert.AreEqual("_serviceAApiVersion", fieldUpperCase!.Name);
+        }
+
+        [Test]
+        public void GetApiVersionFieldForService_MultiService_SameLastSegment_ProducesUniqueFields()
+        {
+            // Regression test: when two services have different full namespaces but the same last
+            // segment, using only the last segment would produce duplicate field names. The fix
+            // uses the full namespace to guarantee uniqueness.
+            List<string> serviceOneVersions = ["1.0", "2.0"];
+            List<string> serviceTwoVersions = ["3.0", "4.0"];
+
+            var serviceOneEnumValues = serviceOneVersions.Select(a => (a, a));
+            var serviceTwoEnumValues = serviceTwoVersions.Select(a => (a, a));
+
+            // Different full namespaces, same last segment ("Tests") — would collide with last-segment-only naming
+            var serviceOneEnum = InputFactory.StringEnum(
+                "ServiceOneVersions",
+                serviceOneEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Azure.ServiceOne.Tests");
+            var serviceTwoEnum = InputFactory.StringEnum(
+                "ServiceTwoVersions",
+                serviceTwoEnumValues,
+                usage: InputModelTypeUsage.ApiVersionEnum,
+                clientNamespace: "Azure.ServiceTwo.Tests");
+
+            InputParameter apiVersionParameter = InputFactory.QueryParameter(
+                "apiVersion",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                isApiVersion: true);
+
+            var serviceOneOperation = InputFactory.Operation(
+                "ServiceOneOperation",
+                parameters: [apiVersionParameter],
+                ns: "Azure.ServiceOne.Tests");
+
+            var serviceTwoOperation = InputFactory.Operation(
+                "ServiceTwoOperation",
+                parameters: [apiVersionParameter],
+                ns: "Azure.ServiceTwo.Tests");
+
+            var client = InputFactory.Client(
+                TestClientName,
+                methods:
+                [
+                    InputFactory.BasicServiceMethod("ServiceOneMethod", serviceOneOperation),
+                    InputFactory.BasicServiceMethod("ServiceTwoMethod", serviceTwoOperation)
+                ],
+                parameters: [apiVersionParameter],
+                isMultiServiceClient: true);
+
+            MockHelpers.LoadMockGenerator(
+                apiVersions: () => [.. serviceOneVersions, .. serviceTwoVersions],
+                clients: () => [client],
+                inputEnums: () => [serviceOneEnum, serviceTwoEnum]);
+
+            var clientProvider = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(client);
+            Assert.IsNotNull(clientProvider);
+
+            // This should not crash — previously it threw due to duplicate field names
+            Assert.DoesNotThrow(() => _ = clientProvider!.Fields);
+
+            // Verify we have two distinct api version fields using the shortest unique namespace suffix
+            var apiVersionFields = clientProvider!.Fields
+                .Where(f => f.Name.Contains("ApiVersion", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(f => f.Name)
+                .ToList();
+            Assert.AreEqual(2, apiVersionFields.Count);
+            Assert.AreNotEqual(apiVersionFields[0].Name, apiVersionFields[1].Name);
+
+            // Shortest unique suffix: "ServiceOne.Tests" → "ServiceOneTests"
+            Assert.AreEqual("_serviceOneTestsApiVersion", apiVersionFields[0].Name);
+            Assert.AreEqual("_serviceTwoTestsApiVersion", apiVersionFields[1].Name);
+        }
+
+        [TestCase("{endpoint}")]
+        [TestCase("{Endpoint}")]
+        [TestCase("{ENDPOINT}")]
+        public void ConvertUriTemplate_CaseInsensitiveEndpointLookup(string serverTemplate)
+        {
+            // Tests that the parameter lookup in ConvertUriTemplateToFormattableString is case-insensitive
+            MockHelpers.LoadMockGenerator();
+            var client = InputFactory.Client(
+                TestClientName,
+                parameters: [InputFactory.EndpointParameter(
+                    "endpoint",
+                    InputPrimitiveType.String,
+                    isRequired: true,
+                    scope: InputParameterScope.Client,
+                    serverUrlTemplate: serverTemplate,
+                    isEndpoint: true)]);
+            var clientProvider = new ClientProvider(client);
+            var constructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+
+            Assert.IsNotNull(constructor);
+            // Should not throw and should contain the Uri assignment
+            var bodyText = constructor!.BodyStatements!.ToDisplayString();
+            Assert.IsTrue(bodyText.Contains("_endpoint = new global::System.Uri($\""));
+        }
+
+        [Test]
+        public void ConvertUriTemplate_CaseInsensitivePathParameterLookup()
+        {
+            // Tests template with mixed case placeholders like "{Endpoint}/services/{ApiVersion}"
+            MockHelpers.LoadMockGenerator();
+
+            var serverTemplate = "{Endpoint}/{ApiVersion}";
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("Test", InputFactory.Operation("test", uri: serverTemplate))],
+                parameters: [
+                    InputFactory.EndpointParameter(
+                        "endpoint", // lowercase parameter name
+                        InputPrimitiveType.String,
+                        isRequired: true,
+                        scope: InputParameterScope.Client,
+                        serverUrlTemplate: serverTemplate,
+                        isEndpoint: true),
+                    InputFactory.PathParameter(
+                        "apiVersion", // lowercase parameter name
+                        InputPrimitiveType.String,
+                        isRequired: true,
+                        scope: InputParameterScope.Client)
+                ]);
+            var clientProvider = new ClientProvider(client);
+            var constructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+
+            Assert.IsNotNull(constructor);
+            // Should not throw - case-insensitive lookup should find parameters
+            var bodyText = constructor!.BodyStatements!.ToDisplayString();
+            Assert.IsNotNull(bodyText);
+            // Verify that the Uri is built according to the server template with case-insensitive parameter matching
+            Assert.IsTrue(bodyText.Contains("$\"{endpoint}/{_apiVersion}\""));
+        }
+
+        [Test]
+        public void ConvertUriTemplate_WithMultiplePlaceholders()
+        {
+            // Tests template with multiple placeholders: "{endpoint}/{apiVersion}/services/{subscriptionId}"
+            MockHelpers.LoadMockGenerator();
+
+            var serverTemplate = "{endpoint}/{apiVersion}/services/{subscriptionId}";
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("Test", InputFactory.Operation("test", uri: serverTemplate))],
+                parameters: [
+                    InputFactory.EndpointParameter(
+                        "endpoint",
+                        InputPrimitiveType.String,
+                        isRequired: true,
+                        scope: InputParameterScope.Client,
+                        serverUrlTemplate: serverTemplate,
+                        isEndpoint: true),
+                    InputFactory.PathParameter(
+                        "apiVersion",
+                        InputPrimitiveType.String,
+                        isRequired: true,
+                        scope: InputParameterScope.Client),
+                    InputFactory.PathParameter(
+                        "subscriptionId",
+                        InputPrimitiveType.String,
+                        isRequired: true,
+                        scope: InputParameterScope.Client)
+                ]);
+            var clientProvider = new ClientProvider(client);
+            var constructor = clientProvider.Constructors.FirstOrDefault(
+                c => c.Signature.Initializer == null && c.Signature?.Modifiers == MethodSignatureModifiers.Internal);
+
+            Assert.IsNotNull(constructor);
+            var bodyText = constructor!.BodyStatements!.ToDisplayString();
+            Assert.IsNotNull(bodyText);
+            // Verify that the Uri is built according to the server template
+            Assert.IsTrue(bodyText.Contains("$\"{endpoint}/{_apiVersion}/services/{_subscriptionId}\""));
+        }
+
+        [Test]
+        public void TestParamAlias_ClientConstructorDoesNotDuplicateAliasedParameter()
+        {
+            // A client parameter "blob" with paramAlias "blobName" should not produce
+            // a duplicate field when the operation also declares "blobName" as client-scoped.
+            var clientParam = InputFactory.MethodParameter(
+                "blob",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                paramAlias: "blobName");
+
+            var operationParam = InputFactory.PathParameter(
+                "blobName",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operation = InputFactory.Operation("Upload", parameters: [operationParam]);
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("Upload", operation)],
+                parameters: [
+                    InputFactory.EndpointParameter(
+                        "endpoint",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true),
+                    clientParam]);
+
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // Should have exactly one field for the blob/blobName parameter (not two)
+            var blobFields = clientProvider.Fields.Where(f => f.Name == "_blob" || f.Name == "_blobName").ToList();
+            Assert.AreEqual(1, blobFields.Count,
+                $"Expected 1 field but found {blobFields.Count}: {string.Join(", ", blobFields.Select(f => f.Name))}");
+            Assert.AreEqual("_blob", blobFields[0].Name);
+
+            // ClientParameters should contain only the "blob" parameter
+            var blobParams = clientProvider.ClientParameters.Where(
+                p => p.Name == "blob" || p.Name == "blobName").ToList();
+            Assert.AreEqual(1, blobParams.Count,
+                $"Expected 1 client parameter but found {blobParams.Count}: {string.Join(", ", blobParams.Select(p => p.Name))}");
+            Assert.AreEqual("blob", blobParams[0].Name);
+        }
+
+        [Test]
+        public void TestParamAlias_ClientConstructorKeepsBothWhenNoAlias()
+        {
+            // Without paramAlias, a client parameter "blob" and operation parameter "blobName"
+            // should both appear since they have different names.
+            var clientParam = InputFactory.MethodParameter(
+                "blob",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operationParam = InputFactory.PathParameter(
+                "blobName",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operation = InputFactory.Operation("Upload", parameters: [operationParam]);
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("Upload", operation)],
+                parameters: [
+                    InputFactory.EndpointParameter(
+                        "endpoint",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true),
+                    clientParam]);
+
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // Without alias, both fields should exist
+            var blobFields = clientProvider.Fields.Where(f => f.Name == "_blob" || f.Name == "_blobName").ToList();
+            Assert.AreEqual(2, blobFields.Count,
+                $"Expected 2 fields but found {blobFields.Count}: {string.Join(", ", blobFields.Select(f => f.Name))}");
+        }
+
+        [Test]
+        public void TestParamAlias_MatchingNamesWithoutAliasDeduplicate()
+        {
+            // When the client parameter and operation parameter share the same name,
+            // deduplication occurs by name even without paramAlias.
+            var clientParam = InputFactory.MethodParameter(
+                "blobName",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operationParam = InputFactory.PathParameter(
+                "blobName",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operation = InputFactory.Operation("Upload", parameters: [operationParam]);
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("Upload", operation)],
+                parameters: [
+                    InputFactory.EndpointParameter(
+                        "endpoint",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true),
+                    clientParam]);
+
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // Same name means they get deduplicated to one field
+            var blobFields = clientProvider.Fields.Where(f => f.Name == "_blobName").ToList();
+            Assert.AreEqual(1, blobFields.Count);
+        }
+
+        [Test]
+        public void TestParamAlias_MethodParametersSkipAliasedClientParam()
+        {
+            // When a client parameter "blob" is aliased to "blobName" via @paramAlias,
+            // the generated operation method should NOT have "blobName" as a method parameter
+            // since it's already on the client.
+            var clientParam = InputFactory.MethodParameter(
+                "blob",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client,
+                paramAlias: "blobName");
+
+            var operationParam = InputFactory.PathParameter(
+                "blobName",
+                InputPrimitiveType.String,
+                isRequired: true,
+                scope: InputParameterScope.Client);
+
+            var operation = InputFactory.Operation("Upload", parameters: [operationParam]);
+            var client = InputFactory.Client(
+                TestClientName,
+                methods: [InputFactory.BasicServiceMethod("Upload", operation)],
+                parameters: [
+                    InputFactory.EndpointParameter(
+                        "endpoint",
+                        InputPrimitiveType.String,
+                        defaultValue: InputFactory.Constant.String("https://default.endpoint.io"),
+                        scope: InputParameterScope.Client,
+                        isEndpoint: true),
+                    clientParam]);
+
+            var clientProvider = new ClientProvider(client);
+
+            Assert.IsNotNull(clientProvider);
+
+            // Get the generated operation methods (excluding subclient accessors and constructors)
+            var operationMethods = clientProvider.Methods
+                .Where(m => m.Signature?.Name == "Upload" || m.Signature?.Name == "UploadAsync")
+                .ToList();
+
+            Assert.IsTrue(operationMethods.Count > 0, "Should have Upload methods");
+
+            foreach (var method in operationMethods)
+            {
+                var paramNames = method.Signature!.Parameters.Select(p => p.Name).ToList();
+                Assert.IsFalse(paramNames.Contains("blobName"),
+                    $"Method '{method.Signature.Name}' should not have 'blobName' parameter since it's an aliased client parameter. " +
+                    $"Params: [{string.Join(", ", paramNames)}]");
+                Assert.IsFalse(paramNames.Contains("blob"),
+                    $"Method '{method.Signature.Name}' should not have 'blob' parameter since it's a client parameter. " +
+                    $"Params: [{string.Join(", ", paramNames)}]");
+            }
+        }
+
+        [Test]
+        public void TestIsExactNameClientPreservesNameVerbatim()
+        {
+            // A client marked with isExactName should bypass ToIdentifierName() casing.
+            var client = InputFactory.Client("snake_case_client", isExactName: true);
+            var clientProvider = new ClientProvider(client);
+
+            Assert.AreEqual("snake_case_client", clientProvider.Name);
+        }
+
+        [Test]
+        public void TestNonExactNameClientStillCased()
+        {
+            // A client without isExactName should still go through ToIdentifierName().
+            var client = InputFactory.Client("snake_case_client");
+            var clientProvider = new ClientProvider(client);
+
+            Assert.AreEqual("SnakeCaseClient", clientProvider.Name);
+        }
+
+        [Test]
+        public void TestIsExactNameServiceMethodPreservesOperationNameVerbatim()
+        {
+            // A service method marked with isExactName should preserve the operation name verbatim
+            // (no PascalCase transformation, no "List" -> "Get" rename).
+            var inputOperation = InputFactory.Operation("snake_case_op", isExactName: true);
+            var inputServiceMethod = InputFactory.BasicServiceMethod("snake_case_op", inputOperation, isExactName: true);
+            var client = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+            var clientProvider = new ClientProvider(client);
+
+            // After CleanOperationNames runs in the ClientProvider constructor, names should be unchanged.
+            Assert.AreEqual("snake_case_op", inputServiceMethod.Name);
+            Assert.AreEqual("snake_case_op", inputServiceMethod.Operation.Name);
+            Assert.AreEqual("CreateSnakeCaseOpRequest", clientProvider.RestClient.GetCreateRequestMethod(inputOperation).Signature.Name);
+        }
+
+        [TestCase("GetUrl", false, "GetUri")]
+        [TestCase("ListUrl", false, "GetUri")]
+        [TestCase("GetUrlValue", false, "GetUrlValue")]
+        [TestCase("GetUrls", false, "GetUrls")]
+        [TestCase("GetUrl", true, "GetUrl")]
+        public void TestOperationNameReplacesCompleteUrlSuffix(string operationName, bool isExactName, string expectedName)
+        {
+            var inputOperation = InputFactory.Operation(operationName, isExactName: isExactName);
+            var inputServiceMethod = InputFactory.BasicServiceMethod(operationName, inputOperation, isExactName: isExactName);
+            var client = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+
+            _ = new ClientProvider(client);
+
+            Assert.AreEqual(expectedName, inputServiceMethod.Name);
+            Assert.AreEqual(expectedName, inputServiceMethod.Operation.Name);
+        }
+
+        [TestCase("GetIpAddress", "GetIPAddress")]
+        [TestCase("GetDbStatus", "GetDBStatus")]
+        [TestCase("GetOsProfile", "GetOSProfile")]
+        [TestCase("GetIpv4Configuration", "GetIPv4Configuration")]
+        [TestCase("GetIpv6Configuration", "GetIPv6Configuration")]
+        [TestCase("GetIpV4Configuration", "GetIPv4Configuration")]
+        [TestCase("GetIpV6Configuration", "GetIPv6Configuration")]
+        [TestCase("GetIpIpDbDbOsOs", "GetIPIPDBDBOSOS")]
+        [TestCase("ListIpAddresses", "GetIPAddresses")]
+        [TestCase("ListIpUrl", "GetIPUri")]
+        [TestCase("GetIpUrls", "GetIPUrls")]
+        [TestCase("get_ip_address", "GetIPAddress")]
+        [TestCase("GetIp", "GetIP")]
+        [TestCase("GetDb", "GetDB")]
+        [TestCase("GetOs", "GetOS")]
+        [TestCase("GetIPv4Configuration", "GetIPv4Configuration")]
+        [TestCase("GetIPv6Configuration", "GetIPv6Configuration")]
+        [TestCase("GetIPV4Configuration", "GetIPV4Configuration")]
+        [TestCase("GetIPV6Configuration", "GetIPV6Configuration")]
+        [TestCase("GetIPAddress", "GetIPAddress")]
+        [TestCase("GetIpaddress", "GetIpaddress")]
+        [TestCase("GetDbase", "GetDbase")]
+        [TestCase("GetOstrich", "GetOstrich")]
+        [TestCase("GetIpv4address", "GetIpv4address")]
+        [TestCase("GetIpv6address", "GetIpv6address")]
+        [TestCase("GetIp1", "GetIp1")]
+        [TestCase("GetStartTime", "GetStartTime")]
+        [TestCase("Listen", "Listen")]
+        public void TestOperationNameNormalizesAcronyms(string operationName, string expectedName)
+        {
+            var operation = InputFactory.Operation(operationName, path: "/Ip/Db/Os");
+            var serviceMethod = InputFactory.BasicServiceMethod(operationName, operation);
+            var client = new ClientProvider(InputFactory.Client("TestClient", methods: [serviceMethod]));
+
+            Assert.AreEqual(expectedName, serviceMethod.Name);
+            Assert.AreEqual(expectedName, operation.Name);
+            Assert.AreEqual(operationName, operation.OriginalName);
+            Assert.AreEqual(operationName, operation.CrossLanguageDefinitionId);
+            Assert.AreEqual("/Ip/Db/Os", operation.Path);
+            var methods = client.GetMethodCollectionByOperation(operation);
+            CollectionAssert.AreEquivalent(
+                new[] { expectedName, expectedName + "Async", expectedName, expectedName + "Async" },
+                methods.Select(m => m.Signature.Name));
+        }
+
+        [TestCase("GetIpAddress", "GetIPAddress", "GetIpAddress", "GetIPAddress")]
+        [TestCase("GetIPAddress", "GetIpAddress", "GetIPAddress", "GetIpAddress")]
+        [TestCase("GetIp", "GetIPAsync", "GetIp", "GetIPAsync")]
+        [TestCase("GetIPAsync", "GetIp", "GetIPAsync", "GetIp")]
+        [TestCase("GetIpAsync", "GetIP", "GetIpAsync", "GetIP")]
+        [TestCase("GetIP", "GetIpAsync", "GetIP", "GetIpAsync")]
+        [TestCase("GetIpAsync", "GetIPAsyncAsync", "GetIpAsync", "GetIPAsyncAsync")]
+        [TestCase("GetIpv4", "GetIpV4Async", "GetIpv4", "GetIpV4Async")]
+        [TestCase("GetIpV4Async", "GetIpv4", "GetIpV4Async", "GetIpv4")]
+        [TestCase("ListIp", "GetIPAsync", "GetIp", "GetIPAsync")]
+        [TestCase("GetDb", "GetDBAsync", "GetDb", "GetDBAsync")]
+        [TestCase("GetOsAsync", "GetOS", "GetOsAsync", "GetOS")]
+        [TestCase("GetIp", "GetIPAsyncAsync", "GetIP", "GetIPAsyncAsync")]
+        [TestCase("GetIp", "GetIPAsyncValue", "GetIP", "GetIPAsyncValue")]
+        [TestCase("GetIp", "GetIPasync", "GetIP", "GetIPasync")]
+        [TestCase("GetIp", "GetDbAsync", "GetIP", "GetDBAsync")]
+        public void TestOperationNameNormalizationPreservesDistinctNames(
+            string firstName, string secondName, string expectedFirstName, string expectedSecondName)
+        {
+            var firstOperation = InputFactory.Operation(firstName);
+            var firstServiceMethod = InputFactory.BasicServiceMethod(firstOperation.Name, firstOperation);
+            var secondOperation = InputFactory.Operation(secondName);
+            var secondServiceMethod = InputFactory.BasicServiceMethod(secondOperation.Name, secondOperation);
+            var client = new ClientProvider(InputFactory.Client(
+                "TestClient",
+                methods: [firstServiceMethod, secondServiceMethod]));
+
+            Assert.AreEqual(expectedFirstName, firstServiceMethod.Name);
+            Assert.AreEqual(expectedFirstName, firstOperation.Name);
+            Assert.AreEqual(expectedSecondName, secondServiceMethod.Name);
+            Assert.AreEqual(expectedSecondName, secondOperation.Name);
+            var firstMethodNames = client.GetMethodCollectionByOperation(firstOperation).Select(m => m.Signature.Name).ToArray();
+            var secondMethodNames = client.GetMethodCollectionByOperation(secondOperation).Select(m => m.Signature.Name).ToArray();
+            CollectionAssert.AreEquivalent(
+                new[] { expectedFirstName, expectedFirstName + "Async", expectedFirstName, expectedFirstName + "Async" },
+                firstMethodNames);
+            CollectionAssert.AreEquivalent(
+                new[] { expectedSecondName, expectedSecondName + "Async", expectedSecondName, expectedSecondName + "Async" },
+                secondMethodNames);
+            CollectionAssert.IsEmpty(firstMethodNames.Intersect(secondMethodNames));
+        }
+
+        [TestCase("GetIpAddress")]
+        [TestCase("GetDbStatus")]
+        [TestCase("GetOsProfile")]
+        [TestCase("GetIpv4Configuration")]
+        [TestCase("GetIpv6Configuration")]
+        [TestCase("ListIpUrl")]
+        public void TestExactOperationNameSkipsAcronymNormalization(string operationName)
+        {
+            var operation = InputFactory.Operation(operationName, isExactName: true);
+            var serviceMethod = InputFactory.BasicServiceMethod(operationName, operation, isExactName: true);
+            var client = new ClientProvider(InputFactory.Client("TestClient", methods: [serviceMethod]));
+
+            CollectionAssert.AreEquivalent(
+                new[] { operationName, operationName + "Async", operationName, operationName + "Async" },
+                client.GetMethodCollectionByOperation(operation).Select(m => m.Signature.Name));
+        }
+
+        [TestCase("Basic")]
+        [TestCase("Paging")]
+        [TestCase("LongRunning")]
+        [TestCase("LongRunningPaging")]
+        public void TestAcronymOperationMethodVariants(string kind)
+        {
+            var item = InputFactory.Model("Item");
+            var page = InputFactory.Model("Page", properties: [InputFactory.Property("items", InputFactory.Array(item))]);
+            var response = InputFactory.OperationResponse([200], page);
+            var operation = InputFactory.Operation("ListIpAddresses", responses: [response]);
+            operation.Update(doc: string.Empty);
+            var serviceResponse = InputFactory.ServiceMethodResponse(page, null);
+            var paging = InputFactory.PagingMetadata(["items"], null, null);
+            InputServiceMethod serviceMethod = kind switch
+            {
+                "Paging" => InputFactory.PagingServiceMethod(operation.Name, operation, response: serviceResponse, pagingMetadata: paging),
+                "LongRunning" => new InputLongRunningServiceMethod(operation.Name, "public", [], null, null,
+                    operation, [], serviceResponse, null, false, true, true, operation.CrossLanguageDefinitionId,
+                    new InputLongRunningServiceMetadata(1, response, null)),
+                "LongRunningPaging" => new InputLongRunningPagingServiceMethod(operation.Name, "public", [], null, null,
+                    operation, [], serviceResponse, null, false, true, true, operation.CrossLanguageDefinitionId,
+                    new InputLongRunningServiceMetadata(1, response, null), paging),
+                _ => InputFactory.BasicServiceMethod(operation.Name, operation, response: serviceResponse)
+            };
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            MockHelpers.LoadMockGenerator(clients: () => [inputClient], inputModels: () => [item, page], includeXmlDocs: true);
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+            var methods = client.GetMethodCollectionByOperation(operation);
+
+            CollectionAssert.AreEquivalent(
+                new[] { "GetIPAddresses", "GetIPAddressesAsync", "GetIPAddresses", "GetIPAddressesAsync" },
+                methods.Select(m => m.Signature.Name));
+            foreach (var method in methods)
+            {
+                bool isAsync = method.Signature.Name.EndsWith("Async", StringComparison.Ordinal);
+                var body = method.BodyStatements!.ToDisplayString();
+                if (kind == "Paging")
+                {
+                    StringAssert.Contains(isAsync ? "TestClientGetIPAddressesAsyncCollectionResult" : "TestClientGetIPAddressesCollectionResult", body);
+                }
+                else if (method.Kind == ScmMethodKind.Protocol)
+                {
+                    StringAssert.Contains("CreateGetIpAddressesRequest(", body);
+                }
+                else
+                {
+                    StringAssert.Contains(isAsync ? "GetIPAddressesAsync(" : "GetIPAddresses(", body);
+                }
+            }
+            Assert.AreEqual("CreateGetIpAddressesRequest", client.RestClient.GetCreateRequestMethod(operation).Signature.Name);
+            var output = new TypeProviderWriter(client).Write().Content;
+            StringAssert.Contains("[Protocol Method] GetIPAddresses", output);
+            StringAssert.DoesNotContain("CreateGetIPAddressesRequest", output);
+            if (kind == "Paging")
+            {
+                var collections = ScmCodeModelGenerator.Instance.OutputLibrary.TypeProviders.OfType<CollectionResultDefinition>().ToList();
+                Assert.IsNotEmpty(collections);
+                foreach (var collection in collections)
+                {
+                    Assert.AreEqual("TestClient.GetIPAddresses", collection.ScopeName);
+                    StringAssert.Contains("CreateGetIpAddressesRequest(", new TypeProviderWriter(collection).Write().Content);
+                }
+            }
+        }
+
+        [Test]
+        public async Task PublishedAcronymOrderPreservesForwarding(
+            [Values(false, true)] bool sameParameterTypes,
+            [Values(false, true)] bool omitOptionalParameter)
+        {
+            var targetType = sameParameterTypes ? InputPrimitiveType.String : InputPrimitiveType.Int32;
+            var operation = InputFactory.Operation(
+                "Send",
+                parameters:
+                [
+                    InputFactory.QueryParameter("sourceIpAddress", InputPrimitiveType.String, isRequired: true, serializedName: "source-ip"),
+                    InputFactory.QueryParameter("targetDbName", targetType, isRequired: true, serializedName: "target-db"),
+                    InputFactory.QueryParameter("filter", InputPrimitiveType.Boolean)
+                ],
+                responses: [InputFactory.OperationResponse([204])]);
+            var methodParameters = new List<InputMethodParameter>
+            {
+                InputFactory.MethodParameter("sourceIpAddress", InputPrimitiveType.String, isRequired: !omitOptionalParameter, location: InputRequestLocation.Query, serializedName: "source-ip"),
+                InputFactory.MethodParameter("targetDbName", targetType, isRequired: true, location: InputRequestLocation.Query, serializedName: "target-db")
+            };
+            if (!omitOptionalParameter)
+            {
+                methodParameters.Add(InputFactory.MethodParameter("filter", InputPrimitiveType.Boolean, location: InputRequestLocation.Query));
+            }
+            var serviceMethod = InputFactory.BasicServiceMethod("Send", operation, parameters: methodParameters);
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [inputClient],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync(sameParameterTypes ? "Same" : "Mixed"),
+                configuration: """{"disable-xml-docs": false, "package-name": "Sample"}""");
+            var client = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+            client.ProcessTypeForBackCompatibility();
+
+            var protocols = client.Methods.OfType<ScmMethodProvider>().Where(method => method.Kind == ScmMethodKind.Protocol).ToArray();
+            Assert.AreEqual(2, protocols.Length);
+            foreach (var protocol in protocols)
+            {
+                bool isAsync = protocol.Signature.Name.EndsWith("Async", StringComparison.Ordinal);
+                string[] expectedProtocolNames = isAsync
+                    ? ["sourceIpAddress", "targetDbName", "filter", "options"]
+                    : ["targetDbName", "sourceIpAddress", "filter", "options"];
+                CollectionAssert.AreEqual(expectedProtocolNames, protocol.Signature.Parameters.Select(parameter => parameter.Name));
+                using var writer = new CodeWriter();
+                writer.WriteMethod(protocol);
+                var methodText = writer.ToString(false);
+                foreach (var name in expectedProtocolNames)
+                {
+                    StringAssert.Contains($"<param name=\"{name}\">", methodText);
+                }
+                var requestSyntax = CSharpSyntaxTree.ParseText(protocol.BodyStatements!.ToDisplayString()).GetRoot();
+                var requestCall = requestSyntax.DescendantNodes().OfType<InvocationExpressionSyntax>().Single(invocation =>
+                    invocation.Expression is MemberAccessExpressionSyntax member && member.Name.Identifier.ValueText == "CreateSendRequest");
+                CollectionAssert.AreEqual(
+                    new[] { "sourceIpAddress", "targetDbName", "filter", "options" },
+                    requestCall.ArgumentList.Arguments.Select(argument => argument.Expression.ToString()));
+
+                var convenience = client.Methods.OfType<ScmMethodProvider>().Single(method =>
+                    method.Kind == ScmMethodKind.Convenience && method.Signature.Name == protocol.Signature.Name);
+                CollectionAssert.AreEqual(
+                    omitOptionalParameter ? new[] { "targetDbName", "sourceIpAddress", "cancellationToken" } : new[] { "targetDbName", "sourceIpAddress", "filter", "cancellationToken" },
+                    convenience.Signature.Parameters.Select(parameter => parameter.Name));
+                var syntax = CSharpSyntaxTree.ParseText(convenience.BodyStatements!.ToDisplayString()).GetRoot();
+                var call = syntax.DescendantNodes().OfType<InvocationExpressionSyntax>().Single(invocation =>
+                    invocation.Expression is MemberAccessExpressionSyntax member && member.Name.Identifier.ValueText == protocol.Signature.Name);
+                CollectionAssert.AreEqual(
+                    expectedProtocolNames.Take(2).Concat(omitOptionalParameter ? [] : new[] { "filter" }).Append("cancellationToken.ToRequestOptions()"),
+                    call.ArgumentList.Arguments.Select(argument => argument.Expression.ToString()));
+            }
+
+            var references = AppDomain.CurrentDomain.GetAssemblies()
+                .Where(assembly => !assembly.IsDynamic && !string.IsNullOrEmpty(assembly.Location))
+                .Select(assembly => MetadataReference.CreateFromFile(assembly.Location))
+                .Append(MetadataReference.CreateFromFile(typeof(Microsoft.Extensions.Configuration.IConfigurationSection).Assembly.Location));
+            var providers = generator.Object.OutputLibrary.TypeProviders
+                .Where(provider => provider is not Utf8JsonBinaryContentDefinition and not BinaryContentHelperDefinition);
+            var trees = providers.Select(provider => new TypeProviderWriter(provider).Write())
+                .Select(file => CSharpSyntaxTree.ParseText(file.Content, path: file.Name));
+            var compilation = CSharpCompilation.Create(
+                "PublishedAcronymOrder", trees, references,
+                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, generalDiagnosticOption: ReportDiagnostic.Error));
+            Assert.IsEmpty(compilation.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
+                .Select(diagnostic => diagnostic.ToString()));
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task AcronymParameterRestorationRequiresMatchingSignature(bool matchingParameterType)
+        {
+            var valueType = matchingParameterType ? InputPrimitiveType.Int32 : InputPrimitiveType.Boolean;
+            var operation = InputFactory.Operation(
+                "Send",
+                parameters:
+                [
+                    InputFactory.QueryParameter("sourceIpAddress", InputPrimitiveType.String, isRequired: true),
+                    InputFactory.QueryParameter("newValue", valueType, isRequired: true)
+                ],
+                responses: [InputFactory.OperationResponse([204])]);
+            var serviceMethod = InputFactory.BasicServiceMethod(
+                "Send", operation,
+                parameters:
+                [
+                    InputFactory.MethodParameter("sourceIpAddress", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Query),
+                    InputFactory.MethodParameter("newValue", valueType, isRequired: true, location: InputRequestLocation.Query)
+                ]);
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [inputClient],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var client = ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+            client.ProcessTypeForBackCompatibility();
+            var methods = client.Methods.OfType<ScmMethodProvider>().Where(method => method.Signature.Name is "Send" or "SendAsync").ToArray();
+            Assert.AreEqual(4, methods.Length);
+
+            foreach (var method in methods)
+            {
+                CollectionAssert.AreEqual(
+                    matchingParameterType ? new[] { "sourceIpAddress", "oldValue" } : new[] { "sourceIPAddress", "newValue" },
+                    method.Signature.Parameters.Take(2).Select(parameter => parameter.Name));
+            }
+        }
+
+        [TestCase("LastContract")]
+        [TestCase("DistinctLastContract")]
+        [TestCase("CaseOnlyLastContract")]
+        [TestCase("PrivateLastContract")]
+        [TestCase("TypeMismatchLastContract")]
+        [TestCase("Custom")]
+        [TestCase("CustomWithLastContract")]
+        public async Task AcronymOperationParameterNamesPreserveSignatures(string signatureSource)
+        {
+            var custom = signatureSource.StartsWith("Custom");
+            var distinctNames = signatureSource == "DistinctLastContract";
+            var hasMatchingContract = signatureSource is not ("PrivateLastContract" or "TypeMismatchLastContract");
+            var lastContractSource = custom ? "LastContract" : signatureSource;
+            string[] inputNames = ["sourceIpAddress", "targetDbName", "guestOsType", "IPv4Address", "IPv6Address"];
+            string[] contractNames = custom
+                ? ["customIpAddress", "customDbName", "customOsType", "customIPv4Address", "customIPv6Address"]
+                : ["sourceIpAddress", "targetDbName", "guestOsType", "iPv4Address", "iPv6Address"];
+            var operation = InputFactory.Operation(
+                "Send",
+                parameters: inputNames.Select(name => InputFactory.QueryParameter(name, InputPrimitiveType.String, isRequired: true)).ToArray(),
+                responses: [InputFactory.OperationResponse([204])]);
+            var serviceMethod = InputFactory.BasicServiceMethod(
+                "Send",
+                operation,
+                parameters: inputNames.Select(name => InputFactory.MethodParameter(name, InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Query)).ToArray());
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [inputClient],
+                compilation: custom ? async () => await Helpers.GetCompilationFromDirectoryAsync("Custom") : null,
+                lastContractCompilation: signatureSource == "Custom" ? null : async () => await Helpers.GetCompilationFromDirectoryAsync(lastContractSource),
+                configuration: """{"disable-xml-docs": false, "package-name": "Sample"}""");
+            var client = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+            client.ProcessTypeForBackCompatibility();
+            var methods = client.Methods.OfType<ScmMethodProvider>().Where(method => method.Signature.Name is "Send" or "SendAsync").ToArray();
+            Assert.AreEqual(4, methods.Length);
+            foreach (var method in methods)
+            {
+                var suffix = (method.Signature.Name.EndsWith("Async") ? "Async" : "Sync")
+                    + (method.Kind == ScmMethodKind.Protocol ? "Protocol" : "Convenience");
+                var expectedNames = distinctNames ? contractNames.Select(name => name + suffix).ToArray() : contractNames;
+                if (!hasMatchingContract)
+                {
+                    expectedNames = ["sourceIPAddress", "targetDBName", "guestOSType", "ipv4Address", "ipv6Address"];
+                }
+                if (signatureSource == "CaseOnlyLastContract")
+                {
+                    expectedNames = suffix switch
+                    {
+                        "SyncProtocol" => ["sourceIpAddress", "targetDbName", "guestOsType", "iPv4Address", "iPv6Address"],
+                        "AsyncProtocol" => ["sourceIPAddress", "targetDBName", "guestOSType", "ipv4Address", "ipv6Address"],
+                        "SyncConvenience" => ["SourceIpAddress", "TargetDbName", "GuestOsType", "IPv4Address", "IPv6Address"],
+                        _ => ["SOURCEIPADDRESS", "TARGETDbNAME", "GUESTOsTYPE", "IPV4ADDRESS", "IPV6ADDRESS"]
+                    };
+                }
+                CollectionAssert.AreEqual(expectedNames, method.Signature.Parameters.Take(inputNames.Length).Select(parameter => parameter.Name));
+                Assert.AreEqual(custom, method.IsPartialMethod);
+                using var writer = new CodeWriter();
+                writer.WriteMethod(method);
+                var text = writer.ToString(false);
+                foreach (var name in expectedNames)
+                {
+                    StringAssert.Contains($"<param name=\"{name}\">", text);
+                    StringAssert.Contains($"<paramref name=\"{name}\"/>", text);
+                    StringAssert.Contains($"nameof({name})", text);
+                }
+                var target = method.Kind == ScmMethodKind.Protocol ? "CreateSendRequest" : method.Signature.Name;
+                var trailingArgument = method.Kind == ScmMethodKind.Protocol ? "options" : "cancellationToken.ToRequestOptions()";
+                StringAssert.Contains($"this.{target}({string.Join(", ", expectedNames)}, {trailingArgument})", text);
+                if (method.Kind == ScmMethodKind.Convenience && method.Signature.Name.EndsWith("Async"))
+                {
+                    Assert.AreEqual(
+                        Helpers.GetExpectedFromFile(custom ? "Custom" : hasMatchingContract ? signatureSource : "Normalized"),
+                        method.BodyStatements!.ToDisplayString());
+                }
+            }
+        }
+
+        [TestCase("GetIpAddress", "GetIpAddress")]
+        [TestCase("GetDbStatus", "GetDbStatus")]
+        [TestCase("GetOsProfile", "GetOsProfile")]
+        [TestCase("GetIpv4Configuration", "GetIpv4Configuration")]
+        [TestCase("GetIpv6Configuration", "GetIpv6Configuration")]
+        [TestCase("ListIpAddresses", "GetIpAddresses")]
+        [TestCase("GetIpUrl", "GetIpUri")]
+        [TestCase("GetDbUrl", "GetDbUrl")]
+        [TestCase("GetOsUrl", "GetOsUrl")]
+        [TestCase("GetIpNew", "GetIPNew")]
+        [TestCase("GetIpPrivate", "GetIPPrivate")]
+        [TestCase("GetDbPrivate", "GetDBPrivate")]
+        [TestCase("GetIpInternal", "GetIPInternal")]
+        [TestCase("GetDbInternal", "GetDBInternal")]
+        [TestCase("GetIpPrivateProtected", "GetIPPrivateProtected")]
+        [TestCase("GetDbPrivateProtected", "GetDBPrivateProtected")]
+        [TestCase("GetIpProtected", "GetIpProtected")]
+        [TestCase("GetDbProtected", "GetDbProtected")]
+        [TestCase("GetIpProtectedInternal", "GetIpProtectedInternal")]
+        [TestCase("GetDbProtectedInternal", "GetDbProtectedInternal")]
+        [TestCase("GetOsPrivateUrl", "GetOSPrivateUri")]
+        [TestCase("GetOsInternalUrl", "GetOSInternalUri")]
+        public async Task TestOperationAcronymsPreserveLastContract(string operationName, string expectedName)
+        {
+            var operation = InputFactory.Operation(operationName);
+            var serviceMethod = InputFactory.BasicServiceMethod(operationName, operation);
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [inputClient],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var client = new ClientProvider(inputClient);
+
+            CollectionAssert.AreEquivalent(
+                new[] { expectedName, expectedName + "Async", expectedName, expectedName + "Async" },
+                client.GetMethodCollectionByOperation(operation).Select(m => m.Signature.Name));
+        }
+
+        [TestCase("GetIpAddress", "GetIpAddress", "GetIPAddress")]
+        [TestCase("GetIpUrl", "GetIpUri", "GetIPUri")]
+        public async Task TestOperationAcronymsRespectPublicProjection(
+            string operationName, string publishedName, string normalizedName)
+        {
+            var operation = InputFactory.Operation(operationName);
+            var serviceMethod = InputFactory.BasicServiceMethod(operationName, operation);
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [inputClient],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var client = new ClientProvider(inputClient);
+            Assert.AreEqual(normalizedName, serviceMethod.Name);
+            var wrapper = new BackCompatTypeProvider("MockableTestResource", "Sample");
+            var shippedMethods = client.GetMethodCollectionByOperation(operation, wrapper);
+            CollectionAssert.AreEquivalent(
+                new[] { publishedName, publishedName + "Async", publishedName, publishedName + "Async" },
+                shippedMethods.Select(m => m.Signature.Name));
+            var requestName = client.RestClient.GetCreateRequestMethod(operation).Signature.Name;
+
+            var newWrapper = new BackCompatTypeProvider("MissingWrapper", "Sample");
+            var newMethods = client.GetMethodCollectionByOperation(operation, newWrapper);
+            Assert.IsTrue(newMethods.All(m => m.Signature.Name == normalizedName || m.Signature.Name == normalizedName + "Async"));
+            Assert.AreEqual(requestName, client.RestClient.GetCreateRequestMethod(operation).Signature.Name);
+            StringAssert.Contains(requestName + "(", new TypeProviderWriter(client.RestClient).Write().Content);
+            Assert.AreEqual(publishedName, shippedMethods.First().Signature.Name);
+
+            _ = client.GetMethodCollectionByOperation(operation, wrapper);
+            Assert.AreEqual(publishedName, serviceMethod.Name);
+            _ = client.GetMethodCollectionByOperation(operation);
+            Assert.AreEqual(normalizedName, serviceMethod.Name);
+        }
+
+        [TestCase("GetIpUrl", "GetIpUri")]
+        [TestCase("GetIpPrivate", "GetIpPrivate")]
+        [TestCase("GetIpInternal", "GetIpInternal")]
+        public async Task TestOperationAcronymsPreserveCustomMethods(string operationName, string expectedName)
+        {
+            var operation = InputFactory.Operation(operationName);
+            var serviceMethod = InputFactory.BasicServiceMethod(operation.Name, operation);
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [inputClient],
+                compilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var client = new ClientProvider(inputClient);
+            var methods = client.GetMethodCollectionByOperation(operation);
+
+            Assert.AreEqual(expectedName, serviceMethod.Name);
+            CollectionAssert.AreEquivalent(
+                new[] { expectedName, expectedName + "Async", expectedName, expectedName + "Async" },
+                methods.Select(m => m.Signature.Name));
+            Assert.AreEqual(2, methods.Count(m => m.IsPartialMethod));
+        }
+
+        [TestCase("LastContract", false)]
+        [TestCase("LastContract", true)]
+        [TestCase("Custom", false)]
+        [TestCase("Custom", true)]
+        [TestCase("CustomWithLastContract", false)]
+        [TestCase("CustomWithLastContract", true)]
+        public async Task AcronymNamedArgumentsUseProtocolSignature(string signatureSource, bool async)
+        {
+            var operation = InputFactory.Operation(
+                "Send",
+                parameters:
+                [
+                    InputFactory.QueryParameter("id", InputPrimitiveType.String, isRequired: true),
+                    InputFactory.QueryParameter("filter", InputPrimitiveType.String),
+                    InputFactory.QueryParameter("sourceIpAddress", InputPrimitiveType.String)
+                ],
+                responses: [InputFactory.OperationResponse([204])]);
+            var serviceMethod = InputFactory.BasicServiceMethod(
+                "Send",
+                operation,
+                parameters:
+                [
+                    InputFactory.MethodParameter("id", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Query),
+                    InputFactory.MethodParameter("sourceIpAddress", InputPrimitiveType.String, location: InputRequestLocation.Query)
+                ]);
+            var inputClient = InputFactory.Client("TestClient", methods: [serviceMethod]);
+            var custom = signatureSource.StartsWith("Custom");
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [inputClient],
+                compilation: custom ? async () => await Helpers.GetCompilationFromDirectoryAsync("Custom") : null,
+                lastContractCompilation: signatureSource == "Custom" ? null : async () => await Helpers.GetCompilationFromDirectoryAsync("LastContract"));
+            var client = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+            client.ProcessTypeForBackCompatibility();
+            var methodName = async ? "SendAsync" : "Send";
+            var convenienceMethod = client.Methods.OfType<ScmMethodProvider>().Single(
+                method => method.Kind == ScmMethodKind.Convenience && method.Signature.Name == methodName);
+            var protocolMethod = client.Methods.OfType<ScmMethodProvider>().Single(
+                method => method.Kind == ScmMethodKind.Protocol && method.Signature.Name == methodName);
+            Assert.AreEqual(custom ? "customIpWire" : "sourceIpAddressWire", protocolMethod.Signature.Parameters[2].Name);
+            Assert.AreEqual(custom ? "customOptions" : "legacyOptions", protocolMethod.Signature.Parameters[3].Name);
+            Assert.AreEqual(
+                Helpers.GetExpectedFromFile($"{(custom ? "Custom" : "LastContract")},{(async ? "Async" : "Sync")}"),
+                convenienceMethod.BodyStatements!.ToDisplayString());
+        }
+
+        [Test]
+        public async Task TestOperationNamePreservesUrlSuffixFromLastContract()
+        {
+            var inputOperation = InputFactory.Operation("GetUrl");
+            var inputServiceMethod = InputFactory.BasicServiceMethod("GetUrl", inputOperation);
+            var client = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+            await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            _ = new ClientProvider(client);
+
+            Assert.AreEqual("GetUrl", inputServiceMethod.Name);
+            Assert.AreEqual("GetUrl", inputServiceMethod.Operation.Name);
+        }
+
+        [Test]
+        public async Task TestOperationNamePreservesUrlSuffixFromBackCompatProvider()
+        {
+            var inputOperation = InputFactory.Operation("GetUrl");
+            var inputServiceMethod = InputFactory.BasicServiceMethod("GetUrl", inputOperation);
+            var client = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+
+            Assert.AreEqual("GetUri", inputServiceMethod.Name);
+
+            var backCompatProvider = new BackCompatTypeProvider("MockableTestResource", "Sample");
+            var methods = clientProvider.GetMethodCollectionByOperation(inputOperation, backCompatProvider);
+
+            Assert.AreEqual("GetUrl", inputServiceMethod.Name);
+            Assert.AreEqual("GetUrl", inputServiceMethod.Operation.Name);
+            Assert.IsTrue(methods.Any(m => m.Signature.Name == "GetUrl"));
+        }
+
+        [Test]
+        public async Task TestOperationNameFallsBackToClientLastContractWhenBackCompatProviderHasNoLastContract()
+        {
+            var inputOperation = InputFactory.Operation("GetUrl");
+            var inputServiceMethod = InputFactory.BasicServiceMethod("GetUrl", inputOperation);
+            var client = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+
+            Assert.AreEqual("GetUrl", inputServiceMethod.Name);
+
+            var backCompatProvider = new BackCompatTypeProvider("MissingWrapper", "Sample");
+            var methods = clientProvider.GetMethodCollectionByOperation(inputOperation, backCompatProvider);
+
+            Assert.IsNull(backCompatProvider.LastContractView);
+            Assert.AreEqual("GetUrl", inputServiceMethod.Name);
+            Assert.AreEqual("GetUrl", inputServiceMethod.Operation.Name);
+            Assert.IsTrue(methods.Any(m => m.Signature.Name == "GetUrl"));
+        }
+
+        [Test]
+        public async Task TestEarlierWrapperRequestExistsAfterLaterBackCompatProvider()
+        {
+            var requestBody = InputFactory.Model("RequestBody");
+            InputParameter[] operationParameters =
+            [
+                InputFactory.HeaderParameter("contentType", InputPrimitiveType.String, isRequired: true, isContentType: true, serializedName: "Content-Type"),
+                InputFactory.BodyParameter("body", requestBody, isRequired: true)
+            ];
+            InputMethodParameter[] methodParameters =
+            [
+                InputFactory.MethodParameter("contentType", InputPrimitiveType.String, isRequired: true, location: InputRequestLocation.Header, serializedName: "Content-Type"),
+                InputFactory.MethodParameter("body", requestBody, isRequired: true, location: InputRequestLocation.Body)
+            ];
+            var listOperation = InputFactory.Operation("ListUrl", parameters: operationParameters, httpMethod: "POST");
+            var listServiceMethod = InputFactory.BasicServiceMethod("ListUrl", listOperation, parameters: methodParameters);
+            var getOperation = InputFactory.Operation("GetUrl", parameters: operationParameters, httpMethod: "POST", isExactName: true);
+            var getServiceMethod = InputFactory.BasicServiceMethod("GetUrl", getOperation, parameters: methodParameters, isExactName: true);
+            var client = InputFactory.Client("TestClient", methods: [listServiceMethod, getServiceMethod]);
+            var generator = await MockHelpers.LoadMockGeneratorAsync(
+                clients: () => [client],
+                lastContractCompilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+            var clientProvider = generator.Object.OutputLibrary.TypeProviders.OfType<ClientProvider>().Single();
+            var shippedWrapper = new BackCompatTypeProvider("MockableTestResource", "Sample");
+
+            var shippedWrapperMethods = clientProvider.GetMethodCollectionByOperation(listOperation, shippedWrapper);
+            var publicMethodName = shippedWrapperMethods.Single(m =>
+                m.Kind == ScmMethodKind.Convenience &&
+                !m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async)).Signature.Name;
+            var capturedRequestMethodName = clientProvider.RestClient.GetCreateRequestMethod(listOperation).Signature.Name;
+
+            var newWrapper = new BackCompatTypeProvider("NewMockableTestResource", "Sample");
+            var newWrapperMethods = clientProvider.GetMethodCollectionByOperation(listOperation, newWrapper);
+            var newPublicMethodName = newWrapperMethods.Single(m =>
+                m.Kind == ScmMethodKind.Convenience &&
+                !m.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Async)).Signature.Name;
+            Assert.AreEqual("ListUrl", publicMethodName);
+            Assert.AreEqual("CreateListUrlRequest", capturedRequestMethodName);
+            Assert.AreEqual("ListUri", newPublicMethodName);
+            foreach (var protocolMethod in shippedWrapperMethods.Where(method => method.Kind == ScmMethodKind.Protocol))
+            {
+                var syntax = CSharpSyntaxTree.ParseText(protocolMethod.BodyStatements!.ToDisplayString()).GetRoot();
+                var requestCalls = syntax.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                    .Where(invocation => invocation.Expression is MemberAccessExpressionSyntax member &&
+                        member.Name.Identifier.ValueText.StartsWith("Create", StringComparison.Ordinal))
+                    .Select(invocation => ((MemberAccessExpressionSyntax)invocation.Expression).Name.Identifier.ValueText);
+                CollectionAssert.Contains(requestCalls, capturedRequestMethodName);
+            }
+
+            Assert.AreEqual(
+                capturedRequestMethodName,
+                clientProvider.RestClient.GetCreateRequestMethod(listOperation).Signature.Name);
+
+            var emittedRestClient = new TypeProviderWriter(clientProvider.RestClient).Write().Content;
+            StringAssert.Contains(
+                $"{capturedRequestMethodName}(",
+                emittedRestClient,
+                "The final REST client must emit the request method captured by an earlier wrapper projection.");
+        }
+
+        [Test]
+        public void TestIsExactNameServiceMethodSkipsListToGetRename()
+        {
+            // The normal CleanOperationNames behavior renames "List" -> "GetAll" and "ListFoo" -> "GetFoo".
+            // When isExactName is true, even an operation literally named "List" must be preserved verbatim.
+            var inputOperation = InputFactory.Operation("List", isExactName: true);
+            var inputServiceMethod = InputFactory.BasicServiceMethod("List", inputOperation, isExactName: true);
+            var client = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+            _ = new ClientProvider(client);
+
+            Assert.AreEqual("List", inputServiceMethod.Name);
+            Assert.AreEqual("List", inputServiceMethod.Operation.Name);
+        }
+
+        [Test]
+        public void TestNonExactNameServiceMethodAppliesListRename()
+        {
+            // Sanity check that without isExactName the existing rename still applies.
+            var inputOperation = InputFactory.Operation("List");
+            var inputServiceMethod = InputFactory.BasicServiceMethod("List", inputOperation);
+            var client = InputFactory.Client("TestClient", methods: [inputServiceMethod]);
+            _ = new ClientProvider(client);
+
+            Assert.AreEqual("GetAll", inputServiceMethod.Name);
+            Assert.AreEqual("GetAll", inputServiceMethod.Operation.Name);
+        }
+
+        private sealed class BackCompatTypeProvider : TypeProvider
+        {
+            private readonly string _name;
+            private readonly string _namespace;
+
+            public BackCompatTypeProvider(string name, string ns)
+            {
+                _name = name;
+                _namespace = ns;
+            }
+
+            protected override string BuildRelativeFilePath() => $"{_name}.cs";
+            protected override string BuildName() => _name;
+            protected override string BuildNamespace() => _namespace;
+        }
+
+        private static ClientProvider BuildMultipartClient(InputModelType bodyModel, bool bodyIsRequired = true)
+        {
+            var body = InputFactory.MethodParameter(
+                "body",
+                bodyModel,
+                isRequired: bodyIsRequired,
+                location: InputRequestLocation.Body);
+
+            var bodyOperationParameter = InputFactory.BodyParameter(
+                "body",
+                bodyModel,
+                isRequired: bodyIsRequired,
+                contentTypes: ["multipart/form-data"],
+                defaultContentType: "multipart/form-data");
+
+            var operation = InputFactory.Operation(
+                "Upload",
+                requestMediaTypes: ["multipart/form-data"],
+                parameters: [InputFactory.ContentTypeParameter("multipart/form-data"), bodyOperationParameter]);
+
+            var serviceMethod = InputFactory.BasicServiceMethod("Upload", operation, parameters: [body]);
+            var inputClient = InputFactory.Client("MultipartClient", methods: [serviceMethod]);
+
+            MockHelpers.LoadMockGenerator(
+                auth: () => new(new InputApiKeyAuth("mock", null), null),
+                clients: () => [inputClient],
+                inputModels: () => [bodyModel]);
+
+            return ScmCodeModelGenerator.Instance.TypeFactory.CreateClient(inputClient)!;
+        }
+
+        [Test]
+        public void TestMultipartClient_UploadMethods_RequiredFileBody()
+        {
+            var inputModel = MultipartModel(
+                "MultiPartRequest",
+                [
+                    NonFilePartProperty("id", InputPrimitiveType.String),
+                    FilePartProperty("profileImage"),
+                ]);
+
+            var clientProvider = BuildMultipartClient(inputModel);
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider, name => name == "Upload" || name == "UploadAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void TestMultipartClient_UploadMethods_MultiFileOnlyBody()
+        {
+            var inputModel = MultipartModel(
+                "BinaryArrayPartsRequest",
+                [MultiFilePartProperty("pictures")]);
+
+            var clientProvider = BuildMultipartClient(inputModel);
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider, name => name == "Upload" || name == "UploadAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void TestMultipartClient_UploadMethods_OptionalFileBody()
+        {
+            var inputModel = MultipartModel(
+                "OptionalFileRequest",
+                [
+                    NonFilePartProperty("id", InputPrimitiveType.String),
+                    FilePartProperty("optionalFile", isRequired: false),
+                ]);
+
+            var clientProvider = BuildMultipartClient(inputModel);
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider, name => name == "Upload" || name == "UploadAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        [Test]
+        public void TestMultipartClient_UploadMethods_OptionalBody()
+        {
+            var inputModel = MultipartModel(
+                "MultiPartRequest",
+                [
+                    NonFilePartProperty("id", InputPrimitiveType.String),
+                    FilePartProperty("profileImage"),
+                ]);
+
+            var clientProvider = BuildMultipartClient(inputModel, bodyIsRequired: false);
+            var writer = new TypeProviderWriter(new FilteredMethodsTypeProvider(clientProvider, name => name == "Upload" || name == "UploadAsync"));
+            var file = writer.Write();
+            Assert.AreEqual(Helpers.GetExpectedFromFile(), file.Content);
+        }
+
+        private static InputModelProperty FilePartProperty(string name, bool isRequired = true)
+            => InputFactory.Property(
+                name,
+                InputFactory.FileType(),
+                isRequired: isRequired,
+                serializationOptions: InputFactory.Serialization.Options(
+                    multipart: InputFactory.Serialization.Multipart(name, isFilePart: true)));
+
+        private static InputModelProperty MultiFilePartProperty(string name)
+            => InputFactory.Property(
+                name,
+                InputFactory.Array(InputFactory.FileType()),
+                isRequired: true,
+                serializationOptions: InputFactory.Serialization.Options(
+                    multipart: InputFactory.Serialization.Multipart(name, isFilePart: true, isMulti: true)));
+
+        private static InputModelProperty NonFilePartProperty(string name, InputType type)
+            => InputFactory.Property(
+                name,
+                type,
+                isRequired: true,
+                serializationOptions: InputFactory.Serialization.Options(
+                    multipart: InputFactory.Serialization.Multipart(name, isFilePart: false, defaultContentTypes: ["text/plain"])));
+
+        private static InputModelType MultipartModel(string name, IEnumerable<InputModelProperty> properties)
+            => InputFactory.Model(name, usage: InputModelTypeUsage.Input | InputModelTypeUsage.MultipartFormData, properties: properties);
+
+    }
+}

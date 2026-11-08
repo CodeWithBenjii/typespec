@@ -1,0 +1,170 @@
+import { isValidLibraryAlias } from "./diagnostic-code.js";
+import { createDiagnosticCreator } from "./diagnostic-creator.js";
+import { compilerAssert } from "./diagnostics.js";
+import type { Program } from "./program.js";
+import { createJSONSchemaValidator } from "./schema-validator.js";
+import type {
+  DiagnosticMessages,
+  JSONSchemaValidator,
+  LinterDefinition,
+  LinterRuleDefinition,
+  PackageFlags,
+  StateDef,
+  TypeInfoProvider,
+  TypeSpecLibrary,
+  TypeSpecLibraryDef,
+} from "./types.js";
+
+export { paramMessage } from "./param-message.js";
+
+const globalLibraryUrlsLoadedSym = Symbol.for("TYPESPEC_LIBRARY_URLS_LOADED");
+if ((globalThis as any)[globalLibraryUrlsLoadedSym] === undefined) {
+  (globalThis as any)[globalLibraryUrlsLoadedSym] = new Set<string>();
+}
+
+const loadedUrls = (globalThis as any)[globalLibraryUrlsLoadedSym];
+
+/**
+ * @internal List of urls that used `createTypeSpecLibrary`. Used to keep track of the loaded version of library and make sure they are compatible.
+ */
+export function getLibraryUrlsLoaded(): Set<string> {
+  return loadedUrls;
+}
+
+function createStateKeys<T extends string>(
+  libName: string,
+  state: Record<T, StateDef> | undefined,
+): Record<T, symbol> {
+  const result: Record<string, symbol> = {};
+
+  for (const key of Object.keys(state ?? {})) {
+    result[key] = Symbol.for(`${libName}/${key}`);
+  }
+  return result as Record<T, symbol>;
+}
+
+/**
+ * Create a new TypeSpec library definition.
+ * @param lib Library definition.
+ * @returns Library with utility functions.
+ *
+ *
+ * @remarks Create the lib object with `as const` to get the full typing.
+ *
+ * @example
+ * const libDef = {
+ *   name: "myLib",
+ *   diagnostics: {
+ *    "my-code": {serverity: "error", messages: {default: "Foo bar"}}
+ *   },
+ * } as const;
+ *
+ * const lib = createTypeSpecLibrary(libDef);
+ */
+export function createTypeSpecLibrary<
+  const T extends { [code: string]: DiagnosticMessages },
+  const E extends Record<string, any>,
+  const State extends string = never,
+>(lib: Readonly<TypeSpecLibraryDef<T, E, State>>): TypeSpecLibrary<T, E, State> {
+  let emitterOptionValidator: JSONSchemaValidator;
+
+  compilerAssert(
+    lib.alias === undefined || isValidLibraryAlias(lib.alias),
+    `Library alias "${lib.alias}" for library "${lib.name}" is invalid. It must contain only lowercase letters, digits, and hyphens (e.g. "tcgc").`,
+  );
+
+  const { reportDiagnostic, createDiagnostic } = createDiagnosticCreator(lib.diagnostics, lib.name);
+
+  function createStateSymbol(name: string): symbol {
+    return Symbol.for(`${lib.name}.${name}`);
+  }
+
+  const caller = getCaller();
+  if (caller) {
+    loadedUrls.add(caller);
+  }
+
+  return {
+    ...lib,
+    diagnostics: lib.diagnostics,
+    stateKeys: createStateKeys(lib.name, lib.state),
+    reportDiagnostic,
+    createDiagnostic,
+    createStateSymbol,
+    get emitterOptionValidator() {
+      if (!emitterOptionValidator && lib.emitter?.options) {
+        emitterOptionValidator = createJSONSchemaValidator<E>(lib.emitter.options, {
+          coerceTypes: true,
+        });
+      }
+      return emitterOptionValidator;
+    },
+    getTracer,
+  };
+
+  function getTracer(program: Program) {
+    return program.tracer.sub(lib.name);
+  }
+}
+
+/** Type-check compiler-recognized library package flags and return the supplied object unchanged. */
+export function definePackageFlags(flags: PackageFlags): PackageFlags {
+  return flags;
+}
+
+/** Type-check a library's linter definition and return it unchanged for export as `$linter`. */
+export function defineLinter(def: LinterDefinition): LinterDefinition {
+  return def;
+}
+
+/**
+ * Define a `$provideTypeInfo` provider that contributes extra information about types to IDE hover
+ * documentation and tooling. This helper only provides typing; export the result as `$provideTypeInfo`
+ * from your library's entry point.
+ *
+ * @example
+ * ```ts
+ * export const $provideTypeInfo = defineTypeInfoProvider(({ target }) => {
+ *   if (target.kind !== "Operation") return undefined;
+ *   return { content: `Operation ${target.name}` };
+ * });
+ * ```
+ */
+export function defineTypeInfoProvider(provider: TypeInfoProvider): TypeInfoProvider {
+  return provider;
+}
+
+/** Create a new linter rule. */
+export function createLinterRule<
+  const N extends string,
+  const T extends DiagnosticMessages,
+  const Options extends Record<string, unknown> = Record<string, never>,
+>(definition: LinterRuleDefinition<N, T, Options>) {
+  compilerAssert(!definition.name.includes("/"), "Rule name cannot contain a '/'.");
+  return definition;
+}
+
+/**
+ * Set the TypeSpec namespace for that function.
+ * @param namespace Namespace string (e.g. "Foo.Bar")
+ * @param functions Functions
+ */
+export function setTypeSpecNamespace(
+  namespace: string,
+  ...functions: Array<(...args: any[]) => any>
+): void {
+  functions.forEach((c: any) => (c.namespace = namespace));
+}
+
+function getCaller() {
+  const caller = getCallStack()[2];
+  return typeof caller === "object" && "getFileName" in caller ? caller.getFileName() : undefined;
+}
+
+function getCallStack() {
+  const _prepareStackTrace = Error.prepareStackTrace;
+  Error.prepareStackTrace = (_, stack) => stack;
+  const stack = (new Error() as any).stack.slice(1);
+  Error.prepareStackTrace = _prepareStackTrace;
+  return stack;
+}

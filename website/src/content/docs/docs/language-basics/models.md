@@ -1,0 +1,298 @@
+---
+id: models
+title: Models
+description: "Language basics - defining schemas with models"
+llmstxt: true
+---
+
+Models in TypeSpec are utilized to define the structure or schema of data.
+
+## Types of models
+
+Models can be categorized into two main types:
+
+- [Record](#record)
+- [Array](#array)
+
+### Record
+
+A Record model is a structure that consists of named fields, referred to as properties.
+
+- The name can be an [`identifier`](./identifiers.md) or `string literal`.
+- The type can be any type reference.
+- Properties are arranged in a specific order. Refer to [property ordering](#property-ordering) for more details.
+
+```typespec
+model Dog {
+  name: string;
+  age: uint8;
+}
+```
+
+#### Optional properties
+
+Properties can be designated as optional by using the `?` symbol.
+
+```typespec
+model Dog {
+  address?: string;
+}
+```
+
+#### Default values
+
+Properties can be assigned a default value using the `=` operator.
+
+```typespec
+model Dog {
+  address?: string = "wild";
+  age: uint8 = 0;
+}
+```
+
+#### Property ordering
+
+Properties are arranged in the order they are defined in the source. Properties acquired via `model is` are placed before properties defined in the model body. Properties obtained via `...` are inserted at the point where the spread appears in the source.
+
+Example:
+
+```tsp
+model Pet {
+  name: string;
+  age: uint8;
+}
+
+model HasHome {
+  address: string;
+}
+
+model Cat is Pet {
+  meow: boolean;
+  ...HasHome;
+  furColor: string;
+}
+
+// The resulting property order for Cat is:
+// name, age, meow, address, furColor
+```
+
+### Additional properties
+
+The `Record<T>` model can be used to define a model with an arbitrary number of properties of type T. It can be combined with a named model to provide some known properties.
+
+There are three ways to achieve this, each with slightly different semantics:
+
+- Using the `...` operator
+- Using the `is` operator
+- Using the `extends` operator
+
+#### Using the `...` operator
+
+Spreading a Record into your model implies that your model includes all the properties you have explicitly defined, plus any additional properties defined by the Record. This means that a property in the model could be of a different and incompatible type with the Record value type.
+
+```tsp
+// In this example, the Person model has a property `age` that is an int32, but also has other properties that are all strings.
+model Person {
+  age: int32;
+  ...Record<string>;
+}
+```
+
+#### Using the `is` operator
+
+Using `is Record<T>` copies the record's indexer into the new model without creating an inheritance relationship. Each property explicitly defined in the model must be assignable to `T`.
+
+The example below would be invalid
+
+```tsp
+model Person is Record<string> {
+  age: int32;
+  //   ^ int32 is not assignable to string
+}
+```
+
+But the following would be valid
+
+```tsp
+model Person is Record<string> {
+  name: string;
+}
+```
+
+#### Using the `extends` operator
+
+Using `extends Record<T>` creates an inheritance relationship with the record. As with `is Record<T>`, each property explicitly defined in the model must be assignable to `T`.
+
+```tsp
+model Person extends Record<string> {
+  name: string;
+}
+```
+
+Choose `is` when you want to copy a model and `extends` when you want to preserve an inheritance relationship. Emitters can represent these relationships differently; the two forms do not necessarily produce the same output. See [model composition](#model-composition) for how they handle properties and decorators.
+
+### Special property types
+
+#### `never`
+
+A model property can be declared as having the type `never`. This can be interpreted as the model not having that property.
+
+This can be useful in a model template to omit a property.
+
+```typespec
+model Address<TState> {
+  state: TState;
+  city: string;
+  street: string;
+}
+
+model UKAddress is Address<never>;
+```
+
+:::note
+The responsibility of removing `never` properties lies with the emitter. The TypeSpec compiler will not automatically omit them.
+:::
+
+### Array
+
+Arrays are models created using the `[]` syntax, which is a shorthand for using the `Array<T>` model type.
+
+## Model composition
+
+### Spread
+
+The spread operator (`...`) copies the members of a source model into a target model. Decorators on the copied properties are preserved, but decorators on the source model itself are not copied. This operation doesn't create any nominal relationship between the source and target, making it useful when you want to reuse common properties without generating complex inheritance relationships.
+
+```typespec
+model Animal {
+  species: string;
+}
+
+model Pet {
+  name: string;
+}
+
+model Dog {
+  ...Animal;
+  ...Pet;
+}
+
+// The Dog model is equivalent to the following declaration:
+model Dog {
+  species: string;
+  name: string;
+}
+```
+
+### Extends
+
+There are times when you want to create an explicit relationship between two models, such as when you're generating class definitions in languages that support inheritance. The `extends` keyword can be used to establish this relationship.
+
+The derived model refers to its base model rather than copying its properties or model-level decorators. It can declare additional properties. Decorators and emitters may use the base model relationship to provide inherited behavior.
+
+```typespec
+model Animal {
+  species: string;
+}
+
+model Dog extends Animal {}
+```
+
+### Is
+
+The `is` keyword copies a model's properties and model-level [decorators](./decorators.md) without creating an inheritance relationship with that model. Decorators on the copied properties are also preserved. You can add properties and decorators to the new model; `is` does not restrict it to the source model's existing properties.
+
+If the source model has a base model, the new model retains that same base model relationship.
+
+A common use case is to provide a better name to a [template](#model-templates) instantiation:
+
+```typespec
+@doc("A container.")
+model Thing<T> {
+  property: T;
+}
+
+model StringThing is Thing<string> {
+  label?: string;
+}
+
+// The StringThing declaration is equivalent to the following declaration:
+@doc("A container.")
+model StringThing {
+  property: string;
+  label?: string;
+}
+```
+
+## Model templates
+
+Refer to [templates](./templates.md) for more details on templates.
+
+```typespec
+model Page<Item> {
+  size: int32;
+  item: Item[];
+}
+
+model DogPage {
+  ...Page<Dog>;
+}
+```
+
+## Meta type references
+
+Some model property meta types can be referenced using `::`.
+
+| Name | Example          | Description                              |
+| ---- | ---------------- | ---------------------------------------- |
+| type | `Pet.name::type` | Reference the type of the model property |
+
+## In expression position
+
+:::warning
+Declaration expressions are an experimental TypeSpec feature and are disabled by default. Using a `model`, `enum`, `union`, or `scalar` declaration in expression position is an error unless you enable them by adding `declaration-expressions` to the `features` list in your `tspconfig.yaml`:
+
+```yaml
+kind: project
+features:
+  - declaration-expressions
+```
+
+:::
+
+The `model` keyword can also be used anywhere a type expression is expected — for example as an alias value, a property type, a decorator or template argument, or a tuple element. This is different from an inline model expression (`{ ... }`) in that it uses the `model` keyword and can therefore carry a name and an `extends`/`is` heritage clause.
+
+```typespec
+model Widget {
+  // anonymous model in expression position
+  config: model {
+    width: int32;
+    height: int32;
+  };
+
+  // named model in expression position
+  metadata: model Metadata {
+    author: string;
+  };
+
+  // with a heritage clause
+  point: model extends Position {
+    z: float64;
+  };
+}
+```
+
+A model used in expression position is marked as an expression and is **not** registered in the enclosing namespace, even when it is given a name. The name is kept on the resulting type for display purposes only — it cannot be referenced elsewhere (and a named model expression cannot reference itself recursively).
+
+You can apply [decorators](./decorators.md) and doc comments to the declaration inline, and augment it through a navigation reference such as `::type`:
+
+```typespec
+model Widget {
+  /** The current status */
+  status: @doc("The current status") model Status {
+    code: int32;
+  };
+}
+
+@@doc(Widget.status::type, "The current status");
+```

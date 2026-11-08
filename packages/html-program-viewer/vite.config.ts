@@ -1,0 +1,39 @@
+import react from "@vitejs/plugin-react";
+import { readFileSync } from "fs";
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
+import { defineConfig } from "vite";
+import checker from "vite-plugin-checker";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const packageJson = JSON.parse(readFileSync(resolve(__dirname, "package.json")).toString());
+const dependencies = Object.keys(packageJson.dependencies);
+const peerDependencies = Object.keys(packageJson.peerDependencies ?? {});
+const externals = ["url", ...dependencies, ...peerDependencies];
+
+export default defineConfig({
+  build: {
+    target: "esnext",
+    minify: false,
+    chunkSizeWarningLimit: 3000,
+    lib: {
+      entry: {
+        "react/index": "src/react/index.ts",
+      },
+      cssFileName: "style",
+      formats: ["es"],
+    },
+    rolldownOptions: {
+      external: (id) => externals.some((x) => id.startsWith(x)),
+    },
+  },
+  plugins: [
+    react(),
+    checker({
+      typescript: {
+        tsconfigPath: "./tsconfig.build.json",
+      },
+    }),
+  ],
+});

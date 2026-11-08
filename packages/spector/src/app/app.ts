@@ -1,0 +1,195 @@
+import type {
+  MockApiDefinition,
+  MockBody,
+  MockMultipartBody,
+  MockRequest,
+  RequestExt,
+  ResolverConfig,
+  ScenarioMockApi,
+} from "@typespec/spec-api";
+import { expandDyns, isMatcher } from "@typespec/spec-api";
+import type { ScenariosMetadata } from "@typespec/spec-coverage-sdk";
+import type { Response } from "express";
+import { Router } from "express";
+import { getScenarioMetadata } from "../coverage/common.js";
+import { CoverageTracker } from "../coverage/coverage-tracker.js";
+import { logger } from "../logger.js";
+import { internalRouter } from "../routes/index.js";
+import { loadScenarioMockApis } from "../scenarios-resolver.js";
+import { MockApiServer } from "../server/index.js";
+import { parseJsonLines } from "../utils/body-utils.js";
+import type { ApiMockAppConfig } from "./config.js";
+import { processRequest } from "./request-processor.js";
+
+export interface ScenariosAndScenariosMetadata {
+  scenarios: Record<string, ScenarioMockApi>;
+  scenariosMetadata: ScenariosMetadata;
+}
+
+export class MockApiApp {
+  private router = Router();
+  private server: MockApiServer;
+  private coverageTracker: CoverageTracker;
+  private resolverConfig!: ResolverConfig;
+
+  constructor(private config: ApiMockAppConfig) {
+    this.server = new MockApiServer({ port: config.port });
+    this.coverageTracker = new CoverageTracker(config.coverageFile);
+  }
+
+  public async start(): Promise<void> {
+    this.server.use("/", internalRouter);
+
+    const ScenariosAndScenariosMetadata: ScenariosAndScenariosMetadata[] = [];
+    if (Array.isArray(this.config.scenarioPath)) {
+      for (let idx = 0; idx < this.config.scenarioPath.length; idx++) {
+        const scenarios = await loadScenarioMockApis(this.config.scenarioPath[idx]);
+        const scenariosMetadata = await getScenarioMetadata(this.config.scenarioPath[idx]);
+        ScenariosAndScenariosMetadata.push({ scenarios, scenariosMetadata });
+      }
+    } else {
+      const scenarios = await loadScenarioMockApis(this.config.scenarioPath);
+      const scenariosMetadata = await getScenarioMetadata(this.config.scenarioPath);
+      ScenariosAndScenariosMetadata.push({ scenarios, scenariosMetadata });
+    }
+
+    this.coverageTracker.setScenarios(ScenariosAndScenariosMetadata);
+
+    for (const { scenarios } of ScenariosAndScenariosMetadata) {
+      for (const [name, scenario] of Object.entries(scenarios)) {
+        this.registerScenario(name, scenario);
+      }
+    }
+
+    this.router.get("/.coverage", (req, res) => {
+      res.json(this.coverageTracker.computeCoverage());
+    });
+
+    this.server.use("/", this.router);
+    // Getting the resolved port as setting 0 in the config will have express resolve on of the available ports
+    const port = await this.server.start();
+    this.resolverConfig = {
+      baseUrl: `http://localhost:${port}`,
+    };
+  }
+
+  private registerScenario(name: string, scenario: ScenarioMockApi) {
+    for (const endpoint of scenario.apis) {
+      if (!endpoint.handler) {
+        endpoint.handler = createHandler(endpoint, this.resolverConfig);
+      }
+      this.router.route(endpoint.uri)[endpoint.method]((req: RequestExt, res: Response) => {
+        processRequest(
+          this.coverageTracker,
+          name,
+          endpoint.uri,
+          req,
+          res,
+          endpoint.handler!,
+          this.resolverConfig,
+        ).catch((e) => {
+          logger.error("Unexpected request error", e);
+          res.status(500).end();
+        });
+      });
+    }
+  }
+}
+
+function validateBody(
+  req: MockRequest,
+  body: MockBody | MockMultipartBody,
+  config: ResolverConfig,
+) {
+  if ("kind" in body) {
+    // custom handler for now.
+  } else {
+    if (body.contentType === "application/jsonl") {
+      const expected =
+        typeof body.rawContent === "string" || Buffer.isBuffer(body.rawContent)
+          ? body.rawContent
+          : body.rawContent?.serialize(config);
+      const actual = req.originalRequest.rawBody;
+      if (expected === undefined || actual === undefined) {
+        req.expect.rawBodyEquals(expected);
+      } else {
+        req.expect.deepEqual(
+          parseJsonLines(actual),
+          parseJsonLines(expected),
+          "JSON Lines bodies not equal",
+        );
+      }
+    } else if (Buffer.isBuffer(body.rawContent)) {
+      req.expect.rawBodyEquals(body.rawContent);
+    } else {
+      switch (body.contentType) {
+        case "application/json": {
+          const expected =
+            typeof body.rawContent === "string"
+              ? JSON.parse(body.rawContent)
+              : body.rawContent?.resolve(config);
+          req.expect.coercedBodyEquals(expected);
+          break;
+        }
+        case "application/xml": {
+          if (typeof body.rawContent === "string") {
+            const xmlStr = body.rawContent.replace(`<?xml version='1.0' encoding='UTF-8'?>`, "");
+            req.expect.xmlBodyEquals(xmlStr);
+          } else if (body.rawContent) {
+            req.expect.xmlBodyEquals(body.rawContent, config);
+          }
+          break;
+        }
+        default: {
+          const raw =
+            typeof body.rawContent === "string"
+              ? body.rawContent
+              : body.rawContent?.serialize(config);
+          req.expect.rawBodyEquals(raw);
+        }
+      }
+    }
+  }
+}
+
+function createHandler(apiDefinition: MockApiDefinition, config: ResolverConfig) {
+  return (req: MockRequest) => {
+    const body = apiDefinition.request?.body;
+    // Validate body if present in the request
+    if (body) {
+      validateBody(req, body, config);
+    }
+
+    // Validate headers if present in the request
+    if (apiDefinition.request?.headers) {
+      const headers = expandDyns(apiDefinition.request.headers, config, { resolveMatchers: false });
+      Object.entries(headers).forEach(([key, value]) => {
+        if (key.toLowerCase() !== "content-type") {
+          if (isMatcher(value) || Array.isArray(value)) {
+            req.expect.deepEqual(req.headers[key], value);
+          } else {
+            req.expect.containsHeader(key.toLowerCase(), String(value));
+          }
+        }
+      });
+    }
+
+    if (apiDefinition.request?.query) {
+      const query = expandDyns(apiDefinition.request.query, config, { resolveMatchers: false });
+      Object.entries(query).forEach(([key, value]) => {
+        if (isMatcher(value) || Array.isArray(value)) {
+          req.expect.deepEqual(req.query[key], value);
+        } else {
+          req.expect.containsQueryParam(key, String(value));
+        }
+      });
+    }
+
+    // Validations are done. Now return the response
+    return {
+      status: apiDefinition.response.status,
+      body: apiDefinition.response.body,
+      headers: apiDefinition.response.headers,
+    };
+  };
+}
